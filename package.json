@@ -1,0 +1,57 @@
+{
+  "name": "telegram-private-media-vault",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:worker": "npm run build && wrangler dev --local --port 8787",
+    "dev:worker:e2e": "wrangler dev --local --port 8787 --persist-to .wrangler/e2e-state",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "npm run build && playwright test",
+    "db:migrate:local": "wrangler d1 migrations apply private-archive-db --local",
+    "db:migrate:e2e": "wrangler d1 migrations apply private-archive-db --local --persist-to .wrangler/e2e-state",
+    "config:validate": "node D:/wendangcodex/Codex2/home/skills/website-building-workflow/scripts/validate-website-config.mjs website.config.json",
+    "check": "npm run config:validate && npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "exifr": "latest",
+    "gsap": "^3.15.0",
+    "hono": "latest",
+    "idb": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@eslint/js": "latest",
+    "@playwright/test": "latest",
+    "@tailwindcss/vite": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@types/three": "^0.185.4",
+    "@vitejs/plugin-react": "latest",
+    "eslint": "latest",
+    "eslint-plugin-react-hooks": "latest",
+    "eslint-plugin-react-refresh": "latest",
+    "globals": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "vite": "latest",
+    "vite-plugin-pwa": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}
