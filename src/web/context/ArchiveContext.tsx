@@ -1,6 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { api } from '../lib/api'
+import { clearAccessReauthGuard, isAccessSignInRequired, requestAccessReauth } from '../lib/access-session'
 import type { Asset } from '../types'
+
+// Translate the low-level ApiError codes (message === code, see ApiError) into calm
+// Chinese copy. Without this the timeline surfaces raw tokens like ACCESS_SIGN_IN_REQUIRED.
+function friendlyLoadError(caught: unknown, fallback: string): string {
+  const code = caught instanceof Error ? caught.message : ''
+  switch (code) {
+    case 'ACCESS_SIGN_IN_REQUIRED': return '登录状态已过期。请刷新页面重新登录后再查看档案。'
+    case 'NETWORK_OFFLINE': return '当前网络不可用。恢复网络后会自动重试。'
+    case 'REQUEST_TIMEOUT': return '连接档案服务超时。请检查网络后重试。'
+    case 'ACCESS_OR_NETWORK_FAILED': return '暂时无法连接档案服务。请稍后重试。'
+    default: return code || fallback
+  }
+}
 
 interface LoadOptions {
   q?: string
@@ -67,11 +81,15 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
     setLastOptions(options)
     try {
       const result = await api.listAssets(buildAssetParams(options))
+      clearAccessReauthGuard()
       setAssets(result.items)
       setNextCursor(result.nextCursor)
       setHasLoadedMore(false)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '加载档案失败')
+      // A stale Cloudflare Access cookie is the dominant first-open failure: recover by
+      // re-running the Access login instead of stranding the user on a dead error card.
+      if (isAccessSignInRequired(caught) && requestAccessReauth()) return
+      setError(friendlyLoadError(caught, '加载档案失败'))
     } finally {
       setLoading(false)
     }
@@ -89,7 +107,7 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
       setNextCursor(result.nextCursor)
       setHasLoadedMore(true)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '加载更多档案失败')
+      setError(friendlyLoadError(caught, '加载更多档案失败'))
     } finally {
       setLoadingMore(false)
     }

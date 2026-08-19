@@ -1,4 +1,5 @@
-import { Check, Heart, Play, Send } from 'lucide-react'
+import { useState } from 'react'
+import { Check, Heart, Play, RefreshCw, Send } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
 import type { Asset } from '../../types'
 
@@ -21,8 +22,15 @@ export function MediaTile({
 }) {
   const { openViewer, toggleFavorite } = useArchive()
   const ratio = asset.width && asset.height ? `${asset.width} / ${asset.height}` : '4 / 3'
+  // A failed preview must reach a real terminal state with a retry, not shimmer forever.
+  const [failed, setFailed] = useState(false)
+  const [reloadNonce, setReloadNonce] = useState(0)
+  const previewSrc = reloadNonce
+    ? `${asset.previewUrl}${asset.previewUrl.includes('?') ? '&' : '?'}retry=${reloadNonce}`
+    : asset.previewUrl
+  const retryPreview = () => { setFailed(false); setReloadNonce((value) => value + 1) }
   return (
-    <article className={`media-tile media-${asset.mediaType}${selectionMode ? ' selection-mode' : ''}${selected ? ' selected' : ''}`} style={{ aspectRatio: ratio }}>
+    <article className={`media-tile media-${asset.mediaType}${selectionMode ? ' selection-mode' : ''}${selected ? ' selected' : ''}${failed ? ' media-failed' : ''}`} style={{ aspectRatio: ratio }}>
       <button
         type="button"
         className="media-open"
@@ -31,7 +39,7 @@ export function MediaTile({
         aria-pressed={selectionMode ? selected : undefined}
       >
         <img
-          src={asset.previewUrl}
+          src={previewSrc}
           alt=""
           loading={priority ? 'eager' : 'lazy'}
           fetchPriority={priority ? 'high' : 'low'}
@@ -39,10 +47,12 @@ export function MediaTile({
           width={asset.width ?? undefined}
           height={asset.height ?? undefined}
           draggable={false}
-          onLoad={(event) => { event.currentTarget.dataset.loaded = 'true' }}
+          onLoad={(event) => { event.currentTarget.dataset.loaded = 'true'; if (failed) setFailed(false) }}
+          onError={() => setFailed(true)}
         />
         <span className="media-overlay"><strong>{asset.originalName}</strong><small>{new Date(asset.takenAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</small></span>
       </button>
+      {failed && <button type="button" className="media-retry" onClick={retryPreview} aria-label={`重新加载 ${asset.originalName}`}><RefreshCw /><span>重新加载</span></button>}
       {selectionMode && <span className="selection-indicator" aria-hidden="true">{selected ? <Check /> : null}</span>}
       {asset.mediaType === 'video' && <VideoBadge />}
       {!asset.originalAvailableInApp && asset.mediaType !== 'file' && <span className="telegram-only" title="原文件仅在 Telegram 打开"><Send /></span>}

@@ -55,7 +55,13 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
   let processed = 0
   const report = (phase: ImportFilesProgress['phase'], window: number) => options.onProgress?.({ total, processed, queued, window, windows, phase })
 
-  const persistPayload = !mobile || !online || !navigator.onLine
+  // Always persist the original to durable storage (OPFS, else an IndexedDB blob).
+  // Mobile browsers evict in-memory File handles aggressively when the page is
+  // backgrounded during the system photo picker, so a transient payload was the root
+  // cause of "mobile upload basically unusable" — the queued job survived but its bytes
+  // did not. The store releases each payload as soon as its upload completes, and surfaces
+  // quota errors per-file, so durable persistence is the safe default on every device.
+  const persistPayload = true
   report('registering', 1)
   if (persistPayload) void requestPersistentStorage()
   for (let start = 0; start < total; start += windowSize) {
