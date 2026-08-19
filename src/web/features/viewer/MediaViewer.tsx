@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RefObject, SyntheticEvent, TouchEvent as ReactTouchEvent, WheelEvent as ReactWheelEvent } from 'react'
-import { Album, ChevronLeft, ChevronRight, Download, Heart, Maximize2, Send, Trash2, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Album, ChevronLeft, ChevronRight, Download, Heart, Maximize2, Trash2, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
 import { api } from '../../lib/api'
 import type { Album as AlbumType, Asset, DiscoverModule } from '../../types'
@@ -335,7 +335,6 @@ export function MediaViewer() {
           </> : null}
           <button type="button" onClick={() => void toggleFavorite(asset)} aria-label={asset.favorite ? '取消收藏' : '收藏'} aria-pressed={asset.favorite}><Heart fill={asset.favorite ? 'currentColor' : 'none'} /><span>收藏</span></button>
           {asset.originalAvailableInApp && asset.mediaUrl && <a href={asset.mediaUrl} download={asset.originalName} aria-label={`下载 ${asset.originalName}`}><Download /><span>下载</span></a>}
-          {asset.telegramUrl && <a href={asset.telegramUrl} target="_blank" rel="noreferrer" aria-label="在 Telegram 打开"><Send /><span>Telegram</span></a>}
           <button className="danger-button" type="button" aria-label="移入回收站" onClick={() => { if (window.confirm(`将“${asset.originalName}”移入回收站？Telegram 中的原文件不会被删除。`)) void trashAsset(asset) }}><Trash2 /><span>回收站</span></button>
         </div>
       </div>

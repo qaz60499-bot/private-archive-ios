@@ -13,6 +13,7 @@ import { createUploadToken } from '../lib/crypto'
 import { requireOwner } from '../lib/security'
 import { createStorageAdapter } from '../services/storage/factory'
 import { fetchPreviewCached } from '../services/storage/preview-cache'
+import { EDGE_MEDIA_TTL, edgeMediaCacheKey, matchEdgeMedia, openEdgeMediaCache, storeEdgeMedia, type EdgeMediaSource } from '../services/storage/edge-media-cache'
 import { TelegramApiError } from '../services/telegram/telegram-client'
 
 export const assetsRoutes = new Hono<{ Bindings: Env }>()
@@ -220,37 +221,98 @@ assetsRoutes.get('/', async (context) => {
 assetsRoutes.get('/:id/preview', async (context) => {
   const asset = await getAsset(context.env.DB, context.req.param('id'))
   if (!asset || asset.status === 'trashed') return context.json({ error: 'ASSET_NOT_FOUND' }, 404)
-  if (context.env.MOCK_TELEGRAM === 'true') return mockPreview(asset.id, asset.original_name, asset.primary_category, asset.width, asset.height)
+
+  const browserCacheControl = 'private, max-age=604800, immutable'
+  const edgeCache = await openEdgeMediaCache()
+  const cacheKey = edgeMediaCacheKey(context.req.raw, 'preview', asset.id)
+  const edgeHit = await matchEdgeMedia(edgeCache, cacheKey, browserCacheControl)
+  if (edgeHit) return edgeHit
+
+  if (context.env.MOCK_TELEGRAM === 'true') {
+    return storeEdgeMedia(edgeCache, cacheKey, mockPreview(asset.id, asset.original_name, asset.primary_category, asset.width, asset.height), {
+      browserCacheControl,
+      edgeTtlSeconds: EDGE_MEDIA_TTL.preview,
+      source: 'mock',
+      waitUntil: (promise) => context.executionCtx.waitUntil(promise),
+    })
+  }
+
   const fileId = asset.preview_file_id ?? (asset.media_type === 'photo' && asset.size_bytes <= 20 * 1024 * 1024 ? asset.storage_file_id : null)
   if (!fileId) return context.json({ error: 'PREVIEW_NOT_AVAILABLE' }, 404)
 
-  return fetchPreviewCached(
+  const response = await fetchPreviewCached(
     () => storageFor(context.env),
     fileId,
     context.env.PREVIEW_CACHE,
     (promise) => context.executionCtx.waitUntil(promise),
   )
+  const source: EdgeMediaSource = response.headers.get('X-Private-Archive-Preview-Cache') === 'kv' ? 'kv' : 'telegram'
+  return storeEdgeMedia(edgeCache, cacheKey, response, {
+    browserCacheControl,
+    edgeTtlSeconds: EDGE_MEDIA_TTL.preview,
+    source,
+    waitUntil: (promise) => context.executionCtx.waitUntil(promise),
+  })
 })
 
 assetsRoutes.get('/:id/media', async (context) => {
   const asset = await getAsset(context.env.DB, context.req.param('id'))
   if (!asset || asset.status === 'trashed') return context.json({ error: 'ASSET_NOT_FOUND' }, 404)
-  if (asset.size_bytes > 20 * 1024 * 1024) return context.json({ error: 'ORIGINAL_AVAILABLE_IN_TELEGRAM_ONLY', telegramUrl: asset.telegram_url }, 409)
-  if (context.env.MOCK_TELEGRAM === 'true') return mockPreview(asset.id, asset.original_name, asset.primary_category, asset.width, asset.height)
+  if (asset.size_bytes > 20 * 1024 * 1024) return context.json({ error: 'ORIGINAL_AVAILABLE_IN_TELEGRAM_ONLY' }, 409)
   if (!asset.storage_file_id) return context.json({ error: 'MEDIA_NOT_AVAILABLE' }, 404)
+
   const range = context.req.header('Range')
+  const edgeEligible = asset.media_type === 'photo' && !range
+  const browserCacheControl = edgeEligible ? 'private, max-age=3600' : 'private, no-store'
+  const edgeCache = edgeEligible ? await openEdgeMediaCache() : null
+  const cacheKey = edgeEligible ? edgeMediaCacheKey(context.req.raw, 'photo', asset.id) : null
+  if (cacheKey && edgeCache) {
+    const edgeHit = await matchEdgeMedia(edgeCache, cacheKey, browserCacheControl)
+    if (edgeHit) return edgeHit
+  }
+
+  if (context.env.MOCK_TELEGRAM === 'true') {
+    const response = mockPreview(asset.id, asset.original_name, asset.primary_category, asset.width, asset.height)
+    if (!cacheKey || !edgeCache) {
+      const headers = new Headers(response.headers)
+      headers.set('Cache-Control', browserCacheControl)
+      headers.set('X-Private-Archive-Edge-Cache', 'BYPASS')
+      headers.set('X-Private-Archive-Upstream', 'mock')
+      headers.set('Server-Timing', 'edge-cache;desc="BYPASS", upstream;desc="mock"')
+      return new Response(response.body, { status: response.status, headers })
+    }
+    return storeEdgeMedia(edgeCache, cacheKey, response, {
+      browserCacheControl,
+      edgeTtlSeconds: EDGE_MEDIA_TTL.photo,
+      source: 'mock',
+      waitUntil: (promise) => context.executionCtx.waitUntil(promise),
+    })
+  }
+
   const response = await (await storageFor(context.env)).fetchFile(asset.storage_file_id, range ? { headers: { Range: range } } : undefined)
   const headers = new Headers({
     'Content-Type': response.headers.get('Content-Type') ?? asset.mime_type,
     'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(asset.original_name)}`,
-    'Cache-Control': asset.media_type === 'photo' ? 'private, max-age=3600' : 'private, no-store',
+    'Cache-Control': browserCacheControl,
+    'X-Private-Archive-Upstream': 'telegram',
   })
   for (const name of ['Content-Range', 'Content-Length', 'Accept-Ranges', 'ETag', 'Last-Modified']) {
     const value = response.headers.get(name)
     if (value) headers.set(name, value)
   }
   if (asset.media_type === 'video' && !headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes')
-  return new Response(response.body, { status: response.status, headers })
+  if (!cacheKey || !edgeCache) {
+    headers.set('X-Private-Archive-Edge-Cache', 'BYPASS')
+    headers.set('Server-Timing', 'edge-cache;desc="BYPASS", upstream;desc="telegram"')
+    return new Response(response.body, { status: response.status, headers })
+  }
+  const mediaResponse = new Response(response.body, { status: response.status, headers })
+  return storeEdgeMedia(edgeCache, cacheKey, mediaResponse, {
+    browserCacheControl,
+    edgeTtlSeconds: EDGE_MEDIA_TTL.photo,
+    source: 'telegram',
+    waitUntil: (promise) => context.executionCtx.waitUntil(promise),
+  })
 })
 
 assetsRoutes.post('/bulk-trash', async (context) => {

@@ -26,7 +26,6 @@ export interface Asset {
   analysisStatus: string
   previewUrl: string
   mediaUrl: string | null
-  telegramUrl: string | null
   originalAvailableInApp: boolean
   tags?: Array<{ slug: string; name: string; confidence: number | null; source: string }>
 }

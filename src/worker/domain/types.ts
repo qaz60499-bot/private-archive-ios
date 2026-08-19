@@ -81,7 +81,6 @@ export interface PublicAsset {
   analysisStatus: AnalysisStatus
   previewUrl: string
   mediaUrl: string | null
-  telegramUrl: string | null
   originalAvailableInApp: boolean
   tags?: AssetTag[]
 }
@@ -189,7 +188,6 @@ export function toPublicAsset(row: AssetRow, tags?: AssetTag[]): PublicAsset {
     analysisStatus: row.analysis_status,
     previewUrl: `/api/assets/${row.id}/preview`,
     mediaUrl: originalAvailableInApp ? `/api/assets/${row.id}/media` : null,
-    telegramUrl: row.telegram_url,
     originalAvailableInApp,
     tags,
   }
