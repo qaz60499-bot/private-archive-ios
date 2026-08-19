@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 const tinyPdf = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF')
+const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
 
 async function openUpload(page: Page): Promise<void> {
   await page.goto('/')
@@ -24,13 +25,30 @@ async function chooseIdenticalFiles(page: Page, names: string[]): Promise<void> 
 
 async function localJobs(page: Page): Promise<Array<Record<string, unknown>>> {
   return page.evaluate(async () => await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-    const request = indexedDB.open('private-archive-offline', 2)
+    const request = indexedDB.open('private-archive-offline', 3)
     request.onerror = () => reject(request.error)
     request.onsuccess = () => {
       const transaction = request.result.transaction('uploads', 'readonly')
       const all = transaction.objectStore('uploads').getAll()
       all.onerror = () => reject(all.error)
       all.onsuccess = () => resolve(all.result as Array<Record<string, unknown>>)
+    }
+  }))
+}
+
+async function localPayloads(page: Page): Promise<Array<{ key: string; byteLength: number; arrayBuffer: boolean }>> {
+  return page.evaluate(async () => await new Promise<Array<{ key: string; byteLength: number; arrayBuffer: boolean }>>((resolve, reject) => {
+    const request = indexedDB.open('private-archive-offline', 3)
+    request.onerror = () => reject(request.error)
+    request.onsuccess = () => {
+      const transaction = request.result.transaction('payloads', 'readonly')
+      const all = transaction.objectStore('payloads').getAll()
+      all.onerror = () => reject(all.error)
+      all.onsuccess = () => resolve((all.result as Array<{ key: string; bytes: ArrayBuffer }>).map((payload) => ({
+        key: payload.key,
+        byteLength: payload.bytes?.byteLength ?? 0,
+        arrayBuffer: payload.bytes instanceof ArrayBuffer,
+      })))
     }
   }))
 }
@@ -130,6 +148,44 @@ test('iPhone upload sheet uses direct native photo import and preserves metadata
   await expect(photoInput).toHaveAttribute('multiple', '')
 })
 
+test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storage', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'Safari-class IndexedDB payload compatibility is mobile-specific')
+  await page.addInitScript(() => {
+    const originalPut = IDBObjectStore.prototype.put
+    IDBObjectStore.prototype.put = function (value: unknown, key?: IDBValidKey) {
+      const candidate = value as { fileBlob?: unknown; previewBlob?: unknown } | null
+      if (candidate && (candidate.fileBlob instanceof Blob || candidate.previewBlob instanceof Blob)) {
+        throw new DOMException('BlobURLs are not yet supported.', 'DataCloneError')
+      }
+      return key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key)
+    }
+  })
+  let previewCalls = 0
+  await page.route('**/api/assets/reserve', async (route) => {
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ assetId: 'ios-photo', uploadToken: 'token', duplicate: false, sizeTier: 'inline' }) })
+  })
+  await page.route('**/api/assets/ios-photo/preview', async (route) => {
+    previewCalls += 1
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ ok: true }) })
+  })
+  await page.route('**/api/assets/ios-photo/content', async (route) => {
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null }) })
+  })
+
+  await openUpload(page)
+  const chooserPromise = page.waitForEvent('filechooser')
+  await page.getByRole('button', { name: '选择照片、视频或文件' }).click()
+  const chooser = await chooserPromise
+  await chooser.setFiles([{ name: 'ios-picker-photo.png', mimeType: 'image/png', buffer: onePixelPng }])
+
+  await expect.poll(async () => (await localJobs(page))[0]?.status, { timeout: 20_000 }).toBe('done')
+  expect(previewCalls).toBe(1)
+  const completed = (await localJobs(page))[0]
+  expect(completed.fileBlob).toBeUndefined()
+  expect(completed.previewBlob).toBeUndefined()
+  expect(await localPayloads(page)).toHaveLength(0)
+})
+
 test('240-item mobile import advances through bounded windows and completes one batch', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'mobile', 'mobile large-import window contract')
   let reserveCalls = 0
@@ -160,13 +216,19 @@ test('offline registration resumes online and preserves payload until success', 
   await chooseFiles(page, ['offline-recovery.pdf'])
   await expect.poll(async () => (await localJobs(page)).length).toBe(1)
   expect((await localJobs(page))[0]).toMatchObject({ status: 'paused', controlState: 'active', prepareStatus: 'pending' })
-  expect(Boolean((await localJobs(page))[0].fileBlob || (await localJobs(page))[0].opfsPath)).toBe(true)
+  expect((await localJobs(page))[0].fileBlob).toBeUndefined()
+  const persisted = await localPayloads(page)
+  expect(persisted).toHaveLength(1)
+  expect(persisted[0]).toMatchObject({ arrayBuffer: true })
+  expect(persisted[0].key).toContain(':original')
+  expect(persisted[0].byteLength).toBeGreaterThan(0)
 
   await page.context().setOffline(false)
   await expect.poll(async () => (await localJobs(page))[0]?.status, { timeout: 20_000 }).toBe('done')
   const completed = (await localJobs(page))[0]
   expect(completed.deduplicated).toBe(true)
   expect(Boolean(completed.fileBlob || completed.opfsPath)).toBe(false)
+  expect(await localPayloads(page)).toHaveLength(0)
 })
 
 test('one Access failure does not block another item in the same batch', async ({ page }, testInfo) => {

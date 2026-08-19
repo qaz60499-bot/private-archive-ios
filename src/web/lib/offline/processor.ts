@@ -2,7 +2,7 @@ import { ApiError, api } from '../api'
 import { sha256File } from '../file-hash'
 import { prepareMedia } from '../preview/media-metadata'
 import {
-  getLocalUpload, getLocalUploadFile, listLocalUploads, releaseLocalUploadPayload, updateLocalUpload,
+  getLocalUpload, getLocalUploadFile, getLocalUploadPreview, listLocalUploads, releaseLocalUploadPayload, storeLocalUploadPreview, updateLocalUpload,
 } from './store'
 import type { LocalUploadJob } from '../../types'
 import { calculateRetryDelay, friendlyUploadError, getUploadSchedulerLimits as policyLimits } from './scheduler-policy'
@@ -49,8 +49,9 @@ async function prepareLocalUpload(job: LocalUploadJob): Promise<void> {
     notify()
     const [prepared, contentHash] = await Promise.all([prepareMedia(file), sha256File(file)])
     if (controller.signal.aborted) return
+    const previewStored = await storeLocalUploadPreview(job.id, prepared.preview)
     await updateLocalUpload(job.id, {
-      prepareStatus: 'ready', stage: 'reserving', progress: 15, previewBlob: prepared.preview,
+      prepareStatus: 'ready', stage: 'reserving', progress: 15, previewBlob: undefined, previewStored: previewStored || undefined,
       contentHash, metadata: { ...prepared.metadata, contentHash }, error: undefined,
     })
   } catch (error) {
@@ -136,9 +137,10 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
       return true
     }
 
-    if (job.previewBlob && !job.previewUploaded) {
+    const preview = !job.previewUploaded ? await getLocalUploadPreview(job) : null
+    if (preview) {
       await updateLocalUpload(id, { stage: 'preview', progress: 34 })
-      if (!await withFreshToken(() => api.uploadPreview(assetId as string, uploadToken as string, job.previewBlob as Blob, controller.signal))) return true
+      if (!await withFreshToken(() => api.uploadPreview(assetId as string, uploadToken as string, preview, controller.signal))) return true
       await updateLocalUpload(id, { previewUploaded: true, progress: 46 })
     }
 

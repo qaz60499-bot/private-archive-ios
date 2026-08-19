@@ -115,6 +115,7 @@ export interface LocalUploadJob {
   duplicateOfAssetId?: string
   contentHash?: string
   previewUploaded?: boolean
+  previewStored?: boolean
   transientPayload?: boolean
   opfsPath?: string
   fileBlob?: Blob

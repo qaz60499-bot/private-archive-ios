@@ -25,6 +25,28 @@ test('mobile: bottom nav dock is hidden while the upload sheet is open and resto
   await expect(dock).toBeVisible()
 })
 
+test('mobile: bottom nav remains pinned to the visible viewport after scrolling to the document end', async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'viewport pinning is a mobile Safari-class interaction')
+  expect((await request.post('/api/dev/seed')).ok()).toBeTruthy()
+  await page.goto('/')
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+  await page.waitForTimeout(100)
+
+  const metrics = await page.locator('.mobile-nav-dock').evaluate((node) => {
+    const rect = node.getBoundingClientRect()
+    const visualViewport = window.visualViewport
+    return {
+      position: getComputedStyle(node).position,
+      transform: getComputedStyle(node).transform,
+      bottom: rect.bottom,
+      viewportBottom: visualViewport ? visualViewport.offsetTop + visualViewport.height : window.innerHeight,
+    }
+  })
+  expect(metrics.position).toBe('fixed')
+  expect(metrics.transform).toBe('none')
+  expect(Math.abs(metrics.bottom - metrics.viewportBottom)).toBeLessThanOrEqual(2)
+})
+
 test('access-check rejects protocol-relative external return targets', async ({ page }) => {
   await page.goto('/access-check?return=%2F%2Fevil.example%2Fsteal')
   await expect(page).toHaveURL('http://127.0.0.1:8787/')

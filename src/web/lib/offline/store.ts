@@ -4,15 +4,25 @@ import { normalizeLocalUpload, originalLocalFileLastModified } from './job-model
 
 export { normalizeLocalUpload } from './job-model'
 
+interface PersistedUploadPayload {
+  key: string
+  bytes: ArrayBuffer
+  mimeType: string
+}
+
 interface ArchiveOfflineDb extends DBSchema {
   uploads: {
     key: string
     value: LocalUploadJob
     indexes: { 'by-status': string; 'by-updated': string; 'by-batch': string; 'by-next-attempt': string }
   }
+  payloads: {
+    key: string
+    value: PersistedUploadPayload
+  }
 }
 
-const dbPromise = openDB<ArchiveOfflineDb>('private-archive-offline', 2, {
+const dbPromise = openDB<ArchiveOfflineDb>('private-archive-offline', 3, {
   upgrade(database, oldVersion, _newVersion, transaction) {
     const store = oldVersion < 1
       ? database.createObjectStore('uploads', { keyPath: 'id' })
@@ -23,6 +33,7 @@ const dbPromise = openDB<ArchiveOfflineDb>('private-archive-offline', 2, {
     }
     if (!store.indexNames.contains('by-batch')) store.createIndex('by-batch', 'batchId')
     if (!store.indexNames.contains('by-next-attempt')) store.createIndex('by-next-attempt', 'nextAttemptAt')
+    if (!database.objectStoreNames.contains('payloads')) database.createObjectStore('payloads', { keyPath: 'key' })
   },
 })
 
@@ -35,6 +46,31 @@ async function persistNormalization(jobs: LocalUploadJob[]): Promise<void> {
 
 const OPFS_WRITE_TIMEOUT_MS = 15_000
 const transientPayloads = new Map<string, File>()
+
+type PayloadKind = 'original' | 'preview'
+
+function payloadKey(id: string, kind: PayloadKind): string {
+  return `${id}:${kind}`
+}
+
+async function persistPayloadBytes(id: string, kind: PayloadKind, blob: Blob): Promise<void> {
+  const bytes = await blob.arrayBuffer()
+  await (await dbPromise).put('payloads', { key: payloadKey(id, kind), bytes, mimeType: blob.type || 'application/octet-stream' })
+}
+
+async function readPayload(id: string, kind: PayloadKind): Promise<PersistedUploadPayload | undefined> {
+  return (await dbPromise).get('payloads', payloadKey(id, kind))
+}
+
+async function removePayloads(id: string): Promise<void> {
+  const database = await dbPromise
+  const transaction = database.transaction('payloads', 'readwrite')
+  await Promise.all([
+    transaction.store.delete(payloadKey(id, 'original')),
+    transaction.store.delete(payloadKey(id, 'preview')),
+  ])
+  await transaction.done
+}
 
 function shouldUseOpfs(): boolean {
   const ua = navigator.userAgent ?? ''
@@ -123,7 +159,6 @@ export async function enqueueLocalUpload(options: {
     updatedAt: now,
     transientPayload: !persistPayload || undefined,
     opfsPath,
-    fileBlob: persistPayload && !opfsPath ? options.file : undefined,
     metadata: {
       originalName: options.file.name,
       mimeType: options.file.type || 'application/octet-stream',
@@ -133,10 +168,11 @@ export async function enqueueLocalUpload(options: {
     },
   }
   try {
+    if (persistPayload && !opfsPath) await persistPayloadBytes(id, 'original', options.file)
     await (await dbPromise).put('uploads', job)
   } catch (error) {
     transientPayloads.delete(id)
-    await removeFromOpfs(opfsPath)
+    await Promise.all([removeFromOpfs(opfsPath), removePayloads(id)])
     if (error instanceof DOMException && ['QuotaExceededError', 'UnknownError'].includes(error.name)) {
       throw new Error('本机可用存储空间不足，无法安全保存原件。请释放空间后重试。', { cause: error })
     }
@@ -163,8 +199,28 @@ export async function getLocalUploadFile(job: LocalUploadJob): Promise<File | nu
   const opfsFile = job.opfsPath ? await readFromOpfs(job.opfsPath) : null
   const lastModified = originalLocalFileLastModified(job)
   if (opfsFile) return new File([opfsFile], job.fileName, { type: job.mimeType, lastModified })
+  const persisted = await readPayload(job.id, 'original')
+  if (persisted) return new File([persisted.bytes], job.fileName, { type: job.mimeType || persisted.mimeType, lastModified })
   if (job.fileBlob) return new File([job.fileBlob], job.fileName, { type: job.mimeType, lastModified })
   return null
+}
+
+export async function storeLocalUploadPreview(id: string, preview?: Blob): Promise<boolean> {
+  if (!preview) return false
+  try {
+    await persistPayloadBytes(id, 'preview', preview)
+    return true
+  } catch {
+    const database = await dbPromise
+    await database.delete('payloads', payloadKey(id, 'preview'))
+    return false
+  }
+}
+
+export async function getLocalUploadPreview(job: LocalUploadJob): Promise<Blob | null> {
+  const persisted = await readPayload(job.id, 'preview')
+  if (persisted) return new Blob([persisted.bytes], { type: persisted.mimeType })
+  return job.previewBlob ?? null
 }
 
 export async function updateLocalUpload(id: string, patch: Partial<LocalUploadJob>): Promise<LocalUploadJob | undefined> {
@@ -181,12 +237,13 @@ export async function releaseLocalUploadPayload(id: string): Promise<void> {
   const database = await dbPromise
   const job = await database.get('uploads', id)
   if (!job) return
-  await removeFromOpfs(job.opfsPath)
+  await Promise.all([removeFromOpfs(job.opfsPath), removePayloads(id)])
   await database.put('uploads', {
     ...job,
     opfsPath: undefined,
     fileBlob: undefined,
     previewBlob: undefined,
+    previewStored: undefined,
     transientPayload: undefined,
     updatedAt: new Date().toISOString(),
   })
@@ -201,6 +258,6 @@ export async function removeLocalUpload(id: string): Promise<void> {
   transientPayloads.delete(id)
   const database = await dbPromise
   const job = await database.get('uploads', id)
-  await removeFromOpfs(job?.opfsPath)
+  await Promise.all([removeFromOpfs(job?.opfsPath), removePayloads(id)])
   await database.delete('uploads', id)
 }
