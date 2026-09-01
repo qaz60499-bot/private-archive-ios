@@ -24,7 +24,8 @@ import {
   replaceAppUserGrants,
   type AppUserGrant,
 } from '../db/app-user-access-repository'
-import { APP_SESSION_COOKIE, APP_SESSION_TTL_SECONDS, appPasswordNeedsUpgrade, createAppSessionToken, hashAppPassword, verifyAppPassword } from '../lib/app-auth'
+import { APP_SESSION_COOKIE, APP_SESSION_TTL_SECONDS, createAppSessionToken, hashAppPassword, verifyAppPassword } from '../lib/app-auth'
+import { appendCookieDomain, nativeAppCookieDomain } from '../lib/app-session-cookie'
 import { readCookieValue } from '../lib/cookies'
 import { isDesktopApiRequest, requireAccess, requireAccessOwner, resolveRequestAppUser } from '../lib/security'
 
@@ -38,12 +39,18 @@ function secureCookie(url: string): boolean {
   return new URL(url).protocol === 'https:'
 }
 
-function sessionCookie(token: string, secure: boolean): string {
-  return `${APP_SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${APP_SESSION_TTL_SECONDS}${secure ? '; Secure' : ''}`
+function sessionCookie(token: string, secure: boolean, domain: string | null): string {
+  const cookie = `${APP_SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${APP_SESSION_TTL_SECONDS}${secure ? '; Secure' : ''}`
+  return appendCookieDomain(cookie, domain)
 }
 
-function clearSessionCookie(secure: boolean): string {
-  return `${APP_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`
+function clearSessionCookie(secure: boolean, domain: string | null): string {
+  const cookie = `${APP_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`
+  return appendCookieDomain(cookie, domain)
+}
+
+function requestCookieDomain(context: { req: { url: string; header(name: string): string | undefined } }): string | null {
+  return nativeAppCookieDomain(context.req.url, context.req.header('X-Private-Archive-Native'))
 }
 
 function rawSessionToken(cookieHeader: string | undefined): string | null {
@@ -181,7 +188,7 @@ authRoutes.post('/bootstrap', requireAccessOwner, async (context) => {
     const user = await createAppUser(context.env.DB, { username, displayName, passwordHash, role: 'OWNER' })
     const token = createAppSessionToken()
     await createAppSession(context.env.DB, user.id, token)
-    context.header('Set-Cookie', sessionCookie(token, secureCookie(context.req.url)))
+    context.header('Set-Cookie', sessionCookie(token, secureCookie(context.req.url), requestCookieDomain(context)))
     return context.json({ user: await publicUserWithAccess(context.env.DB, user) }, 201)
   } catch (error) {
     const code = error instanceof Error ? error.message : 'APP_BOOTSTRAP_FAILED'
@@ -213,12 +220,13 @@ authRoutes.post('/login', requireAccess, async (context) => {
     await recordLoginAttempt(context.env.DB, ip, username, ok)
     if (!ok || !user) return context.json({ error: 'LOGIN_INVALID' }, 401)
     await clearLoginFailures(context.env.DB, ip, username)
-    if (appPasswordNeedsUpgrade(user.password_hash)) {
-      await updateAppUser(context.env.DB, user.id, { passwordHash: await hashAppPassword(password) })
-    }
+    // Do not synchronously rehash legacy passwords during login. A stronger PBKDF2
+    // migration can exceed the Worker request CPU budget after verification has
+    // already succeeded, which turns a valid password into LOGIN_FAILED and leaves
+    // no session. Explicit password changes still use the current stronger hash.
     const token = createAppSessionToken()
     await createAppSession(context.env.DB, user.id, token)
-    context.header('Set-Cookie', sessionCookie(token, secureCookie(context.req.url)))
+    context.header('Set-Cookie', sessionCookie(token, secureCookie(context.req.url), requestCookieDomain(context)))
     return context.json({ user: await publicUserWithAccess(context.env.DB, user) })
   } catch (error) {
     const code = error instanceof Error ? error.message : 'LOGIN_FAILED'
@@ -230,7 +238,7 @@ authRoutes.post('/login', requireAccess, async (context) => {
 authRoutes.post('/logout', requireAccess, async (context) => {
   const token = rawSessionToken(context.req.header('Cookie'))
   if (token) await deleteAppSession(context.env.DB, token)
-  context.header('Set-Cookie', clearSessionCookie(secureCookie(context.req.url)))
+  context.header('Set-Cookie', clearSessionCookie(secureCookie(context.req.url), requestCookieDomain(context)))
   return context.json({ ok: true })
 })
 
