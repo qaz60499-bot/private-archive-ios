@@ -8,6 +8,7 @@ import { MemoryAperture } from '../components/MemoryAperture'
 import { TimelineMonthJump } from '../components/TimelineMonthJump'
 import { TimelineSection } from '../features/timeline/MediaGrid'
 import { api } from '../lib/api'
+import { summarizeImportErrors } from '../lib/import-error-summary'
 import { parseArchiveSearch } from '../lib/search-query'
 import { telegramUserGroupBridge } from '../lib/telegram-user-group'
 import type { Asset, StorageBackend } from '../types'
@@ -108,7 +109,7 @@ export function TimelinePage() {
       // Same app-level importer as the upload sheet, so the global toast and this row
       // stay in sync and feedback survives navigation.
       const result = await runImport(files, { mobile: true, storageBackend: mobileStorageBackend })
-      if (result?.errors.length) setActionError(result.errors.join('；'))
+      if (result?.errors.length) setActionError(summarizeImportErrors(result.errors))
     } catch (caught) {
       setActionError(caught instanceof Error ? caught.message : '手机照片导入失败')
     }

@@ -7,6 +7,7 @@ import { ImportToast } from '../components/ImportToast'
 import { OfflineBadge } from '../components/UploadControls'
 import { useArchive } from '../context/ArchiveContext'
 import { api } from '../lib/api'
+import { summarizeImportErrors } from '../lib/import-error-summary'
 import { summarizeUploadBatches } from '../lib/offline/batch'
 import {
   cancelLocalUpload, cancelUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload,
@@ -157,7 +158,7 @@ export function WebUploadPage() {
     setError(null)
     try {
       const result = await runImport(selected, { mobile, storageBackend })
-      if (result?.errors.length) setError(result.errors.join('；'))
+      if (result?.errors.length) setError(summarizeImportErrors(result.errors))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '无法加入上传队列')
     } finally {

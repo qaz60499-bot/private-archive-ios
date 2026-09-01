@@ -1,21 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api } from '../lib/api'
+import { summarizeImportErrors } from '../lib/import-error-summary'
 import { importFiles, type ImportFilesResult } from '../lib/import-files'
 import { clearAccessReauthGuard, isAccessSignInRequired, requestAccessReauth } from '../lib/access-session'
 import type { Asset, StorageBackend } from '../types'
 
 // Translate the low-level ApiError codes (message === code, see ApiError) into calm
 // Chinese copy. Without this the timeline surfaces raw tokens like ACCESS_SIGN_IN_REQUIRED.
-function summarizeImportErrors(errors: string[]): string | null {
-  if (!errors.length) return null
-  if (errors.length === 1) return errors[0]
-  const first = errors[0]
-  const separator = first.indexOf('：')
-  const reason = (separator >= 0 ? first.slice(separator + 1) : first).trim()
-  const conciseReason = reason.length > 180 ? `${reason.slice(0, 177)}…` : reason
-  return `${errors.length} 项未能加入上传队列。主要原因：${conciseReason}`
-}
-
 function friendlyLoadError(caught: unknown, fallback: string): string {
   const code = caught instanceof Error ? caught.message : ''
   switch (code) {

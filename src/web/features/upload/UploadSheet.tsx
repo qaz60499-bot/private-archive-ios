@@ -3,6 +3,7 @@ import { Camera, CheckCircle2, CloudDownload, FileUp, FolderOpen, LoaderCircle, 
 import { useArchive } from '../../context/ArchiveContext'
 import { api } from '../../lib/api'
 import { telegramUserGroupBridge } from '../../lib/telegram-user-group'
+import { summarizeImportErrors } from '../../lib/import-error-summary'
 import { canUseIosBackgroundUpload } from '../../lib/native-background-upload'
 import { isNativeApp, nativePlatform } from '../../lib/native-platform'
 import { summarizeUploadBatches, type UploadBatchSummary } from '../../lib/offline/batch'
@@ -140,7 +141,7 @@ export function UploadSheet() {
       // sheet (or the whole picker flow on mobile) closes — the global toast reads the
       // same importStatus. The durable enqueue loop is unchanged.
       const result = await runImport(selected, { mobile, storageBackend })
-      if (result?.errors.length) setError(result.errors.join('；'))
+      if (result?.errors.length) setError(summarizeImportErrors(result.errors))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '无法加入上传队列')
     } finally {
