@@ -212,6 +212,7 @@ export interface LocalUploadJob {
   previewUploaded?: boolean
   previewStored?: boolean
   transientPayload?: boolean
+  nativeBackground?: boolean
   opfsPath?: string
   fileBlob?: Blob
   previewBlob?: Blob

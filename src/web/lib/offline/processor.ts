@@ -7,6 +7,7 @@ import {
 } from './store'
 import type { LocalUploadJob } from '../../types'
 import { calculateRetryDelay, friendlyUploadError, getUploadSchedulerLimits as policyLimits } from './scheduler-policy'
+import { cancelNativeBackgroundTransfer, pauseNativeBackgroundTransfer, resumeNativeBackgroundTransfer } from '../native-background-upload-plugin'
 
 export { calculateRetryDelay, friendlyUploadError } from './scheduler-policy'
 
@@ -212,7 +213,7 @@ async function runSchedulerPass(): Promise<void> {
   if (!navigator.onLine) return
   const jobs = await listLocalUploads()
   const limits = getUploadSchedulerLimits()
-  const eligible = jobs.filter((job) => job.controlState === 'active' && !['done', 'failed'].includes(job.status) && due(job))
+  const eligible = jobs.filter((job) => !job.nativeBackground && job.controlState === 'active' && !['done', 'failed'].includes(job.status) && due(job))
   const prepareSlots = Math.max(0, limits.prepare - activePrepare.size)
   const preparing = eligible.filter((job) => job.prepareStatus === 'pending' && !activePrepare.has(job.id)).slice(0, prepareSlots)
   preparing.forEach((job) => void prepareLocalUpload(job))
@@ -258,6 +259,7 @@ export function resumePendingUploads(): Promise<void> {
 
 export async function pauseLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
+  if (job?.nativeBackground) await pauseNativeBackgroundTransfer(id)
   await updateLocalUpload(id, {
     controlState: 'paused', status: 'paused', error: '已暂停，原件仍安全保存在本机。',
     prepareStatus: job?.prepareStatus === 'preparing' ? 'pending' : job?.prepareStatus,
@@ -270,15 +272,18 @@ export async function pauseLocalUpload(id: string): Promise<void> {
 
 export async function resumeLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
+  if (job?.nativeBackground) await resumeNativeBackgroundTransfer(id)
   await updateLocalUpload(id, {
     controlState: 'active', status: 'retrying', nextAttemptAt: undefined, error: undefined,
     prepareStatus: job?.prepareStatus === 'failed' ? 'pending' : job?.prepareStatus,
   })
   notify()
-  await wakeUploadScheduler('resume-job')
+  if (!job?.nativeBackground) await wakeUploadScheduler('resume-job')
 }
 
 export async function cancelLocalUpload(id: string): Promise<void> {
+  const job = await getLocalUpload(id)
+  if (job?.nativeBackground) await cancelNativeBackgroundTransfer(id)
   await updateLocalUpload(id, { controlState: 'canceled', status: 'failed', error: '已取消，本机临时原件已释放。', nextAttemptAt: undefined })
   activePrepare.get(id)?.abort()
   activeUpload.get(id)?.abort()
@@ -293,26 +298,12 @@ export async function pauseUploadBatch(batchId: string): Promise<void> {
 
 export async function resumeUploadBatch(batchId: string): Promise<void> {
   const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId && job.status !== 'done' && job.controlState !== 'canceled')
-  await Promise.all(jobs.map(async (job) => {
-    await updateLocalUpload(job.id, {
-      controlState: 'active', status: 'retrying', nextAttemptAt: undefined, error: undefined,
-      prepareStatus: job.prepareStatus === 'failed' ? 'pending' : job.prepareStatus,
-    })
-  }))
-  notify()
-  await wakeUploadScheduler('resume-batch')
+  await Promise.all(jobs.map((job) => resumeLocalUpload(job.id)))
 }
 
 export async function retryFailedUploadBatch(batchId: string): Promise<void> {
   const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId && job.status === 'failed' && job.controlState !== 'canceled')
-  await Promise.all(jobs.map(async (job) => {
-    await updateLocalUpload(job.id, {
-      controlState: 'active', status: 'retrying', nextAttemptAt: undefined, error: undefined,
-      prepareStatus: job.prepareStatus === 'failed' ? 'pending' : job.prepareStatus,
-    })
-  }))
-  notify()
-  await wakeUploadScheduler('retry-batch')
+  await Promise.all(jobs.map((job) => resumeLocalUpload(job.id)))
 }
 
 export async function cancelUploadBatch(batchId: string): Promise<void> {

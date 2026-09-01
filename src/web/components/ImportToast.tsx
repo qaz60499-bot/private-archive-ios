@@ -6,8 +6,8 @@ import { subscribeUploadScheduler } from '../lib/offline/processor'
 import { listLocalUploads } from '../lib/offline/store'
 import type { LocalUploadJob } from '../types'
 
-// App-level import feedback. "Queued" means the bytes have been persisted in the
-// browser recovery queue; it is deliberately distinct from Telegram confirmation.
+// App-level import feedback. "Queued" means the bytes have been persisted in a
+// recovery queue (native iOS staging or browser storage); it is deliberately distinct from Telegram confirmation.
 // The toast follows the selected batch until each queued item is confirmed, physically
 // deduplicated by reusing an existing Telegram object, or fails and needs attention.
 export function ImportToast() {
@@ -24,10 +24,13 @@ export function ImportToast() {
     }
     void reload()
     const unsubscribe = subscribeUploadScheduler(() => void reload())
+    const onNativeState = () => void reload()
+    window.addEventListener('private-archive:native-upload-state', onNativeState)
     const timer = window.setInterval(() => void reload(), 1500)
     return () => {
       disposed = true
       unsubscribe()
+      window.removeEventListener('private-archive:native-upload-state', onNativeState)
       window.clearInterval(timer)
     }
   }, [batchId])
@@ -42,6 +45,7 @@ export function ImportToast() {
   const canceled = jobs.filter((job) => job.controlState === 'canceled').length
   const unresolved = Math.max(0, queued - confirmed - canceled)
   const telegramSettled = doneRegistering && queued > 0 && unresolved === 0 && failed === 0
+  const backgroundCapable = jobs.some((job) => job.nativeBackground)
 
   const title = active
     ? '正在接收并写入本机恢复队列…'
@@ -61,7 +65,7 @@ export function ImportToast() {
   } else if (failed) {
     detail = `本机已保存 ${queued}/${total} 项 · 已确认 ${confirmed}/${queued} · ${failed} 项需要重试`
   } else if (!telegramSettled && queued) {
-    detail = `本机已保存 ${queued}/${total} 项 · Telegram 已确认 ${confirmed}/${queued} · 剩余 ${unresolved} 项继续上传`
+    detail = `本机已保存 ${queued}/${total} 项 · Telegram 已确认 ${confirmed}/${queued} · 剩余 ${unresolved} 项继续上传${backgroundCapable ? ' · 锁屏/切后台可继续' : ''}`
   } else if (queued) {
     detail = `Telegram 已确认 ${confirmed}/${queued}${deduplicated ? ` · ${deduplicated} 项复用已有 Telegram 原件` : ''}`
   } else {
@@ -79,7 +83,7 @@ export function ImportToast() {
         <span>{detail}</span>
         {active && <div className="import-toast-bar"><i style={{ width: `${percent}%` }} /></div>}
       </div>
-      {doneRegistering && <button type="button" className="import-toast-close" onClick={dismissImportStatus} aria-label="关闭提示"><X /></button>}
+      {doneRegistering && <button type="button" className="import-toast-close" onClick={dismissImportStatus} aria-label="隐藏上传提示，上传会继续" title="仅隐藏提示，上传会继续"><X /></button>}
     </div>
   )
   return createPortal(toast, document.body)

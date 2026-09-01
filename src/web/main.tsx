@@ -4,7 +4,8 @@ import { registerSW } from 'virtual:pwa-register'
 import './styles/main.css'
 import { wakeUploadScheduler } from './lib/offline/processor'
 import { clearSensitivePrivateCaches } from './lib/private-cache'
-import { isNativeApp } from './lib/native-platform'
+import { isNativeApp, nativePlatform } from './lib/native-platform'
+import { initializeIosBackgroundUploadSync, syncIosBackgroundUploads } from './lib/native-background-upload'
 
 const nativeApp = isNativeApp()
 const appSurface = new URLSearchParams(window.location.search).get('app')
@@ -13,6 +14,8 @@ if (appSurface === 'personal-desktop' || nativeApp) {
 } else {
   delete document.documentElement.dataset.appSurface
 }
+if (nativeApp) document.documentElement.dataset.nativePlatform = nativePlatform() ?? 'native'
+else delete document.documentElement.dataset.nativePlatform
 
 // Older builds cached private previews in a runtime cache that did not carry
 // account/permission context. Purge those generations on startup before the
@@ -31,7 +34,12 @@ if (!nativeApp) {
   })
 }
 window.addEventListener('online', () => void wakeUploadScheduler('online'))
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void wakeUploadScheduler('visible') })
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return
+  void syncIosBackgroundUploads()
+  void wakeUploadScheduler('visible')
+})
+void initializeIosBackgroundUploadSync()
 void wakeUploadScheduler('startup')
 
 // Cloudflare's production Web build is intentionally upload-only. The regular

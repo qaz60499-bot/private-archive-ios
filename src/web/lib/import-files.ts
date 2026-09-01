@@ -1,5 +1,6 @@
 import { enqueueLocalUpload } from './offline/store'
 import { wakeUploadScheduler } from './offline/processor'
+import { canUseIosBackgroundUpload, enqueueIosBackgroundUpload } from './native-background-upload'
 import type { MediaType, StorageBackend } from '../types'
 
 export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -80,17 +81,21 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
       } else {
         try {
           const mediaType: MediaType = file.type.startsWith('image/') ? 'photo' : file.type.startsWith('video/') ? 'video' : 'file'
-          await enqueueLocalUpload({ file, batchId, mediaType, persistPayload, storageBackend })
+          if (canUseIosBackgroundUpload(storageBackend)) {
+            await enqueueIosBackgroundUpload({ file, batchId, mediaType, storageBackend })
+          } else {
+            await enqueueLocalUpload({ file, batchId, mediaType, persistPayload, storageBackend })
+          }
           queued += 1
           report('registering', windowNumber)
-          if (online && navigator.onLine) void wakeUploadScheduler('import-window')
+          if (online && navigator.onLine && !canUseIosBackgroundUpload(storageBackend)) void wakeUploadScheduler('import-window')
         } catch (error) {
           errors.push(`${file.name}：${error instanceof Error ? error.message : '无法加入上传队列'}`)
         }
       }
     }
 
-    if (online && navigator.onLine) void wakeUploadScheduler('import-window-ready')
+    if (online && navigator.onLine && !canUseIosBackgroundUpload(storageBackend)) void wakeUploadScheduler('import-window-ready')
     if (end < total) await yieldToBrowser()
   }
 

@@ -143,6 +143,48 @@ async function removeFromOpfs(path?: string): Promise<void> {
   }
 }
 
+export async function registerNativeLocalUpload(options: {
+  id: string
+  batchId: string
+  file: Pick<File, 'name' | 'type' | 'size' | 'lastModified'>
+  mediaType: LocalUploadJob['mediaType']
+  storageBackend?: StorageBackend
+}): Promise<LocalUploadJob> {
+  if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
+  const now = new Date().toISOString()
+  const job: LocalUploadJob = {
+    id: options.id,
+    schemaVersion: 2,
+    batchId: options.batchId,
+    principalId: activePrincipalId,
+    fileName: options.file.name,
+    mimeType: options.file.type || 'application/octet-stream',
+    sizeBytes: options.file.size,
+    mediaType: options.mediaType,
+    storageBackend: options.storageBackend ?? 'telegram_bot',
+    status: 'waiting',
+    prepareStatus: 'ready',
+    controlState: 'active',
+    stage: 'reserving',
+    progress: 12,
+    attempts: 0,
+    createdAt: now,
+    updatedAt: now,
+    nativeBackground: true,
+    metadata: {
+      originalName: options.file.name,
+      mimeType: options.file.type || 'application/octet-stream',
+      sizeBytes: options.file.size,
+      mediaType: options.mediaType,
+      storageBackend: options.storageBackend ?? 'telegram_bot',
+      importOrigin: 'ios-background',
+      fileCreatedAt: options.file.lastModified ? new Date(options.file.lastModified).toISOString() : undefined,
+    },
+  }
+  await (await dbPromise).put('uploads', job)
+  return job
+}
+
 export async function enqueueLocalUpload(options: {
   file: File
   batchId: string
