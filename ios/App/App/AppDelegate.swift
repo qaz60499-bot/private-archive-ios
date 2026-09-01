@@ -27,8 +27,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
-        // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
+        // Make sure every already-staged original remains attached to the durable
+        // background URLSession before the WebView is suspended.
+        NativeBackgroundUploadManager.shared.resumePendingTransfers()
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {
@@ -36,7 +37,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+        // Reconcile tasks immediately on return. This repairs transfers that iOS
+        // canceled while the process was gone instead of leaving their old percentage
+        // visible until the next manual retry.
+        NativeBackgroundUploadManager.shared.resumePendingTransfers()
     }
 
     func applicationWillTerminate(_ application: UIApplication) {

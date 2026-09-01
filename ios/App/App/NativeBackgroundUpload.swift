@@ -300,7 +300,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         guard identifier == Self.sessionIdentifier else { return false }
         stateQueue.async { self.backgroundCompletionHandler = completionHandler }
         _ = session
+        reconcileTasks()
         return true
+    }
+
+    func resumePendingTransfers() {
+        _ = session
+        reconcileTasks()
     }
 
     private func mutate(_ id: String, _ body: (inout NativeUploadRecord) -> Void) -> NativeUploadRecord? {
@@ -461,7 +467,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if let updated = mutate(record.id, { value in
             value.status = "uploading"
             value.stage = "original"
-            value.progress = max(value.progress, 32)
+            // Recreated upload tasks resend the HTTP body from byte zero. Reset the
+            // visible transfer portion so a retry does not appear frozen at an old
+            // value such as 91% while it silently catches back up.
+            value.progress = 32
             value.error = nil
         }) { notify(updated) }
         task.resume()
@@ -591,6 +600,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             retryReserve(record, after: delay, reason: reason)
             return
         }
+        if let retrying = mutate(record.id, { value in
+            value.status = "retrying"
+            value.stage = "original"
+            value.progress = 32
+            value.error = reason ?? "正在重新连接后台上传。"
+        }) { notify(retrying) }
         workerQueue.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
             guard let self,
                   let current = self.stateQueue.sync(execute: { self.records[record.id] }),
@@ -639,13 +654,41 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             // only those legacy reserve tasks; keep real content uploads attached.
             let legacyReserveTasks = tasks.filter { self.taskStage($0) == "reserve" }
             legacyReserveTasks.forEach { $0.cancel() }
-            let activeIds = Set(tasks.filter { self.taskStage($0) != "reserve" }.compactMap { self.taskJobId($0) })
+
+            let contentTasks = tasks.filter { self.taskStage($0) == "content" }
+            let recordsById = self.stateQueue.sync { self.records }
+            var restartIds = Set<String>()
+
+            for task in contentTasks {
+                guard let id = self.taskJobId(task), let record = recordsById[id],
+                      record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { continue }
+                if task.state == .suspended { task.resume() }
+
+                // A task can survive in URLSession as nominally running after the
+                // transport has stopped making progress. When the app is relaunched or
+                // returns to foreground, replace only tasks whose progress timestamp is
+                // stale for a size-aware window. The server-side attempt lease rejects
+                // a late completion from the old request.
+                let staleSeconds = max(180.0, min(600.0, Double(record.sizeBytes) / (64.0 * 1024.0) + 60.0))
+                if record.stage == "original",
+                   let updated = ISO8601DateFormatter().date(from: record.updatedAt),
+                   Date().timeIntervalSince(updated) > staleSeconds {
+                    restartIds.insert(id)
+                    task.cancel()
+                }
+            }
+
+            let activeIds = Set(contentTasks.compactMap { task -> String? in
+                guard let id = self.taskJobId(task), !restartIds.contains(id) else { return nil }
+                return id
+            })
             let resumable = self.stateQueue.sync {
                 self.records.values.filter { $0.ready && $0.status != "done" && $0.status != "failed" && !activeIds.contains($0.id) }
             }
             for record in resumable {
                 if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
-                    self.retryContent(record, after: 0, reason: nil)
+                    let restarting = restartIds.contains(record.id)
+                    self.retryContent(record, after: restarting ? 1 : 0, reason: restarting ? "检测到后台上传停滞，正在重新连接。" : nil)
                 } else {
                     self.retryReserve(record, after: 0, reason: nil)
                 }
@@ -660,7 +703,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard taskStage(task) == "content", let id = taskJobId(task), totalBytesExpectedToSend > 0 else { return }
         let ratio = min(1, max(0, Double(totalBytesSent) / Double(totalBytesExpectedToSend)))
-        if let record = mutate(id, { value in value.progress = max(value.progress, 32 + ratio * 63) }) { notify(record) }
+        if let record = mutate(id, { value in value.progress = 32 + ratio * 63 }) { notify(record) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

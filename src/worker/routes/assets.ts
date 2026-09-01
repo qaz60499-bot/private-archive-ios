@@ -232,8 +232,13 @@ assetsRoutes.put('/:id/content', async (context) => {
     return context.json({ error: 'CONTENT_LENGTH_MISMATCH' }, 400)
   }
   if (!context.req.raw.body) return context.json({ error: 'EMPTY_UPLOAD_BODY' }, 400)
-  const claimed = await claimUploadStarted(context.env.DB, assetId, uploadToken)
-  if (!claimed) {
+  // iOS can tear down a background transfer after the request has already claimed the
+  // upload row (for example after a force-quit). Without a stale lease takeover the next
+  // launch retries forever with UPLOAD_ALREADY_IN_PROGRESS. Keep the lease size-aware so
+  // genuinely slow larger uploads get more time before another attempt can reclaim it.
+  const staleAfterMs = Math.max(180_000, Math.min(10 * 60_000, Math.ceil(asset.size_bytes / (64 * 1024)) * 1000 + 60_000))
+  const uploadAttempt = await claimUploadStarted(context.env.DB, assetId, uploadToken, staleAfterMs)
+  if (!uploadAttempt) {
     if (!(await verifyUploadToken(context.env.DB, assetId, uploadToken))) {
       return context.json({ error: 'UPLOAD_TOKEN_INVALID_OR_EXPIRED' }, 401)
     }
@@ -254,12 +259,16 @@ assetsRoutes.put('/:id/content', async (context) => {
       sizeBytes: asset.size_bytes,
       manifest: createStorageManifest(asset),
     })
-    const storedResult = await markStored(context.env.DB, assetId, stored)
+    const storedResult = await markStored(context.env.DB, assetId, stored, uploadAttempt)
     if (storedResult.discardStoredMessage) {
       try { await storage.deleteMessage(stored.messageId) } catch { /* best-effort duplicate/conflict cleanup */ }
     }
     if (!storedResult.attached) {
-      await markUploadFailed(context.env.DB, assetId, 'STORAGE_OBJECT_DELETE_IN_PROGRESS')
+      if (storedResult.staleAttempt) {
+        context.header('Retry-After', '1')
+        return context.json({ error: 'STALE_UPLOAD_ATTEMPT', recoverable: true }, 409)
+      }
+      await markUploadFailed(context.env.DB, assetId, 'STORAGE_OBJECT_DELETE_IN_PROGRESS', uploadAttempt)
       context.header('Retry-After', '1')
       return context.json({ error: 'STORAGE_OBJECT_DELETE_IN_PROGRESS', recoverable: true }, 409)
     }
@@ -272,7 +281,7 @@ assetsRoutes.put('/:id/content', async (context) => {
       previewAvailable: Boolean(current?.preview_file_id),
     }, 201)
   } catch (error) {
-    await markUploadFailed(context.env.DB, assetId, error instanceof Error ? error.message : 'UPLOAD_FAILED')
+    await markUploadFailed(context.env.DB, assetId, error instanceof Error ? error.message : 'UPLOAD_FAILED', uploadAttempt)
     if (error instanceof TelegramApiError && error.status === 429) {
       const retryAfter = Math.max(1, error.retryAfterSeconds ?? 30)
       context.header('Retry-After', String(retryAfter))
@@ -323,8 +332,8 @@ assetsRoutes.post('/:id/user-group-commit', async (context) => {
   }
   if (chatId !== runtime.storageChatId) return context.json({ error: 'TELEGRAM_STORAGE_CHAT_MISMATCH' }, 403)
 
-  const claimed = await claimUploadStarted(context.env.DB, assetId, uploadToken)
-  if (!claimed) {
+  const uploadAttempt = await claimUploadStarted(context.env.DB, assetId, uploadToken)
+  if (!uploadAttempt) {
     if (!(await verifyUploadToken(context.env.DB, assetId, uploadToken))) return context.json({ error: 'UPLOAD_TOKEN_INVALID_OR_EXPIRED' }, 401)
     const current = await getAsset(context.env.DB, assetId)
     if (current?.storage_file_id) return context.json({ asset: toPublicAsset(current), alreadyStored: true }, 200)
@@ -342,9 +351,10 @@ assetsRoutes.post('/:id/user-group-commit', async (context) => {
       mediaId: mediaId || undefined,
       importOrigin: 'web',
       telegramUrl: null,
-    })
+    }, uploadAttempt)
     if (!storedResult.attached) {
-      await markUploadFailed(context.env.DB, assetId, 'STORAGE_OBJECT_DELETE_IN_PROGRESS')
+      if (storedResult.staleAttempt) return context.json({ error: 'STALE_UPLOAD_ATTEMPT', recoverable: true }, 409)
+      await markUploadFailed(context.env.DB, assetId, 'STORAGE_OBJECT_DELETE_IN_PROGRESS', uploadAttempt)
       return context.json({ error: 'STORAGE_OBJECT_DELETE_IN_PROGRESS', recoverable: true }, 409)
     }
     await enqueueIfReady(context.env, assetId)
@@ -356,7 +366,7 @@ assetsRoutes.post('/:id/user-group-commit', async (context) => {
       alreadyStored: false,
     }, 201)
   } catch (error) {
-    await markUploadFailed(context.env.DB, assetId, error instanceof Error ? error.message : 'USER_GROUP_COMMIT_FAILED')
+    await markUploadFailed(context.env.DB, assetId, error instanceof Error ? error.message : 'USER_GROUP_COMMIT_FAILED', uploadAttempt)
     return context.json({ error: 'USER_GROUP_COMMIT_FAILED', recoverable: true }, 502)
   }
 })

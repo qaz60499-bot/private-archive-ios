@@ -149,24 +149,40 @@ export async function createUploadJobForAsset(db: D1Database, params: { assetId:
   ])
 }
 
-export async function claimUploadStarted(db: D1Database, assetId: string, token: string): Promise<boolean> {
-  const now = new Date().toISOString()
+export async function claimUploadStarted(db: D1Database, assetId: string, token: string, staleAfterMs?: number): Promise<number | null> {
+  const nowDate = new Date()
+  const now = nowDate.toISOString()
+  const staleCutoff = staleAfterMs === undefined
+    ? '0001-01-01T00:00:00.000Z'
+    : new Date(nowDate.getTime() - Math.max(0, staleAfterMs)).toISOString()
   const tokenHash = await hashToken(token)
   const result = await db.prepare(`UPDATE upload_jobs
     SET status = 'uploading', attempts = attempts + 1, updated_at = ?
     WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
-      AND upload_token_hash = ? AND expires_at > ? AND status IN ('waiting', 'failed')`)
-    .bind(now, assetId, tokenHash, now).run()
-  return result.meta.changes > 0
+      AND upload_token_hash = ? AND expires_at > ?
+      AND (status IN ('waiting', 'failed') OR (status = 'uploading' AND updated_at <= ?))`)
+    .bind(now, assetId, tokenHash, now, staleCutoff).run()
+  if (result.meta.changes === 0) return null
+  const row = await db.prepare(`SELECT attempts FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
+    .bind(assetId).first<{ attempts: number }>()
+  return row?.attempts ?? null
 }
 
 export interface MarkStoredResult {
   attached: boolean
   discardStoredMessage: boolean
+  staleAttempt?: boolean
 }
 
-export async function markStored(db: D1Database, assetId: string, stored: StoredFile): Promise<MarkStoredResult> {
+export async function markStored(db: D1Database, assetId: string, stored: StoredFile, expectedAttempt?: number): Promise<MarkStoredResult> {
   const now = new Date().toISOString()
+  if (expectedAttempt !== undefined) {
+    const job = await db.prepare(`SELECT status, attempts FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
+      .bind(assetId).first<{ status: string; attempts: number }>()
+    if (!job || job.status !== 'uploading' || job.attempts !== expectedAttempt) {
+      return { attached: false, discardStoredMessage: true, staleAttempt: true }
+    }
+  }
   const objectId = `obj-${assetId}`
   const source = await db.prepare(`SELECT source_id, storage_backend FROM assets WHERE id = ? AND workspace_id = ?`).bind(assetId, PERSONAL_WORKSPACE_ID).first<{ source_id: string; storage_backend: AssetRow['storage_backend'] }>()
   if (!source) return { attached: false, discardStoredMessage: true }
@@ -239,13 +255,23 @@ export async function markStored(db: D1Database, assetId: string, stored: Stored
   return { attached: true, discardStoredMessage }
 }
 
-export async function markUploadFailed(db: D1Database, assetId: string, error: string): Promise<void> {
+export async function markUploadFailed(db: D1Database, assetId: string, error: string, expectedAttempt?: number): Promise<boolean> {
   const now = new Date().toISOString()
+  if (expectedAttempt !== undefined) {
+    const job = await db.prepare(`UPDATE upload_jobs SET status = 'failed', last_error = ?, updated_at = ?
+      WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+        AND status = 'uploading' AND attempts = ?`)
+      .bind(error.slice(0, 320), now, assetId, expectedAttempt).run()
+    if (job.meta.changes === 0) return false
+    await db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ?`).bind(now, assetId).run()
+    return true
+  }
   await db.batch([
     db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ?`).bind(now, assetId),
     db.prepare(`UPDATE upload_jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE asset_id = ?`)
       .bind(error.slice(0, 320), now, assetId),
   ])
+  return true
 }
 
 export async function markPreviewStored(db: D1Database, assetId: string, stored: StoredFile): Promise<void> {
