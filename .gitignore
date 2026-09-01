@@ -16,6 +16,8 @@ coverage/
 *.session-journal
 *.session-wal
 *.session-shm
+__pycache__/
+*.pyc
 
 work/external/
 work/telegram-bridge-build/
