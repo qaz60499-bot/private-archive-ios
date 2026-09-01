@@ -3164,7 +3164,15 @@ body.upload-open .mobile-nav-dock {
 }
 
 .import-toast-body strong { color: var(--ink); font-size: 0.9rem; }
-.import-toast-body span { color: var(--ink-muted); font-size: 0.78rem; }
+.import-toast-body span {
+  color: var(--ink-muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
 
 .import-toast-bar {
   height: 4px;
@@ -4367,19 +4375,25 @@ body.upload-open .mobile-nav-dock {
   .mobile-bottom-nav a.active .glyph-orbit { opacity: .78; stroke-dasharray: 82; }
   .mobile-bottom-nav a.active .glyph-dot { animation: glyph-orbit 5s linear infinite; }
 
-  .mobile-upload {
+  .mobile-bottom-nav > .mobile-upload {
     width: 52px;
+    min-width: 52px;
     height: 52px;
-    min-height: 52px !important;
+    min-height: 52px;
     justify-self: center;
     border-radius: 50%;
     background: var(--accent);
-    color: #f7f8f4 !important;
+    color: #f7f8f4;
     box-shadow: 0 6px 18px rgba(69, 80, 63, 0.2);
   }
 
-  .mobile-upload .archive-glyph { width: 31px; height: 31px; }
-  .mobile-upload .glyph-orbit { opacity: .5; }
+  .mobile-bottom-nav > .mobile-upload > svg {
+    width: 27px;
+    height: 27px;
+    stroke-width: 1.8;
+  }
+
+  .mobile-bottom-nav > .mobile-upload:active { transform: scale(.96); }
 }
 
 @media (max-width: 767px) {
@@ -4857,9 +4871,10 @@ body.upload-open .mobile-nav-dock {
 @media (max-width: 767px) {
   .mobile-more-scrim {
     position: fixed;
-    z-index: 0;
+    z-index: 99;
     inset: 0;
     width: 100%;
+    height: 100%;
     border: 0;
     background: rgba(31, 34, 29, .16);
     backdrop-filter: blur(2px);

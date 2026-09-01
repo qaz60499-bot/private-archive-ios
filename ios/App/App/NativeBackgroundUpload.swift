@@ -32,7 +32,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     static let sessionIdentifier = "cd.cc.joye.photo.background-upload.v1"
 
     private let apiBase = URL(string: "https://api.photo.joye.cc.cd")!
-    private let fileManager = FileManager.default
+    private var fileManager: FileManager { FileManager.default }
     private let stateQueue = DispatchQueue(label: "cd.cc.joye.photo.background-upload.state")
     private let workerQueue = DispatchQueue(label: "cd.cc.joye.photo.background-upload.worker", qos: .utility)
     private let delegateQueue: OperationQueue = {
@@ -165,7 +165,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             record.progress = record.sizeBytes > 0 ? min(10, Double(currentSize) / Double(record.sizeBytes) * 10) : 10
             record.updatedAt = now()
             records[id] = record
-            saveStateLocked()
+            // A staging job is deliberately unrecoverable until finishJob marks it ready.
+            // Persisting jobs.json for every bridge chunk only adds synchronous disk I/O
+            // and makes multi-photo imports visibly stall. createJob already persisted the
+            // not-ready record; a process interruption will therefore still be recovered
+            // as an interrupted staging job on the next launch.
         }
     }
 
@@ -691,6 +695,11 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
 class PrivateArchiveBridgeViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         super.capacitorDidLoad()
-        bridge?.registerPluginType(NativeBackgroundUploadPlugin.self)
+        // Capacitor 8 enables automatic plugin registration by default. In that mode
+        // registerPluginType(_:) intentionally returns without doing anything, which
+        // made the JS bridge report “NativeBackgroundUpload plugin is not implemented
+        // on ios”. Instance registration is the supported runtime path for this local,
+        // app-owned plugin and works regardless of automatic package-plugin discovery.
+        bridge?.registerPluginInstance(NativeBackgroundUploadPlugin())
     }
 }

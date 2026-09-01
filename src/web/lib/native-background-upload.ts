@@ -1,13 +1,17 @@
+import { Capacitor } from '@capacitor/core'
 import type { MediaType, StorageBackend } from '../types'
 import { isNativeApp, nativePlatform } from './native-platform'
 import { NativeBackgroundUpload, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
 import { getLocalUpload, registerNativeLocalUpload, updateLocalUpload } from './offline/store'
 
-const NATIVE_CHUNK_BYTES = 512 * 1024
+const NATIVE_CHUNK_BYTES = 1024 * 1024
 let listenerReady = false
 
 export function canUseIosBackgroundUpload(storageBackend: StorageBackend): boolean {
-  return storageBackend === 'telegram_bot' && isNativeApp() && nativePlatform() === 'ios'
+  return storageBackend === 'telegram_bot'
+    && isNativeApp()
+    && nativePlatform() === 'ios'
+    && Capacitor.isPluginAvailable('NativeBackgroundUpload')
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -55,11 +59,15 @@ export async function enqueueIosBackgroundUpload(options: {
       mediaType: options.mediaType,
       lastModifiedMs: options.file.lastModified || undefined,
     })
+    let lastStagingProgress = 0
     for (let offset = 0; offset < options.file.size; offset += NATIVE_CHUNK_BYTES) {
       const bytes = new Uint8Array(await options.file.slice(offset, Math.min(options.file.size, offset + NATIVE_CHUNK_BYTES)).arrayBuffer())
       await NativeBackgroundUpload.appendChunk({ id, base64: bytesToBase64(bytes) })
       const localProgress = options.file.size ? Math.min(10, Math.round((offset + bytes.byteLength) / options.file.size * 10)) : 10
-      await updateLocalUpload(id, { progress: localProgress })
+      if (localProgress > lastStagingProgress) {
+        lastStagingProgress = localProgress
+        await updateLocalUpload(id, { progress: localProgress })
+      }
     }
     const result = await NativeBackgroundUpload.finishJob({ id })
     await mirrorNativeJob(result.job)

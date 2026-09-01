@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api } from '../lib/api'
 import { importFiles, type ImportFilesResult } from '../lib/import-files'
 import { clearAccessReauthGuard, isAccessSignInRequired, requestAccessReauth } from '../lib/access-session'
@@ -6,6 +6,16 @@ import type { Asset, StorageBackend } from '../types'
 
 // Translate the low-level ApiError codes (message === code, see ApiError) into calm
 // Chinese copy. Without this the timeline surfaces raw tokens like ACCESS_SIGN_IN_REQUIRED.
+function summarizeImportErrors(errors: string[]): string | null {
+  if (!errors.length) return null
+  if (errors.length === 1) return errors[0]
+  const first = errors[0]
+  const separator = first.indexOf('：')
+  const reason = (separator >= 0 ? first.slice(separator + 1) : first).trim()
+  const conciseReason = reason.length > 180 ? `${reason.slice(0, 177)}…` : reason
+  return `${errors.length} 项未能加入上传队列。主要原因：${conciseReason}`
+}
+
 function friendlyLoadError(caught: unknown, fallback: string): string {
   const code = caught instanceof Error ? caught.message : ''
   switch (code) {
@@ -106,6 +116,8 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [online, setOnline] = useState(navigator.onLine)
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null)
+  const currentImportBatchRef = useRef<string | null>(null)
+  const dismissedImportBatchesRef = useRef<Set<string>>(new Set())
   const [lastOptions, setLastOptions] = useState<LoadOptions>({})
   const [hasLoadedMore, setHasLoadedMore] = useState(false)
 
@@ -206,7 +218,15 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const dismissImportStatus = useCallback(() => setImportStatus(null), [])
+  const dismissImportStatus = useCallback(() => {
+    setImportStatus((current) => {
+      if (current) {
+        dismissedImportBatchesRef.current.add(current.batchId)
+        if (currentImportBatchRef.current === current.batchId) currentImportBatchRef.current = null
+      }
+      return null
+    })
+  }, [])
 
   const runImport = useCallback(async (files: FileList | File[], options?: { mobile?: boolean; storageBackend?: StorageBackend }) => {
     const selected = Array.from(files)
@@ -215,33 +235,42 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
     // Set the status synchronously so feedback is visible the moment the picker closes.
     // "queued" means durable local recovery state only; Telegram confirmation is
     // tracked separately by ImportToast from the jobs in this batch.
+    currentImportBatchRef.current = batchId
+    dismissedImportBatchesRef.current.delete(batchId)
     setImportStatus({ batchId, active: true, total: selected.length, queued: 0, processed: 0, phase: 'registering', error: null })
     try {
       const result = await importFiles(selected, navigator.onLine, {
         mobile: options?.mobile,
         storageBackend: options?.storageBackend,
         batchId,
-        onProgress: (progress) => setImportStatus({
-          batchId: progress.batchId,
-          active: progress.phase !== 'complete',
-          total: progress.total,
-          queued: progress.queued,
-          processed: progress.processed,
-          phase: progress.phase,
-          error: null,
-        }),
+        onProgress: (progress) => {
+          if (currentImportBatchRef.current !== progress.batchId || dismissedImportBatchesRef.current.has(progress.batchId)) return
+          setImportStatus({
+            batchId: progress.batchId,
+            active: progress.phase !== 'complete',
+            total: progress.total,
+            queued: progress.queued,
+            processed: progress.processed,
+            phase: progress.phase,
+            error: null,
+          })
+        },
       })
-      setImportStatus({
-        batchId: result.batchId,
-        active: false, total: result.total, queued: result.queued, processed: result.processed,
-        phase: 'complete', error: result.errors.length ? result.errors.join('；') : null,
-      })
+      if (currentImportBatchRef.current === result.batchId && !dismissedImportBatchesRef.current.has(result.batchId)) {
+        setImportStatus({
+          batchId: result.batchId,
+          active: false, total: result.total, queued: result.queued, processed: result.processed,
+          phase: 'complete', error: summarizeImportErrors(result.errors),
+        })
+      }
       return result
     } catch (caught) {
-      setImportStatus({
-        batchId, active: false, total: selected.length, queued: 0, processed: 0,
-        phase: 'complete', error: caught instanceof Error ? caught.message : '无法加入上传队列',
-      })
+      if (currentImportBatchRef.current === batchId && !dismissedImportBatchesRef.current.has(batchId)) {
+        setImportStatus({
+          batchId, active: false, total: selected.length, queued: 0, processed: 0,
+          phase: 'complete', error: caught instanceof Error ? caught.message : '无法加入上传队列',
+        })
+      }
       throw caught
     }
   }, [])

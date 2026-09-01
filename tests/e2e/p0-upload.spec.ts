@@ -12,13 +12,18 @@ async function openUpload(page: Page): Promise<void> {
   // Storage Bridge. Keep processor P0s deterministic by explicitly choosing the
   // Bot backend whenever the real user-group picker is therefore unavailable.
   const sheet = page.getByRole('dialog', { name: '加入私人档案' })
-  const filePicker = sheet.getByRole('button', { name: '选择照片、视频或文件' })
+  const filePicker = width < 768
+    ? sheet.getByRole('button', { name: '选择文件', exact: true })
+    : sheet.getByRole('button', { name: '选择照片、视频或文件' })
   if (await filePicker.isDisabled()) await sheet.getByRole('radio', { name: /Telegram Bot/ }).check()
 }
 
 async function chooseFiles(page: Page, names: string[]): Promise<void> {
+  const width = page.viewportSize()?.width ?? 1280
   const chooserPromise = page.waitForEvent('filechooser')
-  await page.getByRole('button', { name: '选择照片、视频或文件' }).click()
+  await (width < 768
+    ? page.getByRole('button', { name: '选择文件', exact: true })
+    : page.getByRole('button', { name: '选择照片、视频或文件' })).click()
   const chooser = await chooserPromise
   await chooser.setFiles(names.map((name, index) => ({ name, mimeType: 'application/pdf', buffer: Buffer.concat([tinyPdf, Buffer.from(String(index))]) })))
 }
@@ -170,7 +175,7 @@ test('iPhone photo import sends EXIF capture time, GPS and camera metadata to re
 
   await openUpload(page)
   const chooserPromise = page.waitForEvent('filechooser')
-  await page.getByRole('button', { name: '选择照片、视频或文件' }).click()
+  await page.getByRole('button', { name: '选择照片', exact: true }).click()
   const chooser = await chooserPromise
   await chooser.setFiles([{ name: 'iphone-photo.jpg', mimeType: 'image/jpeg', buffer: exifIphoneJpeg }])
 
@@ -222,7 +227,7 @@ test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storag
 
   await openUpload(page)
   const chooserPromise = page.waitForEvent('filechooser')
-  await page.getByRole('button', { name: '选择照片、视频或文件' }).click()
+  await page.getByRole('button', { name: '选择照片', exact: true }).click()
   const chooser = await chooserPromise
   await chooser.setFiles([{ name: 'ios-picker-photo.png', mimeType: 'image/png', buffer: onePixelPng }])
 

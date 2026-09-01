@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Ellipsis, LogOut, Repeat2, UserRound } from 'lucide-react'
+import { Ellipsis, LogOut, Plus, Repeat2, UserRound } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useArchive } from '../context/ArchiveContext'
@@ -92,23 +92,23 @@ function MobileBottomNav() {
   const moreContent: ReadonlyArray<readonly [string, string, ArchiveGlyphName]> = [['/files', '文件', 'files'], ['/favorites', '收藏', 'favorites'], ['/recent', '最近', 'recent'], ['/archive', '归档', 'historyArchive']]
   const moreManage: ReadonlyArray<readonly [string, string, ArchiveGlyphName]> = [['/trash', '回收站', 'recycle'], ['/activity', '活动', 'activity'], ['/queue', '待整理', 'queue'], ['/settings', '设置', 'settings']]
   const dock = (
-    <div className="mobile-nav-dock">
-      {moreOpen ? <>
-        <button type="button" className="mobile-more-scrim" aria-label="关闭更多导航" onClick={() => setMoreOpen(false)} />
-        <div className="mobile-more-menu" role="dialog" aria-modal="true" aria-label="更多导航">
+    <>
+      {moreOpen ? <button type="button" className="mobile-more-scrim" aria-label="关闭更多导航" onClick={() => setMoreOpen(false)} /> : null}
+      <div className="mobile-nav-dock">
+        {moreOpen ? <div className="mobile-more-menu" role="dialog" aria-modal="true" aria-label="更多导航">
           <span className="mobile-more-handle" aria-hidden="true" />
           <header><div><small>Navigation</small><strong>更多</strong></div><button type="button" onClick={() => setMoreOpen(false)}>完成</button></header>
           <section><span>内容</span><div className="mobile-more-grid">{moreContent.map(([path, label, glyph]) => <NavLink key={path} to={path} onClick={() => setMoreOpen(false)}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}</div></section>
           <section><span>管理</span><div className="mobile-more-list">{moreManage.map(([path, label, glyph]) => <NavLink key={path} to={path} onClick={() => setMoreOpen(false)}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}</div></section>
-        </div>
-      </> : null}
-      <nav className="mobile-bottom-nav" aria-label="移动端导航">
-        {primary.slice(0, 2).map(([path, label, glyph]) => <NavLink key={label} to={path} end={path === '/'}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}
-        <button type="button" className="mobile-upload" onClick={() => setUploadOpen(true)} aria-label="上传媒体"><ArchiveGlyph name="upload" /></button>
-        {primary.slice(2).map(([path, label, glyph]) => <NavLink key={label} to={path}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}
-        <button type="button" className={moreOpen ? 'mobile-more-trigger active' : 'mobile-more-trigger'} onClick={() => setMoreOpen((value) => !value)} aria-expanded={moreOpen}><Ellipsis aria-hidden="true" /><span>更多</span></button>
-      </nav>
-    </div>
+        </div> : null}
+        <nav className="mobile-bottom-nav" aria-label="移动端导航">
+          {primary.slice(0, 2).map(([path, label, glyph]) => <NavLink key={label} to={path} end={path === '/'}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}
+          <button type="button" className="mobile-upload" onClick={() => setUploadOpen(true)} aria-label="上传媒体"><Plus aria-hidden="true" /></button>
+          {primary.slice(2).map(([path, label, glyph]) => <NavLink key={label} to={path}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}
+          <button type="button" className={moreOpen ? 'mobile-more-trigger active' : 'mobile-more-trigger'} onClick={() => setMoreOpen((value) => !value)} aria-expanded={moreOpen}><Ellipsis aria-hidden="true" /><span>更多</span></button>
+        </nav>
+      </div>
+    </>
   )
   return typeof document === 'undefined' ? null : createPortal(dock, document.body)
 }

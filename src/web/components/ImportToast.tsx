@@ -83,7 +83,7 @@ export function ImportToast() {
         <span>{detail}</span>
         {active && <div className="import-toast-bar"><i style={{ width: `${percent}%` }} /></div>}
       </div>
-      {doneRegistering && <button type="button" className="import-toast-close" onClick={dismissImportStatus} aria-label="隐藏上传提示，上传会继续" title="仅隐藏提示，上传会继续"><X /></button>}
+      <button type="button" className="import-toast-close" onClick={dismissImportStatus} aria-label="隐藏上传提示，上传会继续" title="仅隐藏提示，上传会继续"><X /></button>
     </div>
   )
   return createPortal(toast, document.body)
