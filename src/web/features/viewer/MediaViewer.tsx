@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RefObject, SyntheticEvent, TouchEvent as ReactTouchEvent, WheelEvent as ReactWheelEvent } from 'react'
-import { Album, ChevronLeft, ChevronRight, Download, Heart, ImageOff, Maximize2, Trash2, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Album, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, Heart, ImageOff, Maximize2, Trash2, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
 import { api } from '../../lib/api'
 import { assetSourceLabel, formatArchiveDate, formatBytes } from '../../lib/asset-display'
@@ -8,7 +8,7 @@ import { usePrivateMediaUrl } from '../../lib/native-media'
 import { isNativeApp } from '../../lib/native-platform'
 import type { Album as AlbumType, Asset, DiscoverModule } from '../../types'
 
-export function MetadataPanel() {
+export function MetadataPanel({ expanded, onToggle }: { expanded: boolean; onToggle: () => void }) {
   const { viewerAsset: asset, setAssetCategory } = useArchive()
   const [albums, setAlbums] = useState<AlbumType[]>([])
   const [added, setAdded] = useState<string | null>(null)
@@ -25,6 +25,11 @@ export function MetadataPanel() {
   const aiModuleName = modules.find((item) => item.slug === asset.aiCategory)?.name ?? asset.aiCategory ?? '其他'
   return (
     <aside className="metadata-panel" aria-label="媒体信息">
+      <button type="button" className="metadata-sheet-handle" onClick={onToggle} aria-expanded={expanded} aria-label={expanded ? '收起档案信息' : '展开档案信息'}>
+        <span aria-hidden="true" />
+        <strong>{expanded ? '收起详情' : '查看详情'}</strong>
+        {expanded ? <ChevronDown aria-hidden="true" /> : <ChevronUp aria-hidden="true" />}
+      </button>
       <p className="eyebrow">Archive record</p>
       <h2>{asset.originalName}</h2>
       <dl>
@@ -108,6 +113,8 @@ function ViewerPhoto({ asset, stageRef, transform }: { asset: Asset; stageRef: R
     full.src = asset.mediaUrl
   }
 
+  if (asset.status === 'pending_upload' && !asset.previewSupported) return <div className="viewer-preview-unavailable viewer-preview-pending" role="status"><ImageOff /><strong>原件正在上传</strong><span>服务器已经登记这项内容，但原件还没有写入 Telegram。完成后这里会自动获得预览。</span></div>
+  if (asset.status === 'failed' && !asset.previewSupported) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>原件上传未完成</strong><span>请回到上传队列重试；其它档案不受影响。</span></div>
   if (failed || nativePreview.failed || !asset.previewSupported) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>预览不可用</strong><span>这只影响当前项目；其它档案仍可继续浏览。</span></div>
   if (!displayedSource) return <div className="viewer-preview-unavailable" role="status"><strong>正在加载</strong><span>正在安全读取私有媒体。</span></div>
 
@@ -174,6 +181,7 @@ export function MediaViewer() {
   const suppressClickRef = useRef(false)
   const [photoTransform, setPhotoTransform] = useState<PhotoTransform>({ scale: 1, x: 0, y: 0 })
   const [uiHidden, setUiHidden] = useState(false)
+  const [metadataExpanded, setMetadataExpanded] = useState(false)
   const index = asset ? assets.findIndex((item) => item.id === asset.id) : -1
 
   const resetPhoto = useCallback(() => setPhotoTransform({ scale: 1, x: 0, y: 0 }), [])
@@ -193,6 +201,7 @@ export function MediaViewer() {
     const timer = window.setTimeout(() => {
       resetPhoto()
       setUiHidden(false)
+      setMetadataExpanded(false)
     }, 0)
     return () => window.clearTimeout(timer)
   }, [asset?.id, resetPhoto])
@@ -355,7 +364,7 @@ export function MediaViewer() {
   const trashed = asset.status === 'trashed'
   const canNavigate = index >= 0 && assets.length > 1
   return (
-    <div className={`media-viewer${uiHidden ? ' viewer-ui-hidden' : ''}${photoTransform.scale > 1 ? ' viewer-zoomed' : ''}`} role="dialog" aria-modal="true" aria-label={`查看 ${asset.originalName}`}>
+    <div className={`media-viewer${uiHidden ? ' viewer-ui-hidden' : ''}${photoTransform.scale > 1 ? ' viewer-zoomed' : ''}${metadataExpanded ? ' viewer-metadata-expanded' : ''}`} role="dialog" aria-modal="true" aria-label={`查看 ${asset.originalName}`}>
       <div className="viewer-toolbar">
         <button ref={closeRef} type="button" onClick={closeViewer} aria-label="关闭"><X /><span>关闭</span></button>
         <div>
@@ -388,7 +397,7 @@ export function MediaViewer() {
           : <ViewerPhoto key={asset.id} asset={asset} stageRef={stageRef} transform={photoTransform} />}
         {canNavigate ? <button type="button" className="viewer-arrow right" onClick={(event) => { event.stopPropagation(); move(1) }} aria-label="下一项"><ChevronRight /></button> : null}
       </div>
-      <MetadataPanel />
+      <MetadataPanel expanded={metadataExpanded} onToggle={() => { setUiHidden(false); setMetadataExpanded((value) => !value) }} />
     </div>
   )
 }

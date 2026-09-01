@@ -132,9 +132,9 @@ export async function createDeduplicatedLogicalAsset(db: D1Database, params: {
   await refreshAssetSearchIndex(db, params.id)
 }
 
-export async function getLatestUploadJobState(db: D1Database, assetId: string): Promise<{ status: string; expires_at: string } | null> {
-  return db.prepare(`SELECT status, expires_at FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
-    .bind(assetId).first<{ status: string; expires_at: string }>()
+export async function getLatestUploadJobState(db: D1Database, assetId: string): Promise<{ status: string; expires_at: string; updated_at: string } | null> {
+  return db.prepare(`SELECT status, expires_at, updated_at FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
+    .bind(assetId).first<{ status: string; expires_at: string; updated_at: string }>()
 }
 
 export async function createUploadJobForAsset(db: D1Database, params: { assetId: string; jobId: string; token: string; tokenExpiresAt: string }): Promise<void> {
@@ -377,7 +377,15 @@ export async function listAssets(db: D1Database, filters: AssetListFilters): Pro
   const conditions = ['assets.workspace_id = ?']
   const values: unknown[] = [PERSONAL_WORKSPACE_ID]
   if (filters.status === 'trashed') conditions.push("assets.status = 'trashed'")
-  else conditions.push("assets.status != 'trashed'")
+  else if (filters.status) {
+    conditions.push('assets.status = ?')
+    values.push(filters.status)
+  } else {
+    // The archive surface represents committed media. Pending/failed reservations
+    // belong in the upload queue until an original is actually stored, otherwise a
+    // just-selected iPhone photo appears as a broken viewer card before Telegram has it.
+    conditions.push("assets.status NOT IN ('trashed', 'pending_upload', 'failed')")
+  }
 
   if (filters.cursor) {
     const cursor = decodeAssetCursor(filters.cursor)
@@ -418,10 +426,6 @@ export async function listAssets(db: D1Database, filters: AssetListFilters): Pro
   if (filters.mimeType) {
     conditions.push('assets.mime_type = ?')
     values.push(filters.mimeType.toLowerCase())
-  }
-  if (filters.status && filters.status !== 'trashed') {
-    conditions.push('assets.status = ?')
-    values.push(filters.status)
   }
   if (filters.albumId) {
     conditions.push('EXISTS (SELECT 1 FROM album_assets WHERE album_assets.album_id = ? AND album_assets.asset_id = assets.id)')

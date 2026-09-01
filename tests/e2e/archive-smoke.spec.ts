@@ -35,6 +35,36 @@ test('timeline loads seeded media and the viewer opens', async ({ page }) => {
   await expect(viewer).toBeHidden()
 })
 
+test('mobile viewer keeps app navigation out of the modal and expands metadata as a bottom sheet', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'mobile viewer layout contract')
+  await page.goto('/')
+  await page.getByRole('button', { name: '打开 morning-garden.jpg' }).click()
+
+  const viewer = page.getByRole('dialog', { name: '查看 morning-garden.jpg' })
+  await expect(viewer).toBeVisible()
+  const nav = page.locator('.mobile-nav-dock')
+  await expect(nav).toBeHidden()
+
+  const close = viewer.getByRole('button', { name: '关闭' })
+  const closeBox = await close.boundingBox()
+  expect(closeBox).not.toBeNull()
+  expect(closeBox!.y).toBeGreaterThanOrEqual(0)
+  expect(closeBox!.height).toBeGreaterThanOrEqual(41.9)
+
+  const handle = viewer.getByRole('button', { name: '展开档案信息' })
+  await expect(handle).toBeVisible()
+  await expect(handle).toHaveAttribute('aria-expanded', 'false')
+  const panel = viewer.locator('.metadata-panel')
+  const collapsed = await panel.boundingBox()
+  expect(collapsed).not.toBeNull()
+  await handle.click()
+  await expect(viewer.getByRole('button', { name: '收起档案信息' })).toHaveAttribute('aria-expanded', 'true')
+  await expect.poll(async () => (await panel.boundingBox())?.y ?? Number.POSITIVE_INFINITY).toBeLessThan(collapsed!.y - 80)
+
+  await close.click()
+  await expect(viewer).toBeHidden()
+})
+
 test('viewer fits horizontal and vertical images inside the existing canvas', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'fit geometry only needs one browser project')
   await page.setViewportSize({ width: 1280, height: 900 })

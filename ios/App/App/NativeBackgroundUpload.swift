@@ -59,6 +59,24 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
     }()
 
+    // Reservation is a tiny JSON request whose response contains the asset id and
+    // upload token needed by the real background transfer. Keeping this handshake
+    // on the background URLSession can leave iOS waiting at the reservation boundary
+    // even though Cloudflare already created the pending asset. Use a normal session
+    // for the sub-second handshake, then hand only the original file to the durable
+    // background URLSession.
+    private lazy var foregroundSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.allowsCellularAccess = true
+        configuration.httpCookieStorage = HTTPCookieStorage.shared
+        configuration.httpShouldSetCookies = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 60
+        return URLSession(configuration: configuration)
+    }()
+    private var reserveTasks: [String: URLSessionDataTask] = [:]
+
     private lazy var rootDirectory: URL = {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let url = base.appendingPathComponent("PrivateArchiveBackgroundUploads", isDirectory: true)
@@ -218,6 +236,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         session.getAllTasks { tasks in
             tasks.filter { self.taskJobId($0) == id }.forEach { $0.suspend() }
         }
+        stateQueue.sync { reserveTasks[id]?.suspend() }
         if let record = mutate(id, { value in
             value.status = "paused"
             value.error = "已暂停，后台原件仍安全保存在本机。"
@@ -225,6 +244,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func resumeJob(id: String) {
+        if let reserveTask = stateQueue.sync(execute: { reserveTasks[id] }) {
+            reserveTask.resume()
+            if let record = mutate(id, { value in value.status = "retrying"; value.error = nil }) { notify(record) }
+            return
+        }
         session.getAllTasks { tasks in
             let matches = tasks.filter { self.taskJobId($0) == id }
             if !matches.isEmpty {
@@ -236,7 +260,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 return
             }
             guard let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready else { return }
-            self.retryReserve(record, after: 0, reason: nil)
+            if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
+                self.retryContent(record, after: 0, reason: nil)
+            } else {
+                self.retryReserve(record, after: 0, reason: nil)
+            }
         }
     }
 
@@ -244,6 +272,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         session.getAllTasks { tasks in
             tasks.filter { self.taskJobId($0) == id }.forEach { $0.cancel() }
         }
+        stateQueue.sync { reserveTasks.removeValue(forKey: id)?.cancel() }
         if let record = mutate(id, { value in
             value.status = "failed"
             value.error = "已取消，本机临时原件已释放。"
@@ -257,6 +286,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             tasks.filter { self.taskJobId($0) == id }.forEach { $0.cancel() }
         }
         stateQueue.sync {
+            reserveTasks.removeValue(forKey: id)?.cancel()
             records.removeValue(forKey: id)
             saveStateLocked()
         }
@@ -322,18 +352,45 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         guard record.ready, fileManager.fileExists(atPath: originalURL(record.id).path) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 8, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_MISSING"])
         }
+        if let earliest, earliest > Date() {
+            let delay = earliest.timeIntervalSinceNow
+            workerQueue.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
+                guard let self,
+                      let current = self.stateQueue.sync(execute: { self.records[record.id] }),
+                      current.ready,
+                      current.status != "done",
+                      current.status != "failed",
+                      current.status != "paused" else { return }
+                do { try self.scheduleReserve(current, earliest: nil) }
+                catch {
+                    if let failed = self.mutate(record.id, { value in value.status = "failed"; value.error = error.localizedDescription }) {
+                        self.notify(failed)
+                    }
+                }
+            }
+            return
+        }
         guard let cookie = cookieHeader() else {
             throw NSError(domain: "NativeBackgroundUpload", code: 9, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
         let payload = try reservePayload(record)
-        let bodyURL = reserveBodyURL(record.id)
-        try payload.write(to: bodyURL, options: .atomic)
         var request = baseRequest(url: apiBase.appendingPathComponent("api/assets/reserve"), method: "POST", cookie: cookie)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(String(payload.count), forHTTPHeaderField: "Content-Length")
-        let task = session.uploadTask(with: request, fromFile: bodyURL)
-        task.taskDescription = "reserve|\(record.id)"
-        task.earliestBeginDate = earliest
+        request.httpBody = payload
+
+        let task = foregroundSession.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            _ = self.stateQueue.sync { self.reserveTasks.removeValue(forKey: record.id) }
+            guard let current = self.stateQueue.sync(execute: { self.records[record.id] }), current.ready else { return }
+            self.handleReserveResult(current, data: data ?? Data(), response: response as? HTTPURLResponse, error: error)
+        }
+        let shouldStart = stateQueue.sync { () -> Bool in
+            guard reserveTasks[record.id] == nil else { return false }
+            reserveTasks[record.id] = task
+            return true
+        }
+        guard shouldStart else { return }
         let updated = mutate(record.id) { value in
             value.status = value.attempts > 0 ? "retrying" : "uploading"
             value.stage = "reserving"
@@ -343,6 +400,45 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
         if let updated { notify(updated) }
         task.resume()
+    }
+
+    private func handleReserveResult(_ record: NativeUploadRecord, data: Data, response: HTTPURLResponse?, error: Error?) {
+        if let error {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return }
+            retryReserve(record, after: 3, reason: error.localizedDescription)
+            return
+        }
+        let status = response?.statusCode ?? 0
+        let code = responseErrorCode(data)
+        if (200...299).contains(status), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if json["duplicate"] as? Bool == true {
+                if let assetId = json["assetId"] as? String { _ = mutate(record.id) { $0.remoteAssetId = assetId } }
+                complete(record, deduplicated: true)
+                return
+            }
+            guard let assetId = json["assetId"] as? String, let token = json["uploadToken"] as? String else {
+                retryReserve(record, after: 2, reason: "上传预约响应不完整。")
+                return
+            }
+            guard let reserved = mutate(record.id, { value in
+                value.remoteAssetId = assetId
+                value.uploadToken = token
+                value.progress = max(value.progress, 28)
+            }) else { return }
+            do { try scheduleContent(reserved, earliest: nil) }
+            catch { retryReserve(reserved, after: 2, reason: error.localizedDescription) }
+            return
+        }
+        if status == 401 || status == 403 {
+            if let failed = mutate(record.id, { value in value.status = "failed"; value.error = code ?? "APP_AUTH_REQUIRED" }) { notify(failed) }
+            return
+        }
+        if shouldRetry(status: status, code: code) || status == 0 {
+            retryReserve(record, after: retryDelay(response), reason: code)
+            return
+        }
+        if let failed = mutate(record.id, { value in value.status = "failed"; value.error = code ?? "RESERVATION_FAILED" }) { notify(failed) }
     }
 
     private func scheduleContent(_ record: NativeUploadRecord, earliest: Date?) throws {
@@ -487,6 +583,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
+    private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?) {
+        guard record.remoteAssetId != nil, record.uploadToken != nil else {
+            retryReserve(record, after: delay, reason: reason)
+            return
+        }
+        workerQueue.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
+            guard let self,
+                  let current = self.stateQueue.sync(execute: { self.records[record.id] }),
+                  current.ready,
+                  current.status != "done",
+                  current.status != "failed",
+                  current.status != "paused" else { return }
+            do { try self.scheduleContent(current, earliest: nil) }
+            catch { self.retryReserve(current, after: 2, reason: error.localizedDescription) }
+        }
+    }
+
     private func complete(_ record: NativeUploadRecord, deduplicated: Bool) {
         if let finished = mutate(record.id, { value in
             value.status = "done"
@@ -520,7 +633,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let resumable = self.stateQueue.sync {
                 self.records.values.filter { $0.ready && $0.status != "done" && $0.status != "failed" && !activeIds.contains($0.id) }
             }
-            for record in resumable { self.retryReserve(record, after: 0, reason: nil) }
+            for record in resumable {
+                if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
+                    self.retryContent(record, after: 0, reason: nil)
+                } else {
+                    self.retryReserve(record, after: 0, reason: nil)
+                }
+            }
         }
     }
 
@@ -543,37 +662,18 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if let error {
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return }
-            retryReserve(record, after: 5, reason: error.localizedDescription)
+            if stage == "content" { retryContent(record, after: 5, reason: error.localizedDescription) }
+            else { retryReserve(record, after: 5, reason: error.localizedDescription) }
             return
         }
 
         let status = response?.statusCode ?? 0
         let code = responseErrorCode(data)
         if stage == "reserve" {
-            if (200...299).contains(status), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if json["duplicate"] as? Bool == true {
-                    if let assetId = json["assetId"] as? String { _ = mutate(id) { $0.remoteAssetId = assetId } }
-                    complete(record, deduplicated: true)
-                    return
-                }
-                guard let assetId = json["assetId"] as? String, let token = json["uploadToken"] as? String else {
-                    retryReserve(record, after: 2, reason: "上传预约响应不完整。")
-                    return
-                }
-                guard let reserved = mutate(id, { value in value.remoteAssetId = assetId; value.uploadToken = token; value.progress = max(value.progress, 28) }) else { return }
-                do { try scheduleContent(reserved, earliest: nil) }
-                catch { retryReserve(reserved, after: 2, reason: error.localizedDescription) }
-                return
-            }
-            if status == 401 || status == 403 {
-                if let failed = mutate(id, { value in value.status = "failed"; value.error = code ?? "APP_AUTH_REQUIRED" }) { notify(failed) }
-                return
-            }
-            if shouldRetry(status: status, code: code) || status == 0 {
-                retryReserve(record, after: retryDelay(response), reason: code)
-                return
-            }
-            if let failed = mutate(id, { value in value.status = "failed"; value.error = code ?? "RESERVATION_FAILED" }) { notify(failed) }
+            // Compatibility for reservation tasks created by older app builds. New
+            // builds perform this tiny handshake on foregroundSession and reserve the
+            // background URLSession exclusively for the original file transfer.
+            handleReserveResult(record, data: data, response: response, error: nil)
             return
         }
 
@@ -585,8 +685,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             if let failed = mutate(id, { value in value.status = "failed"; value.error = code }) { notify(failed) }
             return
         }
-        if status == 401 || shouldRetry(status: status, code: code) || status == 0 {
+        if status == 401 {
             retryReserve(record, after: retryDelay(response), reason: code)
+            return
+        }
+        if shouldRetry(status: status, code: code) || status == 0 {
+            retryContent(record, after: retryDelay(response), reason: code)
             return
         }
         if let failed = mutate(id, { value in value.status = "failed"; value.error = code ?? "STORAGE_UPLOAD_FAILED" }) { notify(failed) }

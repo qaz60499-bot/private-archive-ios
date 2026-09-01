@@ -114,6 +114,7 @@ async function enqueueIfReady(env: Env, assetId: string): Promise<void> {
 }
 
 const MAX_RESERVE_JSON_BYTES = 128 * 1024
+const IOS_STALE_RESERVATION_RECLAIM_MS = 15_000
 
 assetsRoutes.post('/reserve', async (context) => {
   try {
@@ -153,7 +154,14 @@ assetsRoutes.post('/reserve', async (context) => {
       if (existing.source === 'web') {
         const latestJob = await getLatestUploadJobState(context.env.DB, existing.id)
         const activeJob = latestJob && ['waiting', 'uploading'].includes(latestJob.status) && Date.parse(latestJob.expires_at) > Date.now()
-        if (activeJob) {
+        const staleIosReservation = Boolean(
+          activeJob
+          && latestJob?.status === 'waiting'
+          && input.importOrigin === 'ios-background'
+          && existing.import_origin === 'ios-background'
+          && Date.now() - Date.parse(latestJob.updated_at) >= IOS_STALE_RESERVATION_RECLAIM_MS,
+        )
+        if (activeJob && !staleIosReservation) {
           context.header('Retry-After', '1')
           return context.json({
             error: 'DUPLICATE_UPLOAD_IN_PROGRESS', assetId: existing.id, duplicate: false, resumed: true,
