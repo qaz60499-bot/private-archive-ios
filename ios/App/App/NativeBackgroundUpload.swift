@@ -629,7 +629,14 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 
     private func reconcileTasks() {
         session.getAllTasks { tasks in
-            let activeIds = Set(tasks.compactMap { self.taskJobId($0) })
+            // Older builds used the background session for the tiny /reserve request.
+            // A task from that implementation can survive an in-place app update and
+            // remain parked at 18%, which would make its job look active forever and
+            // prevent the new foreground reservation path from taking over. Cancel
+            // only those legacy reserve tasks; keep real content uploads attached.
+            let legacyReserveTasks = tasks.filter { self.taskStage($0) == "reserve" }
+            legacyReserveTasks.forEach { $0.cancel() }
+            let activeIds = Set(tasks.filter { self.taskStage($0) != "reserve" }.compactMap { self.taskJobId($0) })
             let resumable = self.stateQueue.sync {
                 self.records.values.filter { $0.ready && $0.status != "done" && $0.status != "failed" && !activeIds.contains($0.id) }
             }
