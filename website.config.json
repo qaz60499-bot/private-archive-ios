@@ -1,0 +1,53 @@
+{
+  "$schema": "./website.config.schema.json",
+  "version": 1,
+  "project": {
+    "name": "Private Archive",
+    "kind": "app",
+    "audience": "One owner curating a private photo, video, and file history",
+    "primaryGoal": "Save media once and reliably rediscover it from a calm searchable timeline"
+  },
+  "stack": {
+    "framework": "React 19 + Vite + Hono Worker",
+    "language": "typescript",
+    "packageManager": "npm",
+    "styling": "Tailwind CSS v4 plus project tokens"
+  },
+  "design": {
+    "theme": "light",
+    "direction": "Quiet warm archival editorial interface: mineral paper, graphite type, restrained olive accents, photographic contact sheets, film-index marks, museum-archive spacing, image-first layouts, and a dark viewing room",
+    "signature": "Home Archive Composition: a CSS/DOM contact-sheet cover with three flat photographic frames, registration marks, accession labels, date/index typography, and optional non-blocking real previews. Never a globe, orbit, celestial object, heavy 3D hero, or dashboard card wall.",
+    "source": ".design/DESIGN.md"
+  },
+  "routes": [
+    { "path": "/", "purpose": "Chronological media archive and personal archive cover", "status": "complete" },
+    { "path": "/discover", "purpose": "Visual discovery categories", "status": "complete" },
+    { "path": "/people", "purpose": "Coarse people and portrait groups", "status": "complete" },
+    { "path": "/places", "purpose": "Location groups", "status": "complete" },
+    { "path": "/albums", "purpose": "Owner-created albums", "status": "complete" },
+    { "path": "/videos", "purpose": "Video-only archive", "status": "complete" },
+    { "path": "/files", "purpose": "Non-media documents", "status": "complete" },
+    { "path": "/favorites", "purpose": "Favorite media", "status": "complete" },
+    { "path": "/recent", "purpose": "Recently added and recently viewed assets", "status": "complete" },
+    { "path": "/archive", "purpose": "Items intentionally removed from the daily timeline", "status": "complete" },
+    { "path": "/trash", "purpose": "Recoverable deleted items with source and deletion metadata", "status": "complete" },
+    { "path": "/activity", "purpose": "Human-readable archive history", "status": "complete" },
+    { "path": "/queue", "purpose": "Online and offline upload queue", "status": "complete" },
+    { "path": "/settings", "purpose": "Archive, storage, trash, connection, and advanced diagnostics settings", "status": "complete" }
+  ],
+  "quality": {
+    "viewports": [375, 430, 768, 1280, 1366, 1440, 1920],
+    "maxInitialJavaScriptKb": 260,
+    "maxLcpSeconds": 2.5,
+    "minContrastRatio": 4.5,
+    "reducedMotion": true
+  },
+  "threejs": {
+    "enabled": true,
+    "integration": "vanilla",
+    "maxDevicePixelRatio": 1.25,
+    "renderMode": "continuous",
+    "pauseWhenHidden": true,
+    "fallback": "static-content"
+  }
+}

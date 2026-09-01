@@ -9,20 +9,31 @@
   "scripts": {
     "dev": "vite",
     "dev:worker": "npm run build && wrangler dev --local --port 8787",
-    "dev:worker:e2e": "wrangler dev --local --port 8787 --persist-to .wrangler/e2e-state",
+    "dev:worker:e2e": "npx -y -p wrangler@4.127.1 wrangler dev --config wrangler.e2e.toml --local --port 8799 --persist-to .wrangler/e2e-state",
+    "dev:worker:e2e:auth": "npx -y -p wrangler@4.127.1 wrangler dev --config wrangler.auth-e2e.toml --local --port 8799 --persist-to .wrangler/e2e-state",
     "build": "tsc -b && vite build",
+    "build:web": "tsc -b && vite build --mode web",
+    "build:ios:web": "tsc -b && vite build --mode ios",
+    "ios:sync": "npx cap sync ios",
+    "ios:prepare": "npm run build:ios:web && npm run ios:sync",
+    "ios:open": "npx cap open ios",
+    "build:desktop": "cmd.exe /D /C desktop\\windows\\build-desktop.cmd",
+    "cf:detach-legacy-domains": "node scripts/detach-legacy-worker-domains.mjs",
+    "cf:cleanup-legacy-photo-dns": "node scripts/cleanup-legacy-photo-dns.mjs",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "npm run build && playwright test",
+    "test:e2e": "npm run build && node tests/e2e/run-split.mjs",
+    "test:e2e:raw": "playwright test",
     "db:migrate:local": "wrangler d1 migrations apply private-archive-db --local",
-    "db:migrate:e2e": "wrangler d1 migrations apply private-archive-db --local --persist-to .wrangler/e2e-state",
+    "db:migrate:e2e": "node tests/e2e/migrate-e2e.mjs",
     "config:validate": "node D:/wendangcodex/Codex2/home/skills/website-building-workflow/scripts/validate-website-config.mjs website.config.json",
     "check": "npm run config:validate && npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "exifr": "latest",
+    "fflate": "^0.8.3",
     "gsap": "^3.15.0",
     "hono": "latest",
     "idb": "latest",
@@ -30,9 +41,12 @@
     "react": "latest",
     "react-dom": "latest",
     "react-router-dom": "latest",
-    "three": "^0.185.1"
+    "three": "^0.185.1",
+    "@capacitor/core": "8.5.1",
+    "@capacitor/ios": "8.5.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "8.5.1",
     "@cloudflare/workers-types": "latest",
     "@eslint/js": "latest",
     "@playwright/test": "latest",
@@ -52,6 +66,6 @@
     "vite": "latest",
     "vite-plugin-pwa": "latest",
     "vitest": "latest",
-    "wrangler": "latest"
+    "wrangler": "^4.127.1"
   }
 }

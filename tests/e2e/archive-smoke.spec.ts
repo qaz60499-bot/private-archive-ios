@@ -5,10 +5,25 @@ test.beforeEach(async ({ request }) => {
   expect(response.ok()).toBeTruthy()
 })
 
+test('Windows personal surface keeps the opening hero compact', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'personal desktop geometry only needs the desktop project')
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await page.goto('/?app=personal-desktop')
+
+  await expect(page.locator('html')).toHaveAttribute('data-app-surface', 'personal-desktop')
+  await expect(page.getByRole('heading', { name: /时间留下的\s*形状/ })).toBeVisible()
+  const stageBox = await page.locator('.memory-aperture-stage').boundingBox()
+  const topbarBox = await page.locator('.topbar').boundingBox()
+  expect(stageBox).not.toBeNull()
+  expect(topbarBox).not.toBeNull()
+  expect(stageBox!.height).toBeLessThanOrEqual(500)
+  expect(topbarBox!.height).toBeLessThanOrEqual(68)
+})
+
 test('timeline loads seeded media and the viewer opens', async ({ page }) => {
   await page.goto('/')
 
-  await expect(page.getByRole('heading', { name: '时间留下的形状' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /时间留下的\s*形状/ })).toBeVisible()
   const firstAsset = page.getByRole('button', { name: '打开 morning-garden.jpg' })
   await expect(firstAsset).toBeVisible()
   await firstAsset.click()
@@ -119,7 +134,7 @@ test('timeline selection can bulk-trash items without deleting Telegram storage'
   for (const name of names) {
     const bytes = Buffer.from(`bulk trash ${name}`)
     const reserve = await request.post('/api/assets/reserve', {
-      data: { originalName: name, mimeType: 'application/pdf', sizeBytes: bytes.byteLength, mediaType: 'file' },
+      data: { originalName: name, mimeType: 'application/pdf', sizeBytes: bytes.byteLength, mediaType: 'file', storageBackend: 'telegram_bot' },
     })
     expect(reserve.status()).toBe(201)
     const reservation = await reserve.json() as { assetId: string; uploadToken: string }
@@ -155,11 +170,13 @@ test('timeline month index is loaded on demand and can jump without paging throu
   const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
   await expect(page).toHaveURL(new RegExp(`month=${month}`))
   await expect(page.getByRole('heading', { name: `月度 · ${month.replace('-', ' · ')}` })).toBeVisible()
-  await expect(page.getByRole('heading', { name: '时间留下的形状' })).toBeHidden()
+  await expect(page.getByRole('heading', { name: /时间留下的\s*形状/ })).toBeHidden()
 })
 
-test('mobile timeline imports photos directly from the native picker without opening the upload sheet', async ({ page }, testInfo) => {
+test('mobile timeline imports photos directly from the native picker without opening the upload sheet when Bot storage is selected', async ({ page, request }, testInfo) => {
   test.skip(testInfo.project.name !== 'mobile', 'photo-library shortcut is a mobile interaction')
+  const preference = await request.put('/api/storage-preference', { data: { defaultStorageBackend: 'telegram_bot' } })
+  expect(preference.ok()).toBeTruthy()
   await page.addInitScript(() => {
     Object.defineProperty(window, 'createImageBitmap', { value: undefined, configurable: true })
   })
@@ -168,16 +185,21 @@ test('mobile timeline imports photos directly from the native picker without ope
   await expect(importButton).toBeVisible()
 
   const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  const suffix = `${Date.now()}`
+  const firstName = `phone-library-${suffix}-a.png`
+  const secondName = `phone-library-${suffix}-b.png`
   const chooserPromise = page.waitForEvent('filechooser')
   await importButton.click()
   const chooser = await chooserPromise
   await chooser.setFiles([
-    { name: `phone-library-${Date.now()}-a.png`, mimeType: 'image/png', buffer: onePixelPng },
-    { name: `phone-library-${Date.now()}-b.png`, mimeType: 'image/png', buffer: onePixelPng },
+    { name: firstName, mimeType: 'image/png', buffer: onePixelPng },
+    { name: secondName, mimeType: 'image/png', buffer: onePixelPng },
   ])
 
   await expect(page.getByRole('dialog', { name: '加入私人档案' })).toBeHidden()
-  await expect(page.getByText(/已加入 2 张照片|正在接收手机照片/)).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByRole('status').filter({ hasText: /本机已保存 2 项|已加入 2 项|正在接收/ }).first()).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByRole('button', { name: `打开 ${firstName}` })).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByRole('button', { name: `打开 ${secondName}` })).toBeVisible({ timeout: 15_000 })
 })
 
 test('custom discover module can be created and assigned from the viewer', async ({ page }, testInfo) => {
@@ -221,7 +243,7 @@ test('upload sheet is reachable on desktop and mobile', async ({ page }) => {
   await uploadButton.click()
   const sheet = page.getByRole('dialog', { name: '加入私人档案' })
   await expect(sheet).toBeVisible()
-  await expect(sheet.getByText('≤20 MB')).toBeVisible()
+  await expect(sheet.getByText('≤20 MB', { exact: true })).toBeVisible()
   await sheet.getByRole('button', { name: '关闭' }).click()
   await expect(sheet).toBeHidden()
 })
@@ -255,7 +277,7 @@ test('Telegram discovery reads chats captured by the active webhook', async ({ r
 test('timeline auto-syncs a Telegram item without manual refresh', async ({ page, request }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'background sync only needs one browser project')
   await page.goto('/')
-  await expect(page.getByRole('heading', { name: '时间留下的形状' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /时间留下的\s*形状/ })).toBeVisible()
 
   const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
   const messageId = 200_000 + Math.floor(Math.random() * 700_000)
@@ -290,7 +312,7 @@ test('viewer can soft-delete a web asset without deleting Telegram storage', asy
   const name = `trash-me-${suffix}.pdf`
   const bytes = Buffer.from('private archive soft delete smoke test')
   const reserve = await request.post('/api/assets/reserve', {
-    data: { originalName: name, mimeType: 'application/pdf', sizeBytes: bytes.byteLength, mediaType: 'file' },
+    data: { originalName: name, mimeType: 'application/pdf', sizeBytes: bytes.byteLength, mediaType: 'file', storageBackend: 'telegram_bot' },
   })
   expect(reserve.status()).toBe(201)
   const reservation = await reserve.json() as { assetId: string; uploadToken: string }

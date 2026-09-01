@@ -1,5 +1,6 @@
 import * as exifr from 'exifr'
 import type { MediaType } from '../../types'
+import { extractFileMetadata, type ExtractedMetadata } from './file-metadata'
 
 export interface PreparedMedia {
   file: File
@@ -16,7 +17,33 @@ export interface PreparedMedia {
     fileCreatedAt?: string
     latitude?: number
     longitude?: number
+    logicalPath?: string
+    metadata?: ExtractedMetadata
   }
+}
+
+function logicalPathForFile(file: File): string | undefined {
+  const relative = file.webkitRelativePath?.replaceAll('\\', '/')
+  if (!relative || !relative.includes('/')) return undefined
+  const directory = relative.split('/').slice(0, -1).filter(Boolean).join('/')
+  return directory ? `/${directory}` : undefined
+}
+
+function extensionOf(name: string): string {
+  const lower = name.toLowerCase()
+  if (lower.endsWith('.tar.gz')) return 'tar.gz'
+  const dot = lower.lastIndexOf('.')
+  return dot > 0 ? lower.slice(dot + 1) : ''
+}
+
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'avif', 'bmp', 'tif', 'tiff'])
+const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv', 'avi'])
+
+function mediaTypeForFile(file: File): MediaType {
+  const extension = extensionOf(file.name)
+  if (file.type.startsWith('image/') || IMAGE_EXTENSIONS.has(extension)) return 'photo'
+  if (file.type.startsWith('video/') || VIDEO_EXTENSIONS.has(extension)) return 'video'
+  return 'file'
 }
 
 function canvasBlob(canvas: HTMLCanvasElement, type = 'image/jpeg', quality = 0.78): Promise<Blob> {
@@ -29,11 +56,86 @@ function scaledSize(width: number, height: number, maxEdge = 960): [number, numb
 }
 
 async function imageMetadata(file: File): Promise<Record<string, unknown> | undefined> {
-  try {
-    return await exifr.parse(file, ['DateTimeOriginal', 'CreateDate', 'latitude', 'longitude', 'Model', 'Orientation', 'ImageWidth', 'ImageHeight']) as Record<string, unknown>
-  } catch {
-    return undefined
+  // Parse the complete safe EXIF/IPTC/XMP surface instead of a narrow pick list.
+  // Exifr skips heavyweight MakerNote/UserComment by default, while the broad parse
+  // still catches files whose writers left standard dates under their raw numeric
+  // EXIF tag ids (for example 36867 / 36868). GPS is resolved separately because
+  // exifr.gps() is more tolerant of camera-specific GPS IFD layouts.
+  const [metadataResult, gpsResult] = await Promise.allSettled([
+    exifr.parse(file) as Promise<Record<string, unknown> | undefined>,
+    exifr.gps(file) as Promise<{ latitude?: number; longitude?: number } | undefined>,
+  ])
+  const metadata = metadataResult.status === 'fulfilled' ? metadataResult.value : undefined
+  const gps = gpsResult.status === 'fulfilled' ? gpsResult.value : undefined
+  if (!metadata && !gps) return undefined
+  return { ...(metadata ?? {}), ...(gps ?? {}) }
+}
+
+function isoDate(value: unknown, offset?: unknown): string | undefined {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString()
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  const trimmed = value.trim()
+  const parsed = Date.parse(trimmed)
+  if (!Number.isNaN(parsed)) return new Date(parsed).toISOString()
+  const exif = trimmed.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/)
+  if (!exif) return undefined
+  const [, year, month, day, hour, minute, second, fraction = ''] = exif
+  const normalizedOffset = typeof offset === 'string' && /^[+-]\d{2}:\d{2}$/.test(offset.trim()) ? offset.trim() : ''
+  if (normalizedOffset) {
+    const milliseconds = fraction ? `.${fraction.slice(0, 3).padEnd(3, '0')}` : ''
+    const withOffset = `${year}-${month}-${day}T${hour}:${minute}:${second}${milliseconds}${normalizedOffset}`
+    const withOffsetParsed = Date.parse(withOffset)
+    if (!Number.isNaN(withOffsetParsed)) return new Date(withOffsetParsed).toISOString()
   }
+  const local = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second), Number((fraction + '000').slice(0, 3)))
+  return Number.isNaN(local.getTime()) ? undefined : local.toISOString()
+}
+
+function gpsDateTime(exif: Record<string, unknown> | undefined): string | undefined {
+  const date = metadataString(exif?.GPSDateStamp)
+  const time = metadataString(exif?.GPSTimeStamp)
+  if (!date || !time) return undefined
+  const normalizedDate = date.replace(/:/g, '-')
+  const parsed = Date.parse(`${normalizedDate}T${time}Z`)
+  return Number.isNaN(parsed) ? undefined : new Date(parsed).toISOString()
+}
+
+function metadataString(value: unknown, max = 160): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined
+}
+
+function metadataNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function compactPhotoMetadata(exif: Record<string, unknown> | undefined, file: File): ExtractedMetadata {
+  const metadata: ExtractedMetadata = { imageFormat: extensionOf(file.name) || file.type || 'unknown' }
+  const textFields: Array<[string, string]> = [
+    ['cameraMake', 'Make'], ['cameraModel', 'Model'], ['lensMake', 'LensMake'], ['lensModel', 'LensModel'], ['software', 'Software'],
+    ['city', 'City'], ['sublocation', 'Sublocation'], ['state', 'State'], ['country', 'Country'], ['countryCode', 'CountryCode'], ['contentLocation', 'ContentLocationName'],
+    ['gpsDateStamp', 'GPSDateStamp'], ['gpsTimeStamp', 'GPSTimeStamp'], ['offsetTimeOriginal', 'OffsetTimeOriginal'], ['subSecTimeOriginal', 'SubSecTimeOriginal'],
+  ]
+  for (const [target, source] of textFields) {
+    const value = metadataString(exif?.[source])
+    if (value !== undefined) metadata[target] = value
+  }
+  const numberFields: Array<[string, string]> = [
+    ['orientation', 'Orientation'], ['iso', 'ISO'], ['fNumber', 'FNumber'], ['exposureTime', 'ExposureTime'], ['focalLength', 'FocalLength'],
+    ['exposureBiasValue', 'ExposureBiasValue'], ['gpsAltitude', 'GPSAltitude'], ['gpsAltitudeRef', 'GPSAltitudeRef'], ['gpsHorizontalError', 'GPSHPositioningError'],
+  ]
+  for (const [target, source] of numberFields) {
+    const value = metadataNumber(exif?.[source])
+    if (value !== undefined) metadata[target] = value
+  }
+  const originalAt = isoDate(exif?.DateTimeOriginal ?? exif?.['36867'], exif?.OffsetTimeOriginal)
+  const createdAt = isoDate(exif?.CreateDate ?? exif?.['36868'], exif?.OffsetTimeOriginal)
+  const modifiedAt = isoDate(exif?.ModifyDate)
+  if (originalAt) metadata.exifOriginalAt = originalAt
+  if (createdAt) metadata.exifCreatedAt = createdAt
+  if (modifiedAt) metadata.exifModifiedAt = modifiedAt
+  const gpsAt = gpsDateTime(exif)
+  if (gpsAt) metadata.gpsCapturedAt = gpsAt
+  return metadata
 }
 
 async function decodeImage(file: File): Promise<{ source: CanvasImageSource; width: number; height: number; close: () => void }> {
@@ -68,7 +170,9 @@ async function decodeImage(file: File): Promise<{ source: CanvasImageSource; wid
 
 async function prepareImage(file: File): Promise<PreparedMedia> {
   const exif = await imageMetadata(file)
-  const rawDate = exif?.DateTimeOriginal ?? exif?.CreateDate
+  const takenAt = isoDate(exif?.DateTimeOriginal ?? exif?.['36867'], exif?.OffsetTimeOriginal)
+    ?? isoDate(exif?.CreateDate ?? exif?.['36868'], exif?.OffsetTimeOriginal)
+    ?? gpsDateTime(exif)
   let preview: Blob | undefined
   let decodedWidth = typeof exif?.ImageWidth === 'number' ? exif.ImageWidth : undefined
   let decodedHeight = typeof exif?.ImageHeight === 'number' ? exif.ImageHeight : undefined
@@ -104,10 +208,12 @@ async function prepareImage(file: File): Promise<PreparedMedia> {
       mediaType: 'photo',
       width: decodedWidth,
       height: decodedHeight,
-      takenAt: rawDate instanceof Date ? rawDate.toISOString() : typeof rawDate === 'string' ? rawDate : undefined,
+      takenAt,
       fileCreatedAt: file.lastModified ? new Date(file.lastModified).toISOString() : undefined,
       latitude: typeof exif?.latitude === 'number' ? exif.latitude : undefined,
       longitude: typeof exif?.longitude === 'number' ? exif.longitude : undefined,
+      logicalPath: logicalPathForFile(file),
+      metadata: compactPhotoMetadata(exif, file),
     },
   }
 }
@@ -159,6 +265,8 @@ async function prepareVideo(file: File): Promise<PreparedMedia> {
         height: sourceHeight,
         durationMs: Math.round(duration * 1000),
         fileCreatedAt: file.lastModified ? new Date(file.lastModified).toISOString() : undefined,
+        logicalPath: logicalPathForFile(file),
+        metadata: { videoFormat: extensionOf(file.name) || file.type || 'unknown' },
       },
     }
   } finally {
@@ -167,8 +275,10 @@ async function prepareVideo(file: File): Promise<PreparedMedia> {
 }
 
 export async function prepareMedia(file: File): Promise<PreparedMedia> {
-  if (file.type.startsWith('image/')) return prepareImage(file)
-  if (file.type.startsWith('video/')) return prepareVideo(file)
+  const mediaType = mediaTypeForFile(file)
+  if (mediaType === 'photo') return prepareImage(file)
+  if (mediaType === 'video') return prepareVideo(file)
+  const metadata = await extractFileMetadata(file)
   return {
     file,
     metadata: {
@@ -177,6 +287,8 @@ export async function prepareMedia(file: File): Promise<PreparedMedia> {
       sizeBytes: file.size,
       mediaType: 'file',
       fileCreatedAt: file.lastModified ? new Date(file.lastModified).toISOString() : undefined,
+      logicalPath: logicalPathForFile(file),
+      metadata,
     },
   }
 }

@@ -1,3 +1,5 @@
+import { appUserAssetPermissionPredicate } from './app-user-access-repository'
+
 export interface DiscoverModuleRow {
   slug: string
   name: string
@@ -9,7 +11,33 @@ export interface DiscoverModuleRow {
   cover_asset_id: string | null
 }
 
-export async function listDiscoverModules(db: D1Database): Promise<DiscoverModuleRow[]> {
+export async function listDiscoverModules(db: D1Database, appUserId?: string): Promise<DiscoverModuleRow[]> {
+  if (appUserId) {
+    const modules = await db.prepare(`SELECT slug, name, description, kind, sort_order, is_system,
+      0 AS asset_count, NULL AS cover_asset_id FROM discover_modules
+      ORDER BY sort_order ASC, name ASC`).all<DiscoverModuleRow>()
+    return Promise.all(modules.results.map(async (module) => {
+      const typeFilter = module.kind === 'media' && module.slug === 'video'
+        ? "assets.media_type = 'video'"
+        : "assets.media_type != 'video' AND COALESCE(assets.category_override, assets.primary_category, 'other') = ?"
+      const aggregate = await db.prepare(`SELECT COUNT(*) AS asset_count,
+          (SELECT assets2.id FROM assets assets2
+            WHERE assets2.workspace_id = 'personal' AND assets2.status != 'trashed'
+              AND ${module.kind === 'media' && module.slug === 'video' ? "assets2.media_type = 'video'" : "assets2.media_type != 'video' AND COALESCE(assets2.category_override, assets2.primary_category, 'other') = ?"}
+              AND ${appUserAssetPermissionPredicate('assets2')}
+            ORDER BY assets2.taken_at DESC, assets2.id DESC LIMIT 1) AS cover_asset_id
+        FROM assets
+        WHERE assets.workspace_id = 'personal' AND assets.status != 'trashed' AND ${typeFilter}
+          AND ${appUserAssetPermissionPredicate('assets')}`)
+        .bind(...(
+          module.kind === 'media' && module.slug === 'video'
+            ? [appUserId, 'read', appUserId, 'read']
+            : [module.slug, appUserId, 'read', module.slug, appUserId, 'read']
+        ))
+        .first<{ asset_count: number; cover_asset_id: string | null }>()
+      return { ...module, asset_count: Number(aggregate?.asset_count ?? 0), cover_asset_id: aggregate?.cover_asset_id ?? null }
+    }))
+  }
   const result = await db.prepare(`SELECT
       modules.slug,
       modules.name,

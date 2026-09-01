@@ -10,14 +10,15 @@ import {
 } from '../../src/worker/domain/policy'
 
 describe('storage size policy', () => {
-  it('keeps the exact 20 MB boundary fully available', () => {
-    expect(getSizeTier(TELEGRAM_GET_FILE_LIMIT)).toBe('full')
-    expect(getSizeTier(TELEGRAM_GET_FILE_LIMIT + 1)).toBe('preview-only')
+  it('keeps new Bot writes inside the recoverable 20 MB boundary', () => {
+    expect(MAX_UPLOAD_BYTES).toBe(TELEGRAM_GET_FILE_LIMIT)
+    expect(getSizeTier(TELEGRAM_GET_FILE_LIMIT, 'telegram_bot')).toBe('full')
+    expect(getSizeTier(TELEGRAM_GET_FILE_LIMIT + 1, 'telegram_bot')).toBe('rejected')
   })
 
-  it('keeps the exact 48 MB boundary and rejects anything larger', () => {
-    expect(getSizeTier(MAX_UPLOAD_BYTES)).toBe('preview-only')
-    expect(getSizeTier(MAX_UPLOAD_BYTES + 1)).toBe('rejected')
+  it('does not apply the Bot getFile boundary to User Group storage', () => {
+    expect(getSizeTier(TELEGRAM_GET_FILE_LIMIT + 1, 'telegram_user_group')).toBe('full')
+    expect(getSizeTier(100 * 1024 * 1024, 'telegram_user_group')).toBe('full')
   })
 })
 
@@ -32,11 +33,12 @@ describe('reserve input validation', () => {
     expect(result.mediaType).toBe('photo')
   })
 
-  it('rejects files larger than the Telegram upload contract', () => {
+  it('rejects files larger than the Telegram Bot upload contract', () => {
     expect(() => validateReserveInput({
       originalName: 'too-large.zip',
       mimeType: 'application/zip',
       sizeBytes: MAX_UPLOAD_BYTES + 1,
+      storageBackend: 'telegram_bot',
     })).toThrow('FILE_TOO_LARGE')
   })
 
@@ -46,10 +48,20 @@ describe('reserve input validation', () => {
     expect(() => validateReserveInput({ originalName: 'photo.jpg', mimeType: 'image/jpeg', sizeBytes: 100, contentHash: 'not-a-hash' })).toThrow('INVALID_CONTENT_HASH')
   })
 
+  it('rejects control characters in file names and MIME headers', () => {
+    expect(() => validateReserveInput({ originalName: 'photo\n.jpg', mimeType: 'image/jpeg', sizeBytes: 100 })).toThrow('INVALID_FILE_NAME')
+    expect(() => validateReserveInput({ originalName: 'photo.jpg', mimeType: 'image/jpeg\r\nX-Test: injected', sizeBytes: 100 })).toThrow('INVALID_MIME_TYPE')
+  })
+
   it('classifies common MIME types deterministically', () => {
     expect(inferMediaType('image/webp')).toBe('photo')
     expect(inferMediaType('video/mp4')).toBe('video')
     expect(inferMediaType('application/pdf')).toBe('file')
+  })
+
+  it('derives media type on the server instead of trusting a spoofed client category', () => {
+    expect(validateReserveInput({ originalName: 'page.html', mimeType: 'text/html', sizeBytes: 100, mediaType: 'photo' }).mediaType).toBe('file')
+    expect(validateReserveInput({ originalName: 'photo.jpg', mimeType: 'image/jpeg', sizeBytes: 100, mediaType: 'file' }).mediaType).toBe('photo')
   })
 
   it('rejects invalid dimensions, duration, and GPS ranges', () => {

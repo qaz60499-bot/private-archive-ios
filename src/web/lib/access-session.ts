@@ -7,10 +7,27 @@ export function isAccessSignInRequired(error: unknown): boolean {
 }
 
 export function reauthenticateAccess(returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`): void {
-  const target = new URL('/access-check', window.location.origin)
-  target.searchParams.set('return', returnTo || '/')
-  target.searchParams.set('t', String(Date.now()))
-  window.location.assign(target.toString())
+  const target = new URL(returnTo || '/', window.location.origin)
+  target.searchParams.set('_access_reauth', String(Date.now()))
+
+  // A cached PWA shell can otherwise keep serving the SPA without ever touching
+  // Cloudflare Access. Remove the current worker/cache first, then do a real top-level
+  // navigation so an expired Access application token is challenged by Cloudflare.
+  const navigate = () => window.location.assign(target.toString())
+  void (async () => {
+    try {
+      if ('serviceWorker' in navigator) {
+        const registrations = await navigator.serviceWorker.getRegistrations()
+        await Promise.all(registrations.map((registration) => registration.unregister()))
+      }
+      if ('caches' in window) {
+        const cacheNames = await caches.keys()
+        await Promise.all(cacheNames.map((cacheName) => caches.delete(cacheName)))
+      }
+    } finally {
+      navigate()
+    }
+  })()
 }
 
 // Cloudflare Access sessions expire (default 1-day TTL); a stale cookie turns every

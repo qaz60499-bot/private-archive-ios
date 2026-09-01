@@ -1,15 +1,23 @@
 node_modules/
 dist/
+release/
 .wrangler/
 playwright-report/
 test-results/
 coverage/
 .dev.vars
+.desktop-bootstrap-token
+.desktop-secrets.json
 .env
 .env.*
 !.env.example
 *.log
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
 
 work/external/
+work/telegram-bridge-build/
 *.cpuprofile
 nul

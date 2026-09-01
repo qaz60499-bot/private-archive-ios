@@ -1,12 +1,13 @@
 import { enqueueLocalUpload } from './offline/store'
 import { wakeUploadScheduler } from './offline/processor'
-import type { MediaType } from '../types'
+import type { MediaType, StorageBackend } from '../types'
 
-export const MAX_UPLOAD_BYTES = 48 * 1024 * 1024
+export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 export const MOBILE_IMPORT_WINDOW = 8
 export const DESKTOP_IMPORT_WINDOW = 24
 
 export interface ImportFilesProgress {
+  batchId: string
   total: number
   processed: number
   queued: number
@@ -17,6 +18,8 @@ export interface ImportFilesProgress {
 
 export interface ImportFilesOptions {
   mobile?: boolean
+  batchId?: string
+  storageBackend?: StorageBackend
   onProgress?: (progress: ImportFilesProgress) => void
 }
 
@@ -45,15 +48,16 @@ async function requestPersistentStorage(): Promise<void> {
 
 export async function importFiles(files: FileList | File[], online: boolean, options: ImportFilesOptions = {}): Promise<ImportFilesResult> {
   const selectedFiles = Array.from(files)
-  const batchId = crypto.randomUUID()
+  const batchId = options.batchId ?? crypto.randomUUID()
   const errors: string[] = []
   const total = selectedFiles.length
   const mobile = options.mobile ?? (typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches)
+  const storageBackend = options.storageBackend ?? 'telegram_user_group'
   const windowSize = mobile ? MOBILE_IMPORT_WINDOW : DESKTOP_IMPORT_WINDOW
   const windows = Math.max(1, Math.ceil(total / windowSize))
   let queued = 0
   let processed = 0
-  const report = (phase: ImportFilesProgress['phase'], window: number) => options.onProgress?.({ total, processed, queued, window, windows, phase })
+  const report = (phase: ImportFilesProgress['phase'], window: number) => options.onProgress?.({ batchId, total, processed, queued, window, windows, phase })
 
   // Always persist the original to durable storage (OPFS, else an IndexedDB blob).
   // Mobile browsers evict in-memory File handles aggressively when the page is
@@ -71,12 +75,12 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
       const file = selectedFiles[index]
       processed += 1
       report('registering', windowNumber)
-      if (file.size > MAX_UPLOAD_BYTES) {
-        errors.push(`${file.name} 超过 48 MB，当前 Cloud Bot API 版本不支持。`)
+      if (storageBackend === 'telegram_bot' && file.size > MAX_UPLOAD_BYTES) {
+        errors.push(`${file.name} 超过 Bot 存储安全处理范围，请切换到“Telegram 私人群组”。不会自动回退到 Bot。`)
       } else {
         try {
           const mediaType: MediaType = file.type.startsWith('image/') ? 'photo' : file.type.startsWith('video/') ? 'video' : 'file'
-          await enqueueLocalUpload({ file, batchId, mediaType, persistPayload })
+          await enqueueLocalUpload({ file, batchId, mediaType, persistPayload, storageBackend })
           queued += 1
           report('registering', windowNumber)
           if (online && navigator.onLine) void wakeUploadScheduler('import-window')

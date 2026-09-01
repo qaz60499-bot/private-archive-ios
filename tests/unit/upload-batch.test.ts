@@ -5,7 +5,7 @@ import type { LocalUploadJob } from '../../src/web/types'
 function job(id: string, patch: Partial<LocalUploadJob> = {}): LocalUploadJob {
   return {
     schemaVersion: 2, id, batchId: 'batch-a', fileName: `${id}.jpg`, mimeType: 'image/jpeg', sizeBytes: 1,
-    mediaType: 'photo', status: 'waiting', prepareStatus: 'pending', controlState: 'active', stage: 'registered',
+    mediaType: 'photo', storageBackend: 'telegram_user_group', status: 'waiting', prepareStatus: 'pending', controlState: 'active', stage: 'registered',
     progress: 0, attempts: 0, createdAt: '2026-08-12T00:00:00.000Z', updatedAt: '2026-08-12T00:00:00.000Z', metadata: {}, ...patch,
   }
 }

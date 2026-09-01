@@ -28,6 +28,13 @@ test.beforeEach(async ({ request }) => seed(request))
 test('desktop viewer exposes zoom, fit, and adjacent preview navigation', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'desktop viewer controls only')
   await page.goto('/?q=.jpg')
+  await expect(page.getByRole('button', { name: '打开 morning-garden.jpg' })).toBeVisible()
+  const visibleNames = await page.locator('.media-open').evaluateAll((buttons) => buttons
+    .map((button) => button.getAttribute('aria-label')?.replace(/^打开 /u, '') ?? '')
+    .filter(Boolean))
+  const morningIndex = visibleNames.indexOf('morning-garden.jpg')
+  expect(morningIndex).toBeGreaterThanOrEqual(0)
+  const nextName = visibleNames[(morningIndex + 1) % visibleNames.length]
   await page.getByRole('button', { name: '打开 morning-garden.jpg' }).click()
   const viewer = page.getByRole('dialog', { name: '查看 morning-garden.jpg' })
   await expect(viewer).toBeVisible()
@@ -38,7 +45,7 @@ test('desktop viewer exposes zoom, fit, and adjacent preview navigation', async 
   await expect(viewer).not.toHaveClass(/viewer-zoomed/)
 
   await page.keyboard.press('ArrowRight')
-  await expect(page.getByRole('dialog', { name: '查看 friends-at-dusk.jpg' })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: `查看 ${nextName}` })).toBeVisible()
   await page.keyboard.press('ArrowLeft')
   await expect(page.getByRole('dialog', { name: '查看 morning-garden.jpg' })).toBeVisible()
 })
@@ -46,6 +53,13 @@ test('desktop viewer exposes zoom, fit, and adjacent preview navigation', async 
 test('mobile viewer swipes between photos, dismisses downward, double-tap zooms, and pinches', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'mobile', 'mobile gesture contract')
   await page.goto('/?q=.jpg')
+  await expect(page.getByRole('button', { name: '打开 morning-garden.jpg' })).toBeVisible()
+  const visibleNames = await page.locator('.media-open').evaluateAll((buttons) => buttons
+    .map((button) => button.getAttribute('aria-label')?.replace(/^打开 /u, '') ?? '')
+    .filter(Boolean))
+  const morningIndex = visibleNames.indexOf('morning-garden.jpg')
+  expect(morningIndex).toBeGreaterThanOrEqual(0)
+  const nextName = visibleNames[(morningIndex + 1) % visibleNames.length]
   await page.getByRole('button', { name: '打开 morning-garden.jpg' }).click()
   let viewer = page.getByRole('dialog', { name: '查看 morning-garden.jpg' })
   await expect(viewer).toBeVisible()
@@ -58,9 +72,9 @@ test('mobile viewer swipes between photos, dismisses downward, double-tap zooms,
     { x: stageBox!.x + stageBox!.width * 0.52, y: centerY },
     { x: stageBox!.x + stageBox!.width * 0.18, y: centerY },
   ])
-  await expect(page.getByRole('dialog', { name: '查看 friends-at-dusk.jpg' })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: `查看 ${nextName}` })).toBeVisible()
 
-  viewer = page.getByRole('dialog', { name: '查看 friends-at-dusk.jpg' })
+  viewer = page.getByRole('dialog', { name: `查看 ${nextName}` })
   const secondBox = await viewer.locator('.viewer-stage').boundingBox()
   await touchGesture(page, [
     { x: secondBox!.x + secondBox!.width * 0.5, y: secondBox!.y + secondBox!.height * 0.32 },

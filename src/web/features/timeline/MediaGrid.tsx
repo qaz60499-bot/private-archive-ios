@@ -1,6 +1,7 @@
 import { useState } from 'react'
-import { Check, Heart, Play, RefreshCw, Send } from 'lucide-react'
+import { Check, Heart, ImageOff, Play, RefreshCw, Send } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
+import { usePrivateMediaUrl } from '../../lib/native-media'
 import type { Asset } from '../../types'
 
 export function VideoBadge() {
@@ -23,14 +24,18 @@ export function MediaTile({
   const { openViewer, toggleFavorite } = useArchive()
   const ratio = asset.width && asset.height ? `${asset.width} / ${asset.height}` : '4 / 3'
   // A failed preview must reach a real terminal state with a retry, not shimmer forever.
-  const [failed, setFailed] = useState(false)
+  const [failed, setFailed] = useState(!asset.previewSupported)
   const [reloadNonce, setReloadNonce] = useState(0)
   const previewSrc = reloadNonce
     ? `${asset.previewUrl}${asset.previewUrl.includes('?') ? '&' : '?'}retry=${reloadNonce}`
     : asset.previewUrl
+  const nativePreview = usePrivateMediaUrl(previewSrc, { enabled: asset.previewSupported && !failed, retryKey: reloadNonce })
+  const previewFailed = failed || nativePreview.failed
   const retryPreview = () => { setFailed(false); setReloadNonce((value) => value + 1) }
+  const takenTime = new Date(asset.takenAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  const archiveContext = asset.albumNames?.[0] ?? asset.tags?.[0]?.name ?? null
   return (
-    <article className={`media-tile media-${asset.mediaType}${selectionMode ? ' selection-mode' : ''}${selected ? ' selected' : ''}${failed ? ' media-failed' : ''}`} style={{ aspectRatio: ratio }}>
+    <article className={`media-tile media-${asset.mediaType}${selectionMode ? ' selection-mode' : ''}${selected ? ' selected' : ''}${previewFailed ? ' media-failed' : ''}`} style={{ aspectRatio: ratio }}>
       <button
         type="button"
         className="media-open"
@@ -38,8 +43,8 @@ export function MediaTile({
         aria-label={selectionMode ? `${selected ? '取消选择' : '选择'} ${asset.originalName}` : `打开 ${asset.originalName}`}
         aria-pressed={selectionMode ? selected : undefined}
       >
-        <img
-          src={previewSrc}
+        {!previewFailed && nativePreview.url ? <img
+          src={nativePreview.url}
           alt=""
           loading={priority ? 'eager' : 'lazy'}
           fetchPriority={priority ? 'high' : 'low'}
@@ -47,12 +52,18 @@ export function MediaTile({
           width={asset.width ?? undefined}
           height={asset.height ?? undefined}
           draggable={false}
-          onLoad={(event) => { event.currentTarget.dataset.loaded = 'true'; if (failed) setFailed(false) }}
+          onLoad={(event) => { event.currentTarget.dataset.loaded = 'true' }}
           onError={() => setFailed(true)}
-        />
-        <span className="media-overlay"><strong>{asset.originalName}</strong><small>{new Date(asset.takenAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</small></span>
+        /> : <span className="media-preview-unavailable"><ImageOff /><b>预览不可用</b><small>其它档案不受影响</small></span>}
+        <span className="media-overlay">
+          <span className="media-overlay-copy">
+            <small>{takenTime}</small>
+            <strong>{asset.originalName}</strong>
+            {archiveContext ? <em>{archiveContext}</em> : null}
+          </span>
+        </span>
       </button>
-      {failed && <button type="button" className="media-retry" onClick={retryPreview} aria-label={`重新加载 ${asset.originalName}`}><RefreshCw /><span>重新加载</span></button>}
+      {previewFailed && asset.previewSupported && <button type="button" className="media-retry" onClick={retryPreview} aria-label={`重新加载 ${asset.originalName}`}><RefreshCw /><span>重新加载</span></button>}
       {selectionMode && <span className="selection-indicator" aria-hidden="true">{selected ? <Check /> : null}</span>}
       {asset.mediaType === 'video' && <VideoBadge />}
       {!asset.originalAvailableInApp && asset.mediaType !== 'file' && <span className="telegram-only" title="原文件仅在 Telegram 打开"><Send /></span>}

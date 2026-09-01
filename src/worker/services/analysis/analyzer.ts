@@ -125,6 +125,7 @@ export async function analyzeAsset(env: Env, storage: StorageAdapter, asset: Ass
   if (bytes.byteLength > 2 * 1024 * 1024) throw new Error('PREVIEW_TOO_LARGE_FOR_ANALYSIS')
   const contentType = preview.headers.get('content-type')
   const image = bytesToDataUrl(bytes, contentType?.startsWith('image/') ? contentType : 'image/jpeg')
+  if (!env.AI) throw new Error('AI_NOT_CONFIGURED')
   const ai = env.AI as unknown as JsonAiRunner
 
   const visionRaw = await ai.run(VISION_MODEL, {

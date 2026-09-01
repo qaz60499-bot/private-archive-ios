@@ -1,30 +1,27 @@
-import { BrowserRouter, Route, Routes } from 'react-router-dom'
-import { AppShell } from './components/AppShell'
+import { lazy, Suspense } from 'react'
+import { BrowserRouter } from 'react-router-dom'
 import { ArchiveProvider } from './context/ArchiveContext'
-import { AccessCheckPage } from './pages/AccessCheckPage'
-import { AlbumDetailPage } from './pages/AlbumDetailPage'
-import { AlbumsPage } from './pages/AlbumsPage'
-import { CollectionPage } from './pages/CollectionPage'
-import { DiscoverPage } from './pages/DiscoverPage'
-import { PlacesPage } from './pages/PlacesPage'
-import { QueuePage } from './pages/QueuePage'
-import { SettingsPage } from './pages/SettingsPage'
-import { TimelinePage } from './pages/TimelinePage'
+import { resolveAppSurface } from './lib/app-surface'
+import { setLocalUploadPrincipal } from './lib/offline/store'
+import { WebUploadPage } from './pages/WebUploadPage'
+
+const DesktopApp = lazy(() => import('./DesktopApp'))
+const SharePage = lazy(() => import('./pages/SharePage').then((module) => ({ default: module.SharePage })))
+
+function LoadingSurface() {
+  return <main className="surface-loading" aria-live="polite">正在打开 Private Archive…</main>
+}
 
 export default function App() {
-  return <BrowserRouter><ArchiveProvider><Routes><Route element={<AppShell />}>
-    <Route path="/" element={<TimelinePage />} />
-    <Route path="/access-check" element={<AccessCheckPage />} />
-    <Route path="/discover" element={<DiscoverPage />} />
-    <Route path="/people" element={<CollectionPage type="people" />} />
-    <Route path="/places" element={<PlacesPage />} />
-    <Route path="/albums" element={<AlbumsPage />} />
-    <Route path="/albums/:id" element={<AlbumDetailPage />} />
-    <Route path="/videos" element={<CollectionPage type="videos" />} />
-    <Route path="/files" element={<CollectionPage type="files" />} />
-    <Route path="/favorites" element={<CollectionPage type="favorites" />} />
-    <Route path="/queue" element={<QueuePage />} />
-    <Route path="/settings" element={<SettingsPage />} />
-    <Route path="*" element={<TimelinePage />} />
-  </Route></Routes></ArchiveProvider></BrowserRouter>
+  const surface = resolveAppSurface(window.location)
+  if (surface === 'shared') return <Suspense fallback={<LoadingSurface />}><SharePage /></Suspense>
+  if (surface === 'web-upload') {
+    // Hosted Web is an Access-protected upload portal. It deliberately does not depend
+    // on the desktop app-account session: the Worker maps a validated Access owner to
+    // the D1 Owner only for the narrow hosted-upload API allowlist. The fixed principal
+    // below is only a browser-local queue namespace; it grants no server capability.
+    setLocalUploadPrincipal('hosted-access-owner', { adoptLegacy: true })
+    return <BrowserRouter><ArchiveProvider><WebUploadPage /></ArchiveProvider></BrowserRouter>
+  }
+  return <Suspense fallback={<LoadingSurface />}><DesktopApp /></Suspense>
 }

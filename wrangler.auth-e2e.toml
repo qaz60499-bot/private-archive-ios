@@ -1,0 +1,43 @@
+"$schema" = "./node_modules/wrangler/config-schema.json"
+name = "private-archive-auth-e2e"
+main = "src/worker/index.ts"
+compatibility_date = "2026-08-11"
+workers_dev = false
+preview_urls = false
+
+[vars]
+OWNER_EMAIL = "qaz60499@gmail.com"
+ALLOWED_ORIGIN = "http://127.0.0.1:8799"
+TEAM_DOMAIN = "https://qaz60499.cloudflareaccess.com"
+POLICY_AUD = "7e13f6534f8e8b4b211a42887fc5380e3cca431f200386835385c8b0c574af20"
+TELEGRAM_WEBHOOK_URL = "http://127.0.0.1:8799/api/telegram/webhook"
+SHARE_ORIGIN = "http://127.0.0.1:8799"
+MOCK_TELEGRAM = "true"
+E2E_APP_AUTH_MODE = "strict"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "private-archive-db"
+database_id = "8ca60403-dd2b-48fa-8e07-9b0274a258fc"
+migrations_dir = "migrations"
+
+[[kv_namespaces]]
+binding = "PREVIEW_CACHE"
+id = "32a3a4cbeb2347df857800e25b2bfc04"
+
+[[queues.producers]]
+binding = "ANALYSIS_QUEUE"
+queue = "private-archive-analysis"
+
+[[queues.consumers]]
+queue = "private-archive-analysis"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "private-archive-analysis-dlq"

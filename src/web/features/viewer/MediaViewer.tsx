@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RefObject, SyntheticEvent, TouchEvent as ReactTouchEvent, WheelEvent as ReactWheelEvent } from 'react'
-import { Album, ChevronLeft, ChevronRight, Download, Heart, Maximize2, Trash2, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Album, ChevronLeft, ChevronRight, Download, Heart, ImageOff, Maximize2, Trash2, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
 import { api } from '../../lib/api'
+import { assetSourceLabel, formatArchiveDate, formatBytes } from '../../lib/asset-display'
+import { usePrivateMediaUrl } from '../../lib/native-media'
+import { isNativeApp } from '../../lib/native-platform'
 import type { Album as AlbumType, Asset, DiscoverModule } from '../../types'
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
 
 export function MetadataPanel() {
   const { viewerAsset: asset, setAssetCategory } = useArchive()
@@ -30,14 +28,18 @@ export function MetadataPanel() {
       <p className="eyebrow">Archive record</p>
       <h2>{asset.originalName}</h2>
       <dl>
-        <div><dt>拍摄时间</dt><dd>{new Date(asset.takenAt).toLocaleString('zh-CN')}</dd></div>
-        <div><dt>来源</dt><dd>{asset.source === 'web' ? '网页上传' : asset.source === 'mock' ? 'Mock 档案' : 'Telegram'}</dd></div>
+        <div><dt>拍摄时间</dt><dd>{formatArchiveDate(asset.takenAt)}</dd></div>
+        <div><dt>来源</dt><dd>{assetSourceLabel(asset.source)}</dd></div>
+        <div><dt>导入时间</dt><dd>{formatArchiveDate(asset.uploadedAt)}</dd></div>
+        {asset.deletedAt ? <div><dt>删除时间</dt><dd>{formatArchiveDate(asset.deletedAt)}</dd></div> : null}
+        <div><dt>原路径</dt><dd>{asset.logicalPath || '/'}</dd></div>
         <div><dt>文件</dt><dd>{asset.mimeType} · {formatBytes(asset.sizeBytes)}</dd></div>
         <div><dt>整理状态</dt><dd>{asset.analysisStatus === 'limited' ? '仅基础整理' : asset.analysisStatus}</dd></div>
+        {asset.albumNames?.length ? <div><dt>相册</dt><dd>{asset.albumNames.join('、')}</dd></div> : null}
         {asset.latitude !== null && <div><dt>坐标</dt><dd>{asset.latitude.toFixed(4)}, {asset.longitude?.toFixed(4)} · 待解析</dd></div>}
       </dl>
       <div className="tag-list">{asset.tags?.map((tag) => <span key={tag.slug}>{tag.name}</span>) ?? <span>{asset.primaryCategory ?? '未分类'}</span>}</div>
-      <div className="viewer-category-control">
+      {asset.status !== 'trashed' ? <div className="viewer-category-control">
         <label htmlFor={`asset-module-${asset.id}`}>所属模块</label>
         <select
           id={`asset-module-${asset.id}`}
@@ -53,12 +55,13 @@ export function MetadataPanel() {
           {modules.map((module) => <option key={module.slug} value={module.slug}>{module.name}</option>)}
         </select>
         <small>{asset.categorySource === 'manual' ? '手动归类优先，AI 不会覆盖。' : '当前由 AI 自动归类；可随时手动移动。'}</small>
-      </div>
-      <div className="viewer-album">
+      </div> : null}
+      {asset.status !== 'trashed' ? <div className="viewer-album">
         <button type="button" className="text-button" onClick={async () => setAlbums((await api.listAlbums()).items)}><Album />加入相册</button>
         {albums.length > 0 && <div className="album-options">{albums.map((item) => <button key={item.id} type="button" onClick={async () => { await api.addToAlbum(item.id, asset.id); setAdded(item.name) }}>{added === item.name ? '已加入 ' : '+ '}{item.name}</button>)}</div>}
-      </div>
-      {!asset.originalAvailableInApp && <p className="viewer-note">原文件超过网页回拉范围，安全保存在 Telegram；这里使用小预览浏览。</p>}
+      </div> : null}
+      {asset.status === 'trashed' ? <p className="viewer-note">此项目位于回收站。这里仅用于确认内容与元数据；恢复或永久删除请回到回收站操作。</p> : null}
+      {!asset.originalAvailableInApp && <p className="viewer-note">原文件当前不能从网页直接读取；这里使用可用的小预览浏览。</p>}
     </aside>
   )
 }
@@ -82,12 +85,21 @@ interface PhotoTransform {
 }
 
 function ViewerPhoto({ asset, stageRef, transform }: { asset: Asset; stageRef: RefObject<HTMLDivElement | null>; transform: PhotoTransform }) {
+  const native = isNativeApp()
   const [source, setSource] = useState(asset.previewUrl)
+  const [failed, setFailed] = useState(false)
   const loadingFull = useRef(false)
+  const nativePreview = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported })
+  const nativeFull = usePrivateMediaUrl(asset.mediaUrl, {
+    enabled: native && asset.originalAvailableInApp && Boolean(asset.mediaUrl) && asset.sizeBytes <= 20 * 1024 * 1024,
+    cache: false,
+  })
+  const displayedSource = native ? (nativeFull.url ?? nativePreview.url) : source
 
   const onLoad = (event: SyntheticEvent<HTMLImageElement>) => {
+    setFailed(false)
     if (stageRef.current) fitImageToStage(stageRef.current, event.currentTarget)
-    if (source !== asset.previewUrl || !asset.originalAvailableInApp || !asset.mediaUrl || loadingFull.current) return
+    if (native || source !== asset.previewUrl || !asset.originalAvailableInApp || !asset.mediaUrl || asset.sizeBytes > 20 * 1024 * 1024 || loadingFull.current) return
     loadingFull.current = true
     const full = new Image()
     full.decoding = 'async'
@@ -96,13 +108,28 @@ function ViewerPhoto({ asset, stageRef, transform }: { asset: Asset; stageRef: R
     full.src = asset.mediaUrl
   }
 
+  if (failed || nativePreview.failed || !asset.previewSupported) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>预览不可用</strong><span>这只影响当前项目；其它档案仍可继续浏览。</span></div>
+  if (!displayedSource) return <div className="viewer-preview-unavailable" role="status"><strong>正在加载</strong><span>正在安全读取私有媒体。</span></div>
+
   return <img
-    src={source}
+    src={displayedSource}
     alt={asset.originalName}
     draggable={false}
     onLoad={onLoad}
+    onError={() => setFailed(true)}
     style={{ transform: `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})` }}
   />
+}
+
+function ViewerVideo({ asset }: { asset: Asset }) {
+  const native = isNativeApp()
+  const nativeVideo = usePrivateMediaUrl(asset.mediaUrl, { enabled: native && asset.originalAvailableInApp && Boolean(asset.mediaUrl), cache: false })
+  const nativePoster = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported })
+  const source = native ? nativeVideo.url : (asset.mediaUrl ?? asset.previewUrl)
+  const poster = native ? nativePoster.url ?? undefined : asset.previewUrl
+  if (native && nativeVideo.failed) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>视频读取失败</strong><span>请检查网络后重试。</span></div>
+  if (!source) return <div className="viewer-preview-unavailable" role="status"><strong>正在加载</strong><span>正在安全读取私有视频。</span></div>
+  return <video src={source} poster={poster} controls autoPlay={false} />
 }
 
 interface GestureState {
@@ -171,7 +198,7 @@ export function MediaViewer() {
   }, [asset?.id, resetPhoto])
 
   useEffect(() => {
-    if (!asset || index < 0 || assets.length < 2) return
+    if (!asset || index < 0 || assets.length < 2 || isNativeApp()) return
     const neighbors = [assets[(index - 1 + assets.length) % assets.length], assets[(index + 1) % assets.length]]
     for (const neighbor of neighbors) {
       if (neighbor.mediaType === 'file') continue
@@ -320,9 +347,13 @@ export function MediaViewer() {
     setScale(photoTransform.scale - event.deltaY * 0.004)
   }
 
+  const nativeDownload = usePrivateMediaUrl(asset?.mediaUrl, { enabled: Boolean(asset?.originalAvailableInApp && asset?.mediaUrl), cache: false })
+
   if (!asset) return null
-  const source = asset.mediaUrl ?? asset.previewUrl
+  const downloadUrl = isNativeApp() ? nativeDownload.url : asset.mediaUrl
   const zoomable = asset.mediaType === 'photo'
+  const trashed = asset.status === 'trashed'
+  const canNavigate = index >= 0 && assets.length > 1
   return (
     <div className={`media-viewer${uiHidden ? ' viewer-ui-hidden' : ''}${photoTransform.scale > 1 ? ' viewer-zoomed' : ''}`} role="dialog" aria-modal="true" aria-label={`查看 ${asset.originalName}`}>
       <div className="viewer-toolbar">
@@ -333,9 +364,9 @@ export function MediaViewer() {
             <button type="button" onClick={resetPhoto} aria-label="适合窗口"><Maximize2 /><span>适合</span></button>
             <button type="button" onClick={() => setScale(photoTransform.scale + 0.5)} aria-label="放大"><ZoomIn /><span>放大</span></button>
           </> : null}
-          <button type="button" onClick={() => void toggleFavorite(asset)} aria-label={asset.favorite ? '取消收藏' : '收藏'} aria-pressed={asset.favorite}><Heart fill={asset.favorite ? 'currentColor' : 'none'} /><span>收藏</span></button>
-          {asset.originalAvailableInApp && asset.mediaUrl && <a href={asset.mediaUrl} download={asset.originalName} aria-label={`下载 ${asset.originalName}`}><Download /><span>下载</span></a>}
-          <button className="danger-button" type="button" aria-label="移入回收站" onClick={() => { if (window.confirm(`将“${asset.originalName}”移入回收站？Telegram 中的原文件不会被删除。`)) void trashAsset(asset) }}><Trash2 /><span>回收站</span></button>
+          {!trashed ? <button type="button" onClick={() => void toggleFavorite(asset)} aria-label={asset.favorite ? '取消收藏' : '收藏'} aria-pressed={asset.favorite}><Heart fill={asset.favorite ? 'currentColor' : 'none'} /><span>收藏</span></button> : null}
+          {asset.originalAvailableInApp && downloadUrl && <a href={downloadUrl} download={asset.originalName} aria-label={`下载 ${asset.originalName}`}><Download /><span>下载</span></a>}
+          {!trashed ? <button className="danger-button" type="button" aria-label="移入回收站" onClick={() => { if (window.confirm(`将“${asset.originalName}”移入回收站？Telegram 中的原文件不会被删除。`)) void trashAsset(asset) }}><Trash2 /><span>回收站</span></button> : null}
         </div>
       </div>
       <div
@@ -351,11 +382,11 @@ export function MediaViewer() {
           if (target === event.currentTarget || target.tagName === 'IMG') setUiHidden((hidden) => !hidden)
         }}
       >
-        <button type="button" className="viewer-arrow left" onClick={(event) => { event.stopPropagation(); move(-1) }} aria-label="上一项"><ChevronLeft /></button>
+        {canNavigate ? <button type="button" className="viewer-arrow left" onClick={(event) => { event.stopPropagation(); move(-1) }} aria-label="上一项"><ChevronLeft /></button> : null}
         {asset.mediaType === 'video' && asset.originalAvailableInApp
-          ? <video src={source} poster={asset.previewUrl} controls autoPlay={false} />
+          ? <ViewerVideo asset={asset} />
           : <ViewerPhoto key={asset.id} asset={asset} stageRef={stageRef} transform={photoTransform} />}
-        <button type="button" className="viewer-arrow right" onClick={(event) => { event.stopPropagation(); move(1) }} aria-label="下一项"><ChevronRight /></button>
+        {canNavigate ? <button type="button" className="viewer-arrow right" onClick={(event) => { event.stopPropagation(); move(1) }} aria-label="下一项"><ChevronRight /></button> : null}
       </div>
       <MetadataPanel />
     </div>

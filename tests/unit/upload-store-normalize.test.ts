@@ -26,7 +26,7 @@ describe('IndexedDB v1 upload compatibility', () => {
       metadata: { originalName: 'legacy.jpg', mediaType: 'photo', contentHash: 'abc' },
     })
     expect(normalized).toMatchObject({
-      schemaVersion: 2, batchId: 'legacy-legacy', status: 'retrying', prepareStatus: 'ready', controlState: 'active',
+      schemaVersion: 2, batchId: 'legacy-legacy', storageBackend: 'telegram_bot', status: 'retrying', prepareStatus: 'ready', controlState: 'active',
       remoteAssetId: 'remote-a', uploadToken: 'token-a', fileBlob: blob,
     })
   })

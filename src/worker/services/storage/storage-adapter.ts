@@ -6,6 +6,7 @@ export interface StoreOriginalInput {
   mimeType: string
   mediaType: MediaType
   sizeBytes: number
+  manifest?: string
 }
 
 export interface StorePreviewInput {
@@ -18,6 +19,7 @@ export interface StorageAdapter {
   storeOriginal(input: StoreOriginalInput): Promise<StoredFile>
   storePreview(input: StorePreviewInput): Promise<StoredFile>
   copyMessage(fromChatId: string, messageId: number): Promise<{ messageId: number }>
+  deleteMessage(messageId: number): Promise<boolean>
   fetchFile(fileId: string, init?: RequestInit): Promise<Response>
 }
 

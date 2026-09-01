@@ -24,4 +24,27 @@ describe('parseArchiveSearch', () => {
   it('extracts cheap structured media and favorite filters', () => {
     expect(parseArchiveSearch('收藏 视频', now)).toMatchObject({ favorite: true, mediaType: 'video', q: undefined })
   })
+
+  it('extracts file category, extension, tag and size filters for global search', () => {
+    expect(parseArchiveSearch('Excel tag=合同 >10MB 最近版本', now)).toMatchObject({
+      fileCategory: 'spreadsheets',
+      tag: '合同',
+      minSizeBytes: 10 * 1024 * 1024 + 1,
+      q: '最近版本',
+    })
+    expect(parseArchiveSearch('PDF 已归档', now)).toMatchObject({ extension: 'pdf', archived: true, q: undefined })
+  })
+
+  it('does not treat year-like digits inside filenames or ids as a date filter', () => {
+    expect(parseArchiveSearch('bulk-trash-1788170412084-11111', now)).toMatchObject({
+      q: 'bulk-trash-1788170412084-11111',
+      takenAfter: undefined,
+      takenBefore: undefined,
+    })
+    expect(parseArchiveSearch('photo-1926-final.jpg', now)).toMatchObject({
+      q: 'photo-1926-final.jpg',
+      takenAfter: undefined,
+      takenBefore: undefined,
+    })
+  })
 })

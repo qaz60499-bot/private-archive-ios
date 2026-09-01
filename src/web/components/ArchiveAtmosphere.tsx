@@ -157,7 +157,17 @@ export function ArchiveAtmosphere() {
     const canvas = canvasRef.current
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     const saveData = (navigator as NavigatorWithConnection).connection?.saveData
-    if (!canvas || reduceMotion || saveData) return
+    const personalDesktop = document.documentElement.dataset.appSurface === 'personal-desktop'
+    if (!canvas) return
+
+    // The packaged personal SaaS prioritises instant archive access over ambient WebGL.
+    // Its CSS atmosphere is already complete, so do not download or initialise Three.js.
+    if (personalDesktop) {
+      canvas.dataset.unavailable = 'true'
+      return
+    }
+
+    if (reduceMotion || saveData) return
 
     let disposed = false
     let disposeScene: (() => void) | undefined

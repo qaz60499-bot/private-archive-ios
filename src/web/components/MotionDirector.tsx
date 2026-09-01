@@ -16,22 +16,21 @@ export function MotionDirector() {
       const { gsap } = await import('gsap')
       if (cancelled) return
 
-      const hasMemoryAperture = Boolean(root.querySelector('.memory-aperture'))
-      if (hasMemoryAperture) {
-        const { ScrollTrigger } = await import('gsap/ScrollTrigger')
-        if (cancelled) return
-        gsap.registerPlugin(ScrollTrigger)
-      }
-
       const atmosphere = document.querySelector<HTMLElement>('.archive-atmosphere')
+      const atmosphereLayers = atmosphere?.querySelectorAll<HTMLElement>('.archive-atmosphere-fallback, canvas')
       const exposureVeil = document.querySelector<HTMLElement>('.route-exposure-veil')
       const activeCore = document.querySelectorAll<SVGElement>('.desktop-sidebar .rail-link.active .glyph-core, .mobile-bottom-nav a.active .glyph-core')
       const activeOrbit = document.querySelectorAll<SVGElement>('.desktop-sidebar .rail-link.active .glyph-orbit, .mobile-bottom-nav a.active .glyph-orbit')
 
       const context = gsap.context(() => {
         const route = gsap.timeline({ defaults: { ease: 'power3.out' } })
-        if (atmosphere) {
-          route.fromTo(atmosphere, { scale: 1.016 }, { scale: 1, duration: 1.15, clearProps: 'transform' }, 0)
+        if (atmosphereLayers?.length) {
+          route.fromTo(
+            atmosphereLayers,
+            { scale: 1.016, transformOrigin: '50% 50%' },
+            { scale: 1, duration: 1.15, clearProps: 'transform,transformOrigin' },
+            0,
+          )
         }
         if (exposureVeil) {
           route.fromTo(
@@ -58,29 +57,17 @@ export function MotionDirector() {
           const eyebrow = memoryAperture.querySelector('.eyebrow')
           const title = memoryAperture.querySelector('h1')
           const description = memoryAperture.querySelector('.memory-aperture-copy > p:not(.eyebrow)')
-          const count = memoryAperture.querySelector('.memory-aperture-count')
-          const stage = memoryAperture.querySelector('.memory-aperture-stage')
+          const stats = memoryAperture.querySelector('.archive-hero-stats')
+          const actions = memoryAperture.querySelector('.archive-hero-actions')
           const heroTimeline = gsap.timeline({ defaults: { ease: 'power3.out' } })
 
-          if (eyebrow) heroTimeline.fromTo(eyebrow, { autoAlpha: 0, y: 10 }, { autoAlpha: 1, y: 0, duration: .42, clearProps: 'transform,opacity,visibility' })
-          if (title) heroTimeline.fromTo(title, { autoAlpha: 0, y: 34, scale: .985 }, { autoAlpha: 1, y: 0, scale: 1, duration: .92, clearProps: 'transform,opacity,visibility' }, '-=.18')
-          if (description) heroTimeline.fromTo(description, { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: .62, clearProps: 'transform,opacity,visibility' }, '-=.52')
-          if (count) heroTimeline.fromTo(count, { autoAlpha: 0, x: -10 }, { autoAlpha: 1, x: 0, duration: .52, clearProps: 'transform,opacity,visibility' }, '-=.44')
-          if (stage) heroTimeline.fromTo(stage, { autoAlpha: 0, scale: .95, rotation: -.45 }, { autoAlpha: 1, scale: 1, rotation: 0, duration: 1.2, ease: 'expo.out', clearProps: 'transform,opacity,visibility' }, .08)
-
-          const compact = window.matchMedia('(max-width: 767px)').matches
-          const departure = gsap.timeline({
-            defaults: { ease: 'none' },
-            scrollTrigger: {
-              trigger: memoryAperture,
-              start: 'top top+=72',
-              end: 'bottom top',
-              scrub: compact ? .35 : .65,
-            },
-          })
-          if (stage) departure.to(stage, { y: compact ? -12 : -34, scale: compact ? .985 : .96, rotation: compact ? -.18 : -.45 }, 0)
-          const copy = memoryAperture.querySelector('.memory-aperture-copy')
-          if (copy) departure.to(copy, { y: compact ? -7 : -18, autoAlpha: compact ? .9 : .78 }, 0)
+          if (eyebrow) heroTimeline.fromTo(eyebrow, { autoAlpha: 0, y: 8 }, { autoAlpha: 1, y: 0, duration: .3, clearProps: 'transform,opacity,visibility' })
+          if (title) heroTimeline.fromTo(title, { autoAlpha: 0, y: 16, scale: .994 }, { autoAlpha: 1, y: 0, scale: 1, duration: .56, clearProps: 'transform,opacity,visibility' }, '-=.1')
+          if (description) heroTimeline.fromTo(description, { autoAlpha: 0, y: 8 }, { autoAlpha: 1, y: 0, duration: .4, clearProps: 'transform,opacity,visibility' }, '-=.28')
+          if (stats) heroTimeline.fromTo(stats, { autoAlpha: 0, y: 7 }, { autoAlpha: 1, y: 0, duration: .36, clearProps: 'transform,opacity,visibility' }, '-=.25')
+          if (actions) heroTimeline.fromTo(actions, { autoAlpha: 0, y: 6 }, { autoAlpha: 1, y: 0, duration: .32, clearProps: 'transform,opacity,visibility' }, '-=.22')
+          // The Archive Composition is already painted by CSS/DOM. Do not hide it,
+          // pin it, scrub it, or load ScrollTrigger solely for decorative hero motion.
         }
 
         const intro = root.querySelector<HTMLElement>('.page-intro')

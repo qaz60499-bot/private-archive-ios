@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from 'react'
 import { ArrowLeft, Check, ImagePlus, LoaderCircle, Star, Trash2, X } from 'lucide-react'
 import { Link, useParams } from 'react-router-dom'
 import { EmptyState, ErrorState, LoadMore, SkeletonGrid } from '../components/States'
+import { AssetPreviewById } from '../components/AssetPreviewById'
 import { useArchive } from '../context/ArchiveContext'
 import { MediaGrid } from '../features/timeline/MediaGrid'
 import { api } from '../lib/api'
+import { usePrivateMediaUrl } from '../lib/native-media'
 import type { Album, Asset } from '../types'
 
 function formatRange(album: Album): string {
@@ -12,6 +14,12 @@ function formatRange(album: Album): string {
   const first = new Date(album.first_taken_at).toLocaleDateString('zh-CN')
   const latest = new Date(album.latest_taken_at).toLocaleDateString('zh-CN')
   return first === latest ? first : `${first} — ${latest}`
+}
+
+function AlbumPickerPreview({ asset }: { asset: Asset }) {
+  const preview = usePrivateMediaUrl(asset.previewUrl, { enabled: asset.previewSupported })
+  if (!preview.url) return <span className="album-picker-preview-placeholder" aria-hidden="true"><ImagePlus /></span>
+  return <img src={preview.url} alt="" loading="lazy" decoding="async" />
 }
 
 function AddToAlbumDialog({ album, currentIds, onClose, onAdded }: { album: Album; currentIds: Set<string>; onClose: () => void; onAdded: () => Promise<void> }) {
@@ -56,7 +64,7 @@ function AddToAlbumDialog({ album, currentIds, onClose, onAdded }: { album: Albu
       {loading ? <SkeletonGrid /> : error && !items.length ? <p className="album-error" role="alert">{error}</p> : items.length ? <div className="album-picker-grid">{items.map((asset) => {
         const checked = selected.has(asset.id)
         return <button key={asset.id} className={`album-picker-item${checked ? ' selected' : ''}`} type="button" aria-pressed={checked} onClick={() => toggle(asset.id)}>
-          <img src={asset.previewUrl} alt="" loading="lazy" decoding="async" />
+          <AlbumPickerPreview asset={asset} />
           <span>{checked ? <Check /> : null}</span>
           <small>{asset.originalName}</small>
         </button>
@@ -140,7 +148,7 @@ export function AlbumDetailPage() {
   return <div className="page album-detail-page">
     <header className="album-detail-hero">
       <Link className="album-back" to="/albums"><ArrowLeft />相册</Link>
-      <div className="album-detail-cover" aria-hidden="true">{album.cover_asset_id ? <img src={`/api/assets/${album.cover_asset_id}/preview`} alt="" decoding="async" /> : <ImagePlus />}</div>
+      <div className="album-detail-cover" aria-hidden="true">{album.cover_asset_id ? <AssetPreviewById assetId={album.cover_asset_id} loading="eager" fallback={<ImagePlus />} /> : <ImagePlus />}</div>
       <div className="album-detail-copy"><p className="eyebrow">PRIVATE COLLECTION</p><h1>{album.name}</h1><p>{formatRange(album)} · {album.asset_count} 项</p></div>
       <div className="album-detail-actions">
         <button className="secondary-button" type="button" onClick={() => setPickerOpen(true)}><ImagePlus />加入照片</button>

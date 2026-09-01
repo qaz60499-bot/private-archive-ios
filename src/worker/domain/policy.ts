@@ -1,14 +1,20 @@
-import type { MediaType, ReserveAssetInput } from './types'
+import { normalizeMimeType, sanitizeLogicalPath, sanitizeMetadata } from './asset-metadata'
+import type { MediaType, ReserveAssetInput, StorageBackend } from './types'
 
 export const TELEGRAM_GET_FILE_LIMIT = 20 * 1024 * 1024
-export const MAX_UPLOAD_BYTES = 48 * 1024 * 1024
+// New Bot writes are capped at the same boundary that can be restored through the
+// Bot API. Historical larger Bot objects remain readable/previewable under legacy rules.
+export const MAX_UPLOAD_BYTES = TELEGRAM_GET_FILE_LIMIT
+// The MTProto account limit is owned by Telegram and may change by account tier.
+// Keep the SaaS limit representation-safe instead of hard-coding a product-tier number.
+export const USER_GROUP_CLIENT_SAFETY_MAX_BYTES = Number.MAX_SAFE_INTEGER
 export const UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000
 
 export type SizeTier = 'full' | 'preview-only' | 'rejected'
 
-export function getSizeTier(sizeBytes: number): SizeTier {
+export function getSizeTier(sizeBytes: number, storageBackend: StorageBackend = 'telegram_bot'): SizeTier {
+  if (storageBackend === 'telegram_user_group') return sizeBytes > USER_GROUP_CLIENT_SAFETY_MAX_BYTES ? 'rejected' : 'full'
   if (sizeBytes > MAX_UPLOAD_BYTES) return 'rejected'
-  if (sizeBytes > TELEGRAM_GET_FILE_LIMIT) return 'preview-only'
   return 'full'
 }
 
@@ -18,19 +24,29 @@ export function inferMediaType(mimeType: string): MediaType {
   return 'file'
 }
 
+export function hasUnsafeControlCharacters(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.codePointAt(0) ?? 0
+    return code <= 0x1f || code === 0x7f
+  })
+}
+
 export function validateReserveInput(value: unknown): ReserveAssetInput {
   if (!value || typeof value !== 'object') throw new Error('INVALID_BODY')
   const input = value as Record<string, unknown>
-  if (typeof input.originalName !== 'string' || input.originalName.trim().length === 0 || input.originalName.length > 255) {
+  if (typeof input.originalName !== 'string' || input.originalName.trim().length === 0 || input.originalName.length > 255 || hasUnsafeControlCharacters(input.originalName)) {
     throw new Error('INVALID_FILE_NAME')
   }
-  if (typeof input.mimeType !== 'string' || input.mimeType.length > 160) throw new Error('INVALID_MIME_TYPE')
+  if (typeof input.mimeType !== 'string' || input.mimeType.length > 160 || !/^[\x20-\x7e]+$/.test(input.mimeType)) throw new Error('INVALID_MIME_TYPE')
   if (typeof input.sizeBytes !== 'number' || !Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
     throw new Error('INVALID_FILE_SIZE')
   }
-  if (getSizeTier(input.sizeBytes) === 'rejected') throw new Error('FILE_TOO_LARGE')
-  const mediaType = input.mediaType ?? inferMediaType(input.mimeType)
-  if (!['photo', 'video', 'file'].includes(String(mediaType))) throw new Error('INVALID_MEDIA_TYPE')
+  const storageBackend = input.storageBackend === undefined ? 'telegram_user_group' : String(input.storageBackend)
+  if (!['telegram_user_group', 'telegram_bot'].includes(storageBackend)) throw new Error('INVALID_STORAGE_BACKEND')
+  if (getSizeTier(input.sizeBytes, storageBackend as StorageBackend) === 'rejected') throw new Error('FILE_TOO_LARGE')
+  const normalizedMimeType = normalizeMimeType(input.originalName.trim(), input.mimeType)
+  const mediaType = inferMediaType(normalizedMimeType)
+  if (input.mediaType !== undefined && !['photo', 'video', 'file'].includes(String(input.mediaType))) throw new Error('INVALID_MEDIA_TYPE')
 
   const optionalNumber = (key: string): number | undefined => {
     const candidate = input[key]
@@ -41,6 +57,8 @@ export function validateReserveInput(value: unknown): ReserveAssetInput {
 
   const contentHash = typeof input.contentHash === 'string' ? input.contentHash.trim().toLowerCase() : undefined
   if (contentHash !== undefined && !/^[a-f0-9]{64}$/.test(contentHash)) throw new Error('INVALID_CONTENT_HASH')
+  const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : undefined
+  if (sourceId !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$/.test(sourceId)) throw new Error('INVALID_SOURCE_ID')
 
   const width = optionalNumber('width')
   const height = optionalNumber('height')
@@ -55,7 +73,7 @@ export function validateReserveInput(value: unknown): ReserveAssetInput {
 
   return {
     originalName: input.originalName.trim(),
-    mimeType: input.mimeType || 'application/octet-stream',
+    mimeType: normalizedMimeType,
     sizeBytes: input.sizeBytes,
     mediaType: mediaType as MediaType,
     width,
@@ -66,6 +84,11 @@ export function validateReserveInput(value: unknown): ReserveAssetInput {
     latitude,
     longitude,
     contentHash,
+    logicalPath: sanitizeLogicalPath(input.logicalPath),
+    sourceId,
+    storageBackend: storageBackend as StorageBackend,
+    importOrigin: typeof input.importOrigin === 'string' && input.importOrigin.length <= 80 ? input.importOrigin : 'web',
+    metadata: sanitizeMetadata(input.metadata),
   }
 }
 

@@ -63,7 +63,7 @@ describe('Cloudflare Access JWT verification', () => {
     })).resolves.toBe(false)
   })
 
-  it('accepts a valid signed token when the optional email claim is absent', async () => {
+  it('rejects a token without an email claim when owner identity is required', async () => {
     const fixture = await createFixture({ email: undefined })
     await expect(verifyAccessJwt(fixture.token, {
       audience: 'archive-aud',
@@ -71,7 +71,7 @@ describe('Cloudflare Access JWT verification', () => {
       teamDomain: 'https://private-archive.cloudflareaccess.com',
       fetcher: fetchJwk(fixture.jwk),
       nowSeconds: fixture.now,
-    })).resolves.toBe(true)
+    })).resolves.toBe(false)
   })
 
   it('rejects the wrong audience and expired tokens before trusting identity', async () => {

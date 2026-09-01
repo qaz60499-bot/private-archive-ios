@@ -27,6 +27,7 @@ export function friendlyUploadError(error: unknown): string {
       return '网络连接中断，任务已保留。恢复网络后会继续，不会重复上传已保存的原件。'
     }
     if (error.status === 401 && error.code === 'ACCESS_SIGN_IN_REQUIRED') return 'Cloudflare Access 登录已失效，请重新打开图库完成验证后重试。'
+    if (error.status === 401 && error.code === 'APP_AUTH_REQUIRED') return 'Private Archive 账号登录已过期，重新登录后会继续保留的上传任务。'
     if (error.code === 'UPLOAD_TOKEN_INVALID_OR_EXPIRED') return '上传凭证已过期，系统会为同一文件刷新凭证后继续。'
     return `上传失败（${error.code}）`
   }

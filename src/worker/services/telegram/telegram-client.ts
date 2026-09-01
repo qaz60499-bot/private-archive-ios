@@ -37,15 +37,18 @@ function telegramUrl(chatId: string, messageId: number): string | null {
 }
 
 function extractStoredFile(message: TelegramMessage, chatId: string): StoredFile {
-  let file: TelegramFileShape | undefined = message.document ?? message.video
+  const richFile = message.document ?? message.video
+  let file: TelegramFileShape | undefined = richFile
   if (!file && message.photo?.length) file = message.photo.at(-1)
   if (!file) throw new Error('TELEGRAM_RESPONSE_WITHOUT_FILE')
   return {
+    backend: 'telegram_bot',
     chatId,
     messageId: message.message_id,
     fileId: file.file_id,
     fileUniqueId: file.file_unique_id,
     telegramUrl: telegramUrl(chatId, message.message_id),
+    previewFileId: richFile?.thumbnail?.file_id,
   }
 }
 
@@ -75,9 +78,14 @@ export class TelegramStorageAdapter implements StorageAdapter {
     fileName: string
     mimeType: string
     body: ReadableStream<Uint8Array>
+    caption?: string
   }): Promise<StoredFile> {
     const multipart = createStreamingMultipart({
-      fields: { chat_id: this.storageChatId, disable_content_type_detection: 'false' },
+      fields: {
+        chat_id: this.storageChatId,
+        disable_content_type_detection: 'false',
+        ...(options.caption ? { caption: options.caption } : {}),
+      },
       fileField: options.fileField,
       fileName: options.fileName,
       mimeType: options.mimeType,
@@ -103,6 +111,7 @@ export class TelegramStorageAdapter implements StorageAdapter {
       fileName: input.fileName,
       mimeType: input.mimeType,
       body: input.body,
+      caption: input.manifest,
     })
   }
 
@@ -123,6 +132,15 @@ export class TelegramStorageAdapter implements StorageAdapter {
       message_id: messageId,
     })
     return { messageId: result.message_id }
+  }
+
+  async deleteMessage(messageId: number): Promise<boolean> {
+    try {
+      return await this.callJson<boolean>('deleteMessage', { chat_id: this.storageChatId, message_id: messageId })
+    } catch (error) {
+      if (error instanceof TelegramApiError && error.status === 400 && /message to delete not found/i.test(error.message)) return false
+      throw error
+    }
   }
 
   async fetchFile(fileId: string, init?: RequestInit): Promise<Response> {

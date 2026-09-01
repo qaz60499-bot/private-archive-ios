@@ -24,17 +24,19 @@ test('archive atmosphere and custom navigation glyphs follow the active route', 
   await expect(page.locator('.desktop-sidebar .rail-link.active .glyph-discover')).toBeVisible()
 })
 
-test('home timeline uses the Memory Aperture hero while search stays task-focused', async ({ page }, testInfo) => {
+test('home is a DOM archive cover while search stays task-focused', async ({ page }) => {
   await page.goto('/')
 
   const hero = page.locator('.memory-aperture')
   await expect(hero).toBeVisible()
+  await expect(hero).toHaveAttribute('data-render-mode', 'dom')
   await expect(hero.getByRole('heading', { level: 1 })).toHaveText('时间留下的形状')
-  await expect(hero.locator('.memory-aperture-stage canvas')).toHaveCount(1)
-  await expect(hero.locator('.memory-aperture-stage')).toHaveAttribute('aria-hidden', 'true')
-  await expect(hero.locator('.memory-aperture-label')).toHaveCount(0)
-  await expect(hero.locator('.memory-aperture-count')).toBeVisible()
-  await expect(hero).toHaveAttribute('data-interaction-mode', testInfo.project.name === 'mobile' ? 'scroll' : 'pointer')
+  await expect(hero.locator('canvas')).toHaveCount(0)
+  await expect(hero.locator('.archive-composition')).toBeVisible()
+  await expect(hero.locator('.archive-frame')).toHaveCount(3)
+  await expect(hero.locator('.archive-hero-stats')).toBeVisible()
+  await expect(hero.getByRole('link', { name: '查看时间线' })).toBeVisible()
+  await expect(hero.getByRole('button', { name: '导入' })).toBeVisible()
 
   await page.goto('/?q=archive')
   await expect(page.locator('.memory-aperture')).toHaveCount(0)
@@ -42,18 +44,58 @@ test('home timeline uses the Memory Aperture hero while search stays task-focuse
   await expect(page.locator('.page-intro h1')).toContainText('archive')
 })
 
-test('reduced motion keeps the Memory Aperture as a static poster', async ({ page }) => {
+test('desktop archive composition responds locally without blocking the timeline action', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'pointer proximity is intentionally desktop-only')
+  await page.goto('/')
+
+  const stage = page.locator('.memory-aperture-stage')
+  const bounds = await stage.boundingBox()
+  expect(bounds).not.toBeNull()
+  await page.mouse.move(bounds!.x + bounds!.width * 0.82, bounds!.y + bounds!.height * 0.28)
+
+  const depth = await stage.evaluate((element) => ({
+    frontX: parseFloat((element as HTMLElement).style.getPropertyValue('--archive-front-x')) || 0,
+    frontY: parseFloat((element as HTMLElement).style.getPropertyValue('--archive-front-y')) || 0,
+  }))
+  expect(Math.abs(depth.frontX) + Math.abs(depth.frontY)).toBeGreaterThan(1)
+  expect(Math.abs(depth.frontX)).toBeLessThanOrEqual(5.3)
+  expect(Math.abs(depth.frontY)).toBeLessThanOrEqual(3.9)
+
+  await page.getByRole('link', { name: '查看时间线' }).click()
+  await expect(page.locator('#archive-timeline')).toBeVisible()
+  expect(await page.evaluate(() => location.hash)).toBe('#archive-timeline')
+})
+
+test('timeline exposes factual monthly memory markers without scroll-jacking', async ({ page }) => {
+  await page.goto('/')
+
+  const marker = page.locator('.timeline-month-marker').first()
+  await expect(marker).toBeVisible()
+  await expect(marker).toContainText(/\d{4}/)
+  await expect(marker).toContainText(/这个月留下了 \d+ 项记录/)
+  await expect(page.locator('.timeline-month-chapter').first()).toHaveCSS('display', 'grid')
+  await expect(page.locator('html')).not.toHaveCSS('scroll-snap-type', /mandatory/)
+})
+
+test('reduced motion keeps the DOM archive cover usable without canvas', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.goto('/')
 
   const hero = page.locator('.memory-aperture')
   await expect(hero).toBeVisible()
-  await expect(hero).toHaveAttribute('data-render-mode', 'static')
-  await expect(hero.locator('.memory-aperture-fallback')).toBeVisible()
-  await expect(hero.locator('.memory-aperture-stage canvas')).toBeHidden()
+  await expect(hero).toHaveAttribute('data-render-mode', 'dom')
+  await expect(hero.locator('.archive-composition')).toBeVisible()
+  await expect(hero.locator('canvas')).toHaveCount(0)
+
+  const stage = hero.locator('.memory-aperture-stage')
+  const bounds = await stage.boundingBox()
+  expect(bounds).not.toBeNull()
+  await page.mouse.move(bounds!.x + bounds!.width * .85, bounds!.y + bounds!.height * .2)
+  const pointerDepth = await stage.evaluate((element) => (element as HTMLElement).style.getPropertyValue('--archive-front-x'))
+  expect(pointerDepth === '' || pointerDepth === '0px').toBeTruthy()
 })
 
-test('reduced motion keeps the static darkroom field and disables WebGL motion', async ({ page }, testInfo) => {
+test('reduced motion keeps the static darkroom field and disables ambient WebGL motion', async ({ page }, testInfo) => {
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.goto(testInfo.project.name === 'mobile' ? '/discover' : '/people')
 
@@ -66,7 +108,7 @@ test('reduced motion keeps the static darkroom field and disables WebGL motion',
   await expect(activeDot).toHaveCSS('animation-name', 'none')
 })
 
-test('Memory Aperture stays bounded across required responsive widths', async ({ page }, testInfo) => {
+test('archive cover stays bounded across required responsive widths', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'one project is enough for the responsive viewport sweep')
 
   for (const viewport of [
@@ -74,24 +116,50 @@ test('Memory Aperture stays bounded across required responsive widths', async ({
     { width: 430, height: 844 },
     { width: 768, height: 900 },
     { width: 1280, height: 900 },
+    { width: 1366, height: 768 },
     { width: 1440, height: 960 },
+    { width: 1920, height: 1080 },
   ]) {
     await page.setViewportSize(viewport)
     await page.goto('/')
-    await expect(page.locator('.memory-aperture')).toBeVisible()
+    const hero = page.locator('.memory-aperture')
+    await expect(hero).toBeVisible()
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width + 1)
 
-    const stage = await page.locator('.memory-aperture-stage').evaluate((element) => {
+    const composition = await page.locator('.archive-composition').evaluate((element) => {
       const rect = element.getBoundingClientRect()
-      return { left: rect.left, right: rect.right, width: rect.width }
+      return { left: rect.left, right: rect.right, width: rect.width, height: rect.height }
     })
-    expect(stage.left).toBeGreaterThanOrEqual(-1)
-    expect(stage.right).toBeLessThanOrEqual(viewport.width + 1)
-    expect(stage.width).toBeGreaterThan(240)
+    expect(composition.left).toBeGreaterThanOrEqual(-1)
+    expect(composition.right).toBeLessThanOrEqual(viewport.width + 1)
+    expect(composition.width).toBeGreaterThan(240)
+    expect(composition.height).toBeGreaterThan(240)
   }
 })
 
-test('mobile Memory Aperture stays inside the viewport', async ({ page }, testInfo) => {
+test('1366x768 personal desktop keeps the complete cover above the timeline', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'Windows personal surface only needs desktop project')
+  await page.setViewportSize({ width: 1366, height: 768 })
+  await page.goto('/?app=personal-desktop')
+
+  await expect(page.locator('html')).toHaveAttribute('data-app-surface', 'personal-desktop')
+  const hero = page.locator('.memory-aperture')
+  const frontFrame = hero.locator('.archive-frame-front')
+  const timeline = page.locator('#archive-timeline')
+  await expect(frontFrame).toBeVisible()
+  await expect(timeline).toBeVisible()
+  const geometry = await page.evaluate(() => {
+    const hero = document.querySelector('.memory-aperture')?.getBoundingClientRect()
+    const frame = document.querySelector('.archive-frame-front')?.getBoundingClientRect()
+    const timeline = document.querySelector('#archive-timeline')?.getBoundingClientRect()
+    return hero && frame && timeline ? { heroBottom: hero.bottom, frameBottom: frame.bottom, timelineTop: timeline.top } : null
+  })
+  expect(geometry).not.toBeNull()
+  expect(geometry!.frameBottom).toBeLessThanOrEqual(geometry!.heroBottom + 1)
+  expect(geometry!.timelineTop).toBeGreaterThanOrEqual(geometry!.heroBottom - 1)
+})
+
+test('mobile archive cover stays inside the viewport', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'mobile', 'mobile hero geometry only applies to mobile')
   await page.goto('/')
 
@@ -106,53 +174,6 @@ test('mobile Memory Aperture stays inside the viewport', async ({ page }, testIn
   expect(geometry.right).toBeLessThanOrEqual(viewport.width + 1)
   expect(geometry.width).toBeLessThanOrEqual(viewport.width + 2)
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width + 1)
-})
-
-test('desktop Memory Aperture accepts pointer movement and settles on leave', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop', 'pointer interaction applies to desktop')
-  await page.goto('/')
-
-  const hero = page.locator('.memory-aperture')
-  const bounds = await hero.boundingBox()
-  expect(bounds).not.toBeNull()
-  await expect(hero).toHaveAttribute('data-interaction-mode', 'pointer')
-  await expect(hero).toHaveAttribute('data-interaction-state', 'idle')
-
-  const box = bounds!
-  for (const [x, y] of [
-    [box.x + box.width * .2, box.y + box.height * .5],
-    [box.x + box.width * .8, box.y + box.height * .5],
-    [box.x + box.width * .5, box.y + box.height * .2],
-    [box.x + box.width * .5, box.y + box.height * .8],
-  ]) {
-    await page.mouse.move(x, y, { steps: 8 })
-    await page.waitForTimeout(90)
-  }
-  await expect(hero).toHaveAttribute('data-interaction-state', 'engaged')
-  await page.mouse.move(2, 2, { steps: 8 })
-  await expect(hero).toHaveAttribute('data-interaction-state', 'settling')
-})
-
-test('mobile Memory Aperture exposes scroll inertia for slow, fast, reverse, and settle gestures', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'mobile', 'scroll inertia is a mobile interaction')
-  await page.goto('/')
-
-  const hero = page.locator('.memory-aperture')
-  await expect(hero).toHaveAttribute('data-interaction-mode', 'scroll')
-  await expect(hero).toHaveAttribute('data-scroll-active', 'false')
-
-  for (let index = 0; index < 4; index += 1) {
-    await page.evaluate(() => window.scrollBy({ top: 26, behavior: 'instant' }))
-    await page.waitForTimeout(85)
-  }
-  await expect(hero).toHaveAttribute('data-scroll-active', 'true')
-  await expect.poll(() => hero.getAttribute('data-scroll-active'), { timeout: 4_000 }).toBe('false')
-
-  await page.evaluate(() => window.scrollBy({ top: 260, behavior: 'instant' }))
-  await expect(hero).toHaveAttribute('data-scroll-active', 'true')
-  await page.evaluate(() => window.scrollBy({ top: -180, behavior: 'instant' }))
-  await expect(hero).toHaveAttribute('data-scroll-active', 'true')
-  await expect.poll(() => hero.getAttribute('data-scroll-active'), { timeout: 4_000 }).toBe('false')
 })
 
 test('mobile navigation uses archive glyphs and the atmosphere covers the viewport', async ({ page }, testInfo) => {

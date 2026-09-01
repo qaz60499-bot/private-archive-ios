@@ -1,0 +1,4 @@
+# Copy to .dev.vars for credential-free local Mock development.
+# Production should leave MOCK_TELEGRAM unset/false and inject real secrets with Wrangler.
+MOCK_TELEGRAM=true
+ALLOWED_ORIGIN=http://127.0.0.1:8787

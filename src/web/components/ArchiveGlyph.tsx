@@ -8,6 +8,10 @@ export type ArchiveGlyphName =
   | 'videos'
   | 'files'
   | 'favorites'
+  | 'recent'
+  | 'activity'
+  | 'historyArchive'
+  | 'recycle'
   | 'queue'
   | 'settings'
   | 'search'
@@ -23,6 +27,10 @@ const corePaths: Record<ArchiveGlyphName, ReactNode> = {
   videos: <><path d="M8 10.5h11v11H8z" /><path d="m19 14 5-2.3v8.6L19 18M12.4 14v4l3.6-2Z" /></>,
   files: <><path d="M10 7.5h8l4 4v13H10z" /><path d="M18 7.5v4h4M13 16h6M13 19.5h5" /></>,
   favorites: <><path d="M16 23.5S8.5 19 8.5 13.7c0-2.6 1.8-4.5 4.2-4.5 1.5 0 2.7.8 3.3 2 .6-1.2 1.8-2 3.3-2 2.4 0 4.2 1.9 4.2 4.5C23.5 19 16 23.5 16 23.5Z" /><path d="M11.5 13.4c.3-1.1 1-1.7 2-1.8" /></>,
+  recent: <><circle cx="16" cy="16" r="8" /><path d="M16 11v5l3.8 2.2M9.5 9.5 7 7M7 7v4h4" /></>,
+  activity: <><path d="M7.5 18h4l2.2-6 4.1 11 2.2-6h4.5" /><path d="M9 9.5h14" /></>,
+  historyArchive: <><rect x="8" y="11" width="16" height="12" rx="1.5" /><path d="M7 8.5h18M13 16h6" /></>,
+  recycle: <><path d="M10 11h12l-1 13H11zM8.5 11h15M13 8h6M14 14v6M18 14v6" /></>,
   queue: <><path d="M9 17.5a7 7 0 1 1 5.5 5.3" /><path d="m8 13 1 4.5 4.4-1.4M16 10v6l4 2" /><circle cx="10.5" cy="22" r="1" /></>,
   settings: <><path d="M16 8.5 19.5 10l3.2 3.5-.7 4.6-3 3.4-4.6.7-3.9-2.5-1.2-4.5 1.8-4.2Z" /><circle cx="16" cy="15.5" r="3.3" /><path d="m19.5 10-1.7 3M22 18.1l-3.5-.8M14.4 22.2l.1-3.5M10.5 19.7l2.3-2.5M11.1 11l3 2" /></>,
   search: <><circle cx="14" cy="14" r="6" /><path d="m18.5 18.5 5 5M11 14h6M14 11v6" /></>,

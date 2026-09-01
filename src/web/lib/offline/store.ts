@@ -1,5 +1,5 @@
 import { openDB, type DBSchema } from 'idb'
-import type { LocalUploadJob } from '../../types'
+import type { LocalUploadJob, StorageBackend } from '../../types'
 import { normalizeLocalUpload, originalLocalFileLastModified } from './job-model'
 
 export { normalizeLocalUpload } from './job-model'
@@ -45,9 +45,22 @@ async function persistNormalization(jobs: LocalUploadJob[]): Promise<void> {
 }
 
 const OPFS_WRITE_TIMEOUT_MS = 15_000
+const INDEXEDDB_PAYLOAD_FALLBACK_MAX_BYTES = 64 * 1024 * 1024
 const transientPayloads = new Map<string, File>()
+let activePrincipalId: string | null = null
+let adoptLegacyUploads = false
 
 type PayloadKind = 'original' | 'preview'
+
+export function setLocalUploadPrincipal(principalId: string | null, options: { adoptLegacy?: boolean } = {}): void {
+  activePrincipalId = principalId
+  adoptLegacyUploads = Boolean(principalId && options.adoptLegacy)
+}
+
+function visibleToActivePrincipal(job: LocalUploadJob): boolean {
+  if (!activePrincipalId) return false
+  return job.principalId === activePrincipalId || (!job.principalId && adoptLegacyUploads)
+}
 
 function payloadKey(id: string, kind: PayloadKind): string {
   return `${id}:${kind}`
@@ -134,21 +147,28 @@ export async function enqueueLocalUpload(options: {
   file: File
   batchId: string
   mediaType: LocalUploadJob['mediaType']
+  storageBackend?: StorageBackend
   persistPayload?: boolean
 }): Promise<LocalUploadJob> {
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
   const persistPayload = options.persistPayload !== false
+  if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
   const opfsPath = persistPayload ? await writeToOpfs(id, options.file) : undefined
+  if (persistPayload && !opfsPath && options.file.size > INDEXEDDB_PAYLOAD_FALLBACK_MAX_BYTES) {
+    throw new Error('当前浏览器缺少适合大文件的持久化存储能力。请使用支持 OPFS 的桌面客户端上传该文件。')
+  }
   if (!persistPayload) transientPayloads.set(id, options.file)
   const job: LocalUploadJob = {
     id,
     schemaVersion: 2,
     batchId: options.batchId,
+    principalId: activePrincipalId,
     fileName: options.file.name,
     mimeType: options.file.type || 'application/octet-stream',
     sizeBytes: options.file.size,
     mediaType: options.mediaType,
+    storageBackend: options.storageBackend ?? 'telegram_user_group',
     status: navigator.onLine ? 'waiting' : 'paused',
     prepareStatus: 'pending',
     controlState: 'active',
@@ -164,6 +184,8 @@ export async function enqueueLocalUpload(options: {
       mimeType: options.file.type || 'application/octet-stream',
       sizeBytes: options.file.size,
       mediaType: options.mediaType,
+      storageBackend: options.storageBackend ?? 'telegram_user_group',
+      importOrigin: 'web',
       fileCreatedAt: options.file.lastModified ? new Date(options.file.lastModified).toISOString() : undefined,
     },
   }
@@ -182,18 +204,33 @@ export async function enqueueLocalUpload(options: {
 }
 
 export async function listLocalUploads(): Promise<LocalUploadJob[]> {
+  if (!activePrincipalId) return []
   const raw = await (await dbPromise).getAllFromIndex('uploads', 'by-updated')
   const jobs = raw.map((job) => normalizeLocalUpload(job))
-  if (jobs.some((job, index) => job.schemaVersion !== raw[index].schemaVersion || job.status !== raw[index].status)) await persistNormalization(jobs)
-  return jobs.reverse()
+  const visible = jobs.filter(visibleToActivePrincipal).map((job) => job.principalId ? job : { ...job, principalId: activePrincipalId as string })
+  if (visible.some((job) => {
+    const original = raw.find((item) => item.id === job.id)
+    return !original || job.schemaVersion !== original.schemaVersion || job.status !== original.status || job.principalId !== original.principalId
+  })) await persistNormalization(visible)
+  return visible.reverse()
 }
 
 export async function getLocalUpload(id: string): Promise<LocalUploadJob | undefined> {
+  if (!activePrincipalId) return undefined
   const job = await (await dbPromise).get('uploads', id)
-  return job ? normalizeLocalUpload(job) : undefined
+  if (!job) return undefined
+  const normalized = normalizeLocalUpload(job)
+  if (!visibleToActivePrincipal(normalized)) return undefined
+  if (!normalized.principalId && adoptLegacyUploads) {
+    const adopted = { ...normalized, principalId: activePrincipalId }
+    await (await dbPromise).put('uploads', adopted)
+    return adopted
+  }
+  return normalized
 }
 
 export async function getLocalUploadFile(job: LocalUploadJob): Promise<File | null> {
+  if (!visibleToActivePrincipal(job)) return null
   const transientFile = transientPayloads.get(job.id)
   if (transientFile) return transientFile
   const opfsFile = job.opfsPath ? await readFromOpfs(job.opfsPath) : null
@@ -218,25 +255,30 @@ export async function storeLocalUploadPreview(id: string, preview?: Blob): Promi
 }
 
 export async function getLocalUploadPreview(job: LocalUploadJob): Promise<Blob | null> {
+  if (!visibleToActivePrincipal(job)) return null
   const persisted = await readPayload(job.id, 'preview')
   if (persisted) return new Blob([persisted.bytes], { type: persisted.mimeType })
   return job.previewBlob ?? null
 }
 
 export async function updateLocalUpload(id: string, patch: Partial<LocalUploadJob>): Promise<LocalUploadJob | undefined> {
+  if (!activePrincipalId) return undefined
   const database = await dbPromise
   const current = await database.get('uploads', id)
   if (!current) return undefined
-  const next = normalizeLocalUpload({ ...current, ...patch, id, updatedAt: new Date().toISOString() })
+  const normalizedCurrent = normalizeLocalUpload(current)
+  if (!visibleToActivePrincipal(normalizedCurrent)) return undefined
+  const next = normalizeLocalUpload({ ...current, ...patch, id, principalId: normalizedCurrent.principalId ?? activePrincipalId, updatedAt: new Date().toISOString() })
   await database.put('uploads', next)
   return next
 }
 
 export async function releaseLocalUploadPayload(id: string): Promise<void> {
-  transientPayloads.delete(id)
+  if (!activePrincipalId) return
   const database = await dbPromise
   const job = await database.get('uploads', id)
-  if (!job) return
+  if (!job || !visibleToActivePrincipal(normalizeLocalUpload(job))) return
+  transientPayloads.delete(id)
   await Promise.all([removeFromOpfs(job.opfsPath), removePayloads(id)])
   await database.put('uploads', {
     ...job,
@@ -250,14 +292,17 @@ export async function releaseLocalUploadPayload(id: string): Promise<void> {
 }
 
 export async function getLocalUploadsByBatch(batchId: string): Promise<LocalUploadJob[]> {
+  if (!activePrincipalId) return []
   const jobs = await (await dbPromise).getAllFromIndex('uploads', 'by-batch', batchId)
-  return jobs.map((job) => normalizeLocalUpload(job))
+  return jobs.map((job) => normalizeLocalUpload(job)).filter(visibleToActivePrincipal)
 }
 
 export async function removeLocalUpload(id: string): Promise<void> {
-  transientPayloads.delete(id)
+  if (!activePrincipalId) return
   const database = await dbPromise
   const job = await database.get('uploads', id)
+  if (!job || !visibleToActivePrincipal(normalizeLocalUpload(job))) return
+  transientPayloads.delete(id)
   await Promise.all([removeFromOpfs(job?.opfsPath), removePayloads(id)])
   await database.delete('uploads', id)
 }

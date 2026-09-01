@@ -9,7 +9,7 @@ test('concurrent reserve for the same content does not rotate the active upload 
   const contentHash = createHash('sha256').update(file).digest('hex')
   const metadata = {
     originalName: `reserve-race-${suffix}.pdf`, mimeType: 'application/pdf', sizeBytes: file.byteLength,
-    mediaType: 'file', contentHash,
+    mediaType: 'file', contentHash, storageBackend: 'telegram_bot',
   }
 
   const responses = await Promise.all([
@@ -57,9 +57,11 @@ test('concurrent reserve for the same content does not rotate the active upload 
   expect(idempotentContent.status()).toBe(200)
   await expect(idempotentContent.json()).resolves.toMatchObject({ alreadyStored: true })
 
-  const duplicate = await request.post('/api/assets/reserve', { data: metadata })
-  expect(duplicate.status()).toBe(200)
-  await expect(duplicate.json()).resolves.toMatchObject({ assetId: reservation.assetId, duplicate: true })
+  const duplicate = await request.post('/api/assets/reserve', { data: { ...metadata, originalName: `logical-copy-${suffix}.pdf` } })
+  expect(duplicate.status()).toBe(201)
+  const duplicateBody = await duplicate.json() as { assetId: string; duplicate: boolean; duplicateOfAssetId: string; reusedStorage: boolean }
+  expect(duplicateBody.assetId).not.toBe(reservation.assetId)
+  expect(duplicateBody).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
 })
 
 test('web upload and Telegram webhook converge into archive records', async ({ request }, testInfo) => {
@@ -81,6 +83,7 @@ test('web upload and Telegram webhook converge into archive records', async ({ r
       height: 1,
       takenAt: '2026-08-12T01:02:03.000Z',
       contentHash,
+      storageBackend: 'telegram_bot',
     },
   })
   expect(reserve.status()).toBe(201)
@@ -94,7 +97,8 @@ test('web upload and Telegram webhook converge into archive records', async ({ r
       'X-Upload-Token': reservation.uploadToken,
     },
   })
-  expect(preview.status()).toBe(201)
+  expect(preview.status()).toBe(200)
+  await expect(preview.json()).resolves.toMatchObject({ ok: true, skipped: true })
 
   const content = await request.put(`/api/assets/${reservation.assetId}/content`, {
     data: png,
@@ -124,10 +128,13 @@ test('web upload and Telegram webhook converge into archive records', async ({ r
       sizeBytes: png.byteLength,
       mediaType: 'photo',
       contentHash,
+      storageBackend: 'telegram_bot',
     },
   })
-  expect(duplicateReserve.status()).toBe(200)
-  await expect(duplicateReserve.json()).resolves.toMatchObject({ assetId: reservation.assetId, duplicate: true })
+  expect(duplicateReserve.status()).toBe(201)
+  const duplicateAsset = await duplicateReserve.json() as { assetId: string; duplicate: boolean; duplicateOfAssetId: string; reusedStorage: boolean }
+  expect(duplicateAsset.assetId).not.toBe(reservation.assetId)
+  expect(duplicateAsset).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
 
   const messageId = 100_000 + Math.floor(Math.random() * 800_000)
   const updateId = Date.now() + Math.floor(Math.random() * 1000)

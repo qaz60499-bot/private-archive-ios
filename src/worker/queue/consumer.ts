@@ -1,13 +1,12 @@
 import { getAsset } from '../db/assets-repository'
-import { getTelegramRuntimeConfig } from '../db/settings-repository'
+import { resolveTelegramSourceConfig } from '../db/telegram-sources-repository'
 import { markAnalysisFailed, markAnalysisLimited, markAnalyzing, saveAnalysis } from '../db/analysis-repository'
 import type { AnalysisMessage, Env } from '../env'
 import { analyzeAsset } from '../services/analysis/analyzer'
-import { createStorageAdapter } from '../services/storage/factory'
+import { isMockMode } from '../env'
+import { createStorageAdapterFromConfig } from '../services/storage/factory'
 
 export async function consumeAnalysisQueue(batch: MessageBatch<AnalysisMessage>, env: Env): Promise<void> {
-  const telegram = await getTelegramRuntimeConfig(env.DB, env)
-  const storage = createStorageAdapter(env, telegram.storageChatId)
   for (const message of batch.messages) {
     try {
       const asset = await getAsset(env.DB, message.body.assetId)
@@ -15,6 +14,10 @@ export async function consumeAnalysisQueue(batch: MessageBatch<AnalysisMessage>,
         message.ack()
         continue
       }
+      const source = isMockMode(env)
+        ? { token: 'mock', storageChatId: '-1000000000000' }
+        : await resolveTelegramSourceConfig(env.DB, env, asset.source_id)
+      const storage = createStorageAdapterFromConfig(env, source)
       await markAnalyzing(env.DB, asset.id)
       const result = await analyzeAsset(env, storage, asset)
       if (!result) await markAnalysisLimited(env.DB, asset.id)

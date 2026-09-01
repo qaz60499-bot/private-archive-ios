@@ -2,11 +2,18 @@ import { expect, test, type Page } from '@playwright/test'
 
 const tinyPdf = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF')
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+const exifIphoneJpeg = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/4QEgRXhpZgAATU0AKgAAAAgABQEPAAIAAAAGAAAASgEQAAIAAAAOAAAAUIglAAQAAAABAAAAXpADAAIAAAAUAAAA8JAEAAIAAAAUAAABBAAAAABBcHBsZQBpUGhvbmUgMTUgUHJvAAAGAAEAAgAAAAJOAAAAAAIABQAAAAMAAACsAAMAAgAAAAJXAAAAAAQABQAAAAMAAADEAAYABQAAAAEAAADcAB0AAgAAAAsAAADkAAAAAAAAACUAAAABAAAALgAAAAEAAAAeAAAAAQAAAHoAAAABAAAAGQAAAAEAAAAKAAAAAQAAAA8AAAABMjAyNDowNTowNgAAMjAyNDowNTowNiAwNzowODowOQAyMDI0OjA1OjA2IDA3OjA4OjA5AP/bAEMACAYGBwYFCAcHBwkJCAoMFA0MCwsMGRITDxQdGh8eHRocHCAkLicgIiwjHBwoNyksMDE0NDQfJzk9ODI8LjM0Mv/bAEMBCQkJDAsMGA0NGDIhHCEyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMv/AABEIAAIAAgMBIgACEQEDEQH/xAAfAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgv/xAC1EAACAQMDAgQDBQUEBAAAAX0BAgMABBEFEiExQQYTUWEHInEUMoGRoQgjQrHBFVLR8CQzYnKCCQoWFxgZGiUmJygpKjQ1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4eLj5OXm5+jp6vHy8/T19vf4+fr/xAAfAQADAQEBAQEBAQEBAAAAAAAAAQIDBAUGBwgJCgv/xAC1EQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGhscEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/AOLooor5k/cT/9k=', 'base64')
 
 async function openUpload(page: Page): Promise<void> {
   await page.goto('/')
   const width = page.viewportSize()?.width ?? 1280
   await (width < 768 ? page.getByRole('button', { name: '上传媒体' }) : page.getByRole('button', { name: '加入档案' })).click()
+  // Local Playwright runs on :8799 and intentionally has no Windows Telegram
+  // Storage Bridge. Keep processor P0s deterministic by explicitly choosing the
+  // Bot backend whenever the real user-group picker is therefore unavailable.
+  const sheet = page.getByRole('dialog', { name: '加入私人档案' })
+  const filePicker = sheet.getByRole('button', { name: '选择照片、视频或文件' })
+  if (await filePicker.isDisabled()) await sheet.getByRole('radio', { name: /Telegram Bot/ }).check()
 }
 
 async function chooseFiles(page: Page, names: string[]): Promise<void> {
@@ -138,14 +145,55 @@ test('100-item batch is scheduled to completion without fake byte progress', asy
   expect(await page.locator('.upload-sheet').evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true)
 })
 
-test('iPhone upload sheet uses direct native photo import and preserves metadata processing', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'mobile', 'iPhone-only native photo import')
+test('iPhone upload sheet exposes complete native sources and metadata-aware photo import', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'iPhone-only native upload sources')
   await openUpload(page)
-  await expect(page.getByText('从手机相册选择照片')).toBeVisible()
-  await expect(page.getByText(/读取 EXIF 拍摄时间/)).toBeVisible()
+  await expect(page.getByText('照片 / iCloud Photos')).toBeVisible()
+  await expect(page.getByText('文件 / iCloud Drive')).toBeVisible()
+  await expect(page.getByText('直接拍摄')).toBeVisible()
+  await expect(page.getByText(/EXIF 拍摄时间和 GPS/)).toBeVisible()
   const photoInput = page.locator('#archive-upload-input')
   await expect(photoInput).toHaveAttribute('accept', 'image/*')
   await expect(photoInput).toHaveAttribute('multiple', '')
+  await expect(page.getByLabel('从文件或 iCloud Drive 选择')).toHaveAttribute('multiple', '')
+  await expect(page.getByLabel('拍照上传')).toHaveAttribute('capture', 'environment')
+  await expect(page.getByLabel('录像上传')).toHaveAttribute('capture', 'environment')
+})
+
+test('iPhone photo import sends EXIF capture time, GPS and camera metadata to reserve', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'mobile metadata extraction contract')
+  let captured: Record<string, unknown> | null = null
+  await page.route('**/api/assets/reserve', async (route) => {
+    captured = route.request().postDataJSON() as Record<string, unknown>
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ assetId: 'exif-duplicate', duplicate: true, sizeTier: 'inline' }) })
+  })
+
+  await openUpload(page)
+  const chooserPromise = page.waitForEvent('filechooser')
+  await page.getByRole('button', { name: '选择照片、视频或文件' }).click()
+  const chooser = await chooserPromise
+  await chooser.setFiles([{ name: 'iphone-photo.jpg', mimeType: 'image/jpeg', buffer: exifIphoneJpeg }])
+
+  await expect.poll(async () => (await localJobs(page))[0]?.status, { timeout: 20_000 }).toBe('done')
+  expect(captured).not.toBeNull()
+  const reservation = captured as unknown as Record<string, unknown>
+  expect(Number.isNaN(Date.parse(String(reservation.takenAt ?? '')))).toBe(false)
+  expect(Number(reservation.latitude)).toBeCloseTo(37.775, 4)
+  expect(Number(reservation.longitude)).toBeCloseTo(-122.419444, 4)
+  expect(reservation.metadata).toMatchObject({ cameraMake: 'Apple', cameraModel: 'iPhone 15 Pro', gpsAltitude: 15 })
+})
+
+test('desktop upload sheet accepts arbitrary files and folders including iCloud Photos', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'desktop-only folder import')
+  await openUpload(page)
+  await expect(page.getByText('文件夹 / iCloud Photos')).toBeVisible()
+  await expect(page.getByRole('button', { name: '选择文件夹' })).toBeVisible()
+  const mainInput = page.locator('#archive-upload-input')
+  await expect(mainInput).not.toHaveAttribute('accept')
+  const folderInput = page.locator('.icloud-folder-input')
+  await expect(folderInput).toHaveAttribute('multiple', '')
+  await expect(folderInput).toHaveAttribute('webkitdirectory', '')
+  await expect(folderInput).not.toHaveAttribute('accept')
 })
 
 test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storage', async ({ page }, testInfo) => {
@@ -169,7 +217,7 @@ test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storag
     await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ ok: true }) })
   })
   await page.route('**/api/assets/ios-photo/content', async (route) => {
-    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null }) })
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null, previewAvailable: true }) })
   })
 
   await openUpload(page)
@@ -179,7 +227,7 @@ test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storag
   await chooser.setFiles([{ name: 'ios-picker-photo.png', mimeType: 'image/png', buffer: onePixelPng }])
 
   await expect.poll(async () => (await localJobs(page))[0]?.status, { timeout: 20_000 }).toBe('done')
-  expect(previewCalls).toBe(1)
+  expect(previewCalls).toBe(0)
   const completed = (await localJobs(page))[0]
   expect(completed.fileBlob).toBeUndefined()
   expect(completed.previewBlob).toBeUndefined()
@@ -187,6 +235,7 @@ test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storag
 })
 
 test('240-item mobile import advances through bounded windows and completes one batch', async ({ page }, testInfo) => {
+  test.setTimeout(120_000)
   test.skip(testInfo.project.name !== 'mobile', 'mobile large-import window contract')
   let reserveCalls = 0
   await page.route('**/api/assets/reserve', async (route) => {
@@ -199,7 +248,7 @@ test('240-item mobile import advances through bounded windows and completes one 
   await chooseFiles(page, Array.from({ length: 240 }, (_, index) => `mobile-240-${index}.pdf`))
 
   await expect(page.getByRole('dialog', { name: '加入私人档案' })).toBeHidden()
-  await expect(page.getByRole('heading', { name: '时间留下的形状' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /时间留下的\s*形状/ })).toBeVisible()
   await expect.poll(async () => (await localJobs(page)).length, { timeout: 90_000 }).toBe(240)
   await expect.poll(async () => (await localJobs(page)).filter((job) => job.status === 'done').length, { timeout: 90_000 }).toBe(240)
   expect(reserveCalls).toBe(240)

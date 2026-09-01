@@ -13,11 +13,12 @@ export default {
     }
 
 
-    if (request.method !== 'POST' || url.pathname !== WEBHOOK_PATH) {
+    const webhookPath = url.pathname === WEBHOOK_PATH || url.pathname.startsWith(`${WEBHOOK_PATH}/`)
+    if (request.method !== 'POST' || !webhookPath) {
       return Response.json({ error: 'NOT_FOUND' }, { status: 404 })
     }
 
-    const forwarded = new Request(`https://private-archive.internal${WEBHOOK_PATH}`, {
+    const forwarded = new Request(`https://private-archive.internal${url.pathname}`, {
       method: 'POST',
       headers: request.headers,
       body: request.body,

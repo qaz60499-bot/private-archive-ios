@@ -1,6 +1,7 @@
 import { ApiError, api } from '../api'
 import { sha256File } from '../file-hash'
 import { prepareMedia } from '../preview/media-metadata'
+import { telegramUserGroupBridge } from '../telegram-user-group'
 import {
   getLocalUpload, getLocalUploadFile, getLocalUploadPreview, listLocalUploads, releaseLocalUploadPayload, storeLocalUploadPreview, updateLocalUpload,
 } from './store'
@@ -52,7 +53,7 @@ async function prepareLocalUpload(job: LocalUploadJob): Promise<void> {
     const previewStored = await storeLocalUploadPreview(job.id, prepared.preview)
     await updateLocalUpload(job.id, {
       prepareStatus: 'ready', stage: 'reserving', progress: 15, previewBlob: undefined, previewStored: previewStored || undefined,
-      contentHash, metadata: { ...prepared.metadata, contentHash }, error: undefined,
+      contentHash, metadata: { ...prepared.metadata, contentHash, storageBackend: job.storageBackend, importOrigin: 'web' }, error: undefined,
     })
   } catch (error) {
     if (!controller.signal.aborted) await updateLocalUpload(job.id, { prepareStatus: 'failed', status: 'failed', error: friendlyUploadError(error) })
@@ -108,7 +109,8 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
       const reservation = await api.reserve(job.metadata, controller.signal)
       if (reservation.duplicate) {
         await updateLocalUpload(id, {
-          status: 'done', stage: 'completed', progress: 100, deduplicated: true, duplicateOfAssetId: reservation.assetId,
+          status: 'done', stage: 'completed', progress: 100, deduplicated: true,
+          duplicateOfAssetId: reservation.duplicateOfAssetId ?? reservation.assetId,
           remoteAssetId: reservation.assetId, uploadToken: undefined, error: undefined,
         })
         await releaseLocalUploadPayload(id)
@@ -137,15 +139,41 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
       return true
     }
 
-    const preview = !job.previewUploaded ? await getLocalUploadPreview(job) : null
-    if (preview) {
-      await updateLocalUpload(id, { stage: 'preview', progress: 34 })
-      if (!await withFreshToken(() => api.uploadPreview(assetId as string, uploadToken as string, preview, controller.signal))) return true
-      await updateLocalUpload(id, { previewUploaded: true, progress: 46 })
+    await updateLocalUpload(id, { stage: 'original', progress: 48 })
+    if (job.storageBackend === 'telegram_user_group') {
+      if (!contentHash) throw new Error('上传前未生成内容指纹。')
+      const receiptAssetId = assetId as string
+      const receipt = await telegramUserGroupBridge.upload(receiptAssetId, uploadToken as string, file, contentHash, controller.signal)
+      await updateLocalUpload(id, { progress: 82 })
+      try {
+        await api.commitUserGroupUpload(receiptAssetId, uploadToken as string, receipt)
+      } catch (error) {
+        if (!(error instanceof ApiError && error.code === 'UPLOAD_TOKEN_INVALID_OR_EXPIRED')) throw error
+        if (await reserve(true) === 'duplicate') return true
+        if (assetId !== receiptAssetId) throw new Error('Telegram 已上传，但远端预约发生变化；已停止自动重试以避免错绑文件。', { cause: error })
+        await api.commitUserGroupUpload(receiptAssetId, uploadToken as string, receipt)
+      }
+      await updateLocalUpload(id, { progress: 92, previewUploaded: ['photo', 'video'].includes(job.mediaType) || undefined })
+    } else {
+      // Legacy/optional Bot storage keeps the existing Worker streaming path. It is
+      // never used as an automatic fallback from User Group storage.
+      let contentResult: Awaited<ReturnType<typeof api.uploadContent>> | undefined
+      if (!await withFreshToken(async () => {
+        contentResult = await api.uploadContent(assetId as string, uploadToken as string, file, controller.signal)
+      })) return true
+
+      if (contentResult?.previewAvailable) {
+        await updateLocalUpload(id, { previewUploaded: true, progress: 82 })
+      } else if (job.mediaType !== 'photo') {
+        const preview = !job.previewUploaded ? await getLocalUploadPreview(job) : null
+        if (preview) {
+          await updateLocalUpload(id, { stage: 'preview', progress: 78 })
+          if (!await withFreshToken(() => api.uploadPreview(assetId as string, uploadToken as string, preview, controller.signal))) return true
+          await updateLocalUpload(id, { previewUploaded: true, progress: 88 })
+        }
+      }
     }
 
-    await updateLocalUpload(id, { stage: 'original', progress: 55 })
-    if (!await withFreshToken(() => api.uploadContent(assetId as string, uploadToken as string, file, controller.signal))) return true
     await updateLocalUpload(id, { status: 'done', stage: 'completed', progress: 100, error: undefined, uploadToken: undefined, nextAttemptAt: undefined })
     await releaseLocalUploadPayload(id)
     return true

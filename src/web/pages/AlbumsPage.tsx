@@ -1,9 +1,15 @@
 import { useEffect, useState } from 'react'
-import { Album as AlbumIcon, LoaderCircle, Plus, Trash2 } from 'lucide-react'
+import { Album as AlbumIcon, ImageOff, LoaderCircle, Plus, Trash2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../lib/api'
+import { AssetPreviewById } from '../components/AssetPreviewById'
 import type { Album } from '../types'
 import { EmptyState, PageIntro } from '../components/States'
+
+function AlbumCover({ album }: { album: Album }) {
+  if (!album.cover_asset_id) return <div className="album-cover-fallback"><AlbumIcon /><span>等待第一张封面</span></div>
+  return <AssetPreviewById assetId={album.cover_asset_id} fallback={<div className="album-cover-fallback"><ImageOff /><span>封面暂不可用</span></div>} />
+}
 
 export function AlbumsPage() {
   const [albums, setAlbums] = useState<Album[]>([])
@@ -49,7 +55,7 @@ export function AlbumsPage() {
 
   return (
     <div className="page">
-      <PageIntro eyebrow="Albums · 05" title="把关系留给自己定义" description="相册只是 D1 中的一层关系；Telegram 里仍只有一份原文件。" />
+      <PageIntro eyebrow="COLLECTIONS · ALBUMS" title="相册" description="把属于同一段旅程、人物或主题的内容放在一起；原件不会因为加入相册而被复制。" />
       <form className="album-create" onSubmit={(event) => { event.preventDefault(); void create() }}>
         <label htmlFor="album-name">新相册名称</label>
         <input id="album-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={80} placeholder="例如：东京旅行" />
@@ -63,7 +69,11 @@ export function AlbumsPage() {
           {albums.map((album) => (
             <article className="album-card" key={album.id}>
               <Link className="album-card-link" to={`/albums/${album.id}`} aria-label={`打开相册 ${album.name}`}>
-                <div className="album-card-cover">{album.cover_asset_id ? <img src={`/api/assets/${album.cover_asset_id}/preview`} alt="" loading="lazy" decoding="async" /> : <AlbumIcon />}</div>
+                <div className="album-card-stack" aria-hidden="true">
+                  <span className="album-card-sheet album-card-sheet-back" />
+                  <span className="album-card-sheet album-card-sheet-mid" />
+                  <div className="album-card-cover"><AlbumCover album={album} /></div>
+                </div>
                 <p>PRIVATE COLLECTION</p>
                 <h2>{album.name}</h2>
                 <span>{album.asset_count} 项{album.latest_taken_at ? ` · ${new Date(album.latest_taken_at).getFullYear()}` : ''}</span>

@@ -45,6 +45,15 @@ function normalizeFile(message: TelegramMessage): Omit<NormalizedTelegramAsset, 
   }
 }
 
+export function parseTelegramSourceUpdate(update: TelegramUpdate, storageChatId: string): ParsedUpdate {
+  const message = update.channel_post ?? update.message
+  if (!message) return { kind: 'ignored', reason: 'NO_SUPPORTED_MESSAGE' }
+  if (String(message.chat.id) !== storageChatId) return { kind: 'forbidden', reason: 'SOURCE_CHAT_NOT_ALLOWED' }
+  const normalized = normalizeFile(message)
+  if (!normalized) return { kind: 'ignored', reason: 'UNSUPPORTED_MEDIA' }
+  return { kind: 'asset', asset: { ...normalized, message }, needsCopy: false }
+}
+
 export function parseTelegramUpdate(update: TelegramUpdate, ownerUserId: string, storageChatId: string): ParsedUpdate {
   const isChannelPost = Boolean(update.channel_post)
   const message = update.channel_post ?? update.message

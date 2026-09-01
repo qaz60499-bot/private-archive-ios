@@ -15,6 +15,7 @@ export function normalizeLocalUpload(job: Partial<LocalUploadJob> & Pick<LocalUp
     ...job,
     schemaVersion: 2,
     batchId: job.batchId ?? `legacy-${job.id}`,
+    storageBackend: job.storageBackend ?? (job.metadata.storageBackend === 'telegram_user_group' ? 'telegram_user_group' : 'telegram_bot'),
     status: recoveredStatus,
     prepareStatus,
     controlState,

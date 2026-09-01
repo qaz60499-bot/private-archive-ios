@@ -3,6 +3,7 @@ import { Building2, Camera, Film, Leaf, PartyPopper, Plus, Shapes, Soup, UsersRo
 import type { LucideIcon } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { PageIntro } from '../components/States'
+import { AssetPreviewById } from '../components/AssetPreviewById'
 import { api } from '../lib/api'
 import type { DiscoverModule } from '../types'
 
@@ -74,7 +75,7 @@ export function DiscoverPage() {
             : `/?category=${encodeURIComponent(module.slug)}&label=${encodeURIComponent(module.name)}`
           return (
             <button key={module.slug} className="category-card" type="button" onClick={() => navigate(target)}>
-              {module.coverAssetId ? <img src={`/api/assets/${module.coverAssetId}/preview`} alt="" loading="lazy" decoding="async" /> : null}
+              {module.coverAssetId ? <AssetPreviewById assetId={module.coverAssetId} /> : null}
               <span className="category-wash" />
               <div>
                 <Icon />

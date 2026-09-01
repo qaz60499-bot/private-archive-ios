@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
-import { CheckCircle2, FileUp, LoaderCircle, Pause, Play, RotateCcw, Trash2, Video, WifiOff, X, XCircle } from 'lucide-react'
+import { Camera, CheckCircle2, CloudDownload, FileUp, FolderOpen, LoaderCircle, Pause, Play, RotateCcw, Trash2, Video, WifiOff, X, XCircle } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
-import { importFiles, type ImportFilesProgress } from '../../lib/import-files'
+import { api } from '../../lib/api'
+import { telegramUserGroupBridge } from '../../lib/telegram-user-group'
 import { summarizeUploadBatches, type UploadBatchSummary } from '../../lib/offline/batch'
 import { listLocalUploads, removeLocalUpload } from '../../lib/offline/store'
 import {
   cancelLocalUpload, cancelUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload, resumeUploadBatch,
   retryFailedUploadBatch, subscribeUploadScheduler,
 } from '../../lib/offline/processor'
-import type { LocalUploadJob } from '../../types'
+import type { LocalUploadJob, StorageBackend } from '../../types'
 
 const stageLabels: Record<LocalUploadJob['stage'], string> = {
   registered: '等待准备', preparing: '读取元数据与指纹', reserving: '核对精确重复', preview: '保存预览', original: '保存 Telegram 原件', completed: '已完成',
@@ -74,13 +75,27 @@ export function UploadQueue({ compact = false, suspended = false }: { compact?: 
 }
 
 export function UploadSheet() {
-  const { uploadOpen, setUploadOpen, online } = useArchive()
+  const { uploadOpen, setUploadOpen, online, importStatus, runImport } = useArchive()
   const [activeImports, setActiveImports] = useState(0)
   const [error, setError] = useState<string | null>(null)
-  const [importProgress, setImportProgress] = useState<ImportFilesProgress | null>(null)
+  const [storageBackend, setStorageBackend] = useState<StorageBackend>(() => telegramUserGroupBridge.available ? 'telegram_user_group' : 'telegram_bot')
   const inputRef = useRef<HTMLInputElement>(null)
+  const folderRef = useRef<HTMLInputElement>(null)
+  const mobileFileRef = useRef<HTMLInputElement>(null)
+  const cameraPhotoRef = useRef<HTMLInputElement>(null)
+  const cameraVideoRef = useRef<HTMLInputElement>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
   const mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
+  useEffect(() => {
+    if (!uploadOpen) return
+    let active = true
+    void api.storagePreference().then((result) => {
+      if (!active) return
+      const preferred = result.defaultStorageBackend
+      setStorageBackend(preferred === 'telegram_user_group' && !telegramUserGroupBridge.available ? 'telegram_bot' : preferred)
+    }).catch(() => undefined)
+    return () => { active = false }
+  }, [uploadOpen])
   useEffect(() => {
     if (!uploadOpen) return
     const previous = document.activeElement as HTMLElement | null
@@ -101,6 +116,12 @@ export function UploadSheet() {
     return () => { window.removeEventListener('keydown', onKey); previous?.focus() }
   }, [uploadOpen, setUploadOpen])
   useEffect(() => {
+    if (folderRef.current) {
+      folderRef.current.setAttribute('webkitdirectory', '')
+      folderRef.current.setAttribute('directory', '')
+    }
+  }, [uploadOpen])
+  useEffect(() => {
     if (!uploadOpen) return
     document.body.classList.add('upload-open')
     return () => document.body.classList.remove('upload-open')
@@ -110,36 +131,54 @@ export function UploadSheet() {
     if (!selected.length) return
     setActiveImports((count) => count + 1)
     setError(null)
-    setImportProgress(null)
     try {
-      const result = await importFiles(selected, online, { onProgress: setImportProgress })
-      if (result.errors.length) setError(result.errors.join('；'))
+      // Delegate to the app-level importer so feedback stays visible even after the
+      // sheet (or the whole picker flow on mobile) closes — the global toast reads the
+      // same importStatus. The durable enqueue loop is unchanged.
+      const result = await runImport(selected, { mobile, storageBackend })
+      if (result?.errors.length) setError(result.errors.join('；'))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '无法加入上传队列')
     } finally {
       setActiveImports((count) => Math.max(0, count - 1))
     }
   }
-  const busy = activeImports > 0
+  const busy = activeImports > 0 || Boolean(importStatus?.active)
   if (!uploadOpen) return null
   return <div className="sheet-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setUploadOpen(false)}>
     <section className="upload-sheet" role="dialog" aria-modal="true" aria-labelledby="upload-title">
       <header><div><p className="eyebrow">New accession</p><h2 id="upload-title">加入私人档案</h2></div><button ref={closeRef} className="icon-button" type="button" onClick={() => setUploadOpen(false)} aria-label="关闭"><X /></button></header>
+      <div className="storage-backend-picker" role="radiogroup" aria-label="上传存储后端">
+        <span>存储到</span>
+        <label className={storageBackend === 'telegram_user_group' ? 'active' : ''}><input type="radio" name="upload-storage-backend" value="telegram_user_group" checked={storageBackend === 'telegram_user_group'} onChange={() => setStorageBackend('telegram_user_group')} /><strong>Telegram 私人群组</strong><small>默认 · 使用你的用户账号上传到 ai 群</small></label>
+        <label className={storageBackend === 'telegram_bot' ? 'active' : ''}><input type="radio" name="upload-storage-backend" value="telegram_bot" checked={storageBackend === 'telegram_bot'} onChange={() => setStorageBackend('telegram_bot')} /><strong>Telegram Bot</strong><small>兼容 / 备用 · 新文件仅建议 ≤20 MB</small></label>
+      </div>
+      {storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available ? <p className="offline-notice"><WifiOff />私人群组上传需要 Windows 客户端里的 Telegram Storage Bridge。手机端请直接把文件分享到 Telegram 的 <b>ai</b> 私人群组，Windows 客户端会自动补扫导入；也可以手动切换到 Bot 存储小文件。</p> : null}
       {mobile ? <div className="mobile-native-import">
         <div className={`drop-zone mobile-photo-picker${busy ? ' is-importing' : ''}`}>
-          {busy ? <LoaderCircle className="spin" /> : <FileUp />}<strong>{busy ? '后台正在加入，可继续选择更多照片' : '从手机相册选择照片'}</strong><span>直接导入原图；网页会读取 EXIF 拍摄时间、地点和文件时间。照片选完返回网页后会自动回到图库并继续后台上传。</span>
-          <input id="archive-upload-input" ref={inputRef} className="mobile-native-file-control" type="file" multiple accept="image/*" aria-label="选择照片、视频或文件" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} />
+          {busy ? <LoaderCircle className="spin" /> : <FileUp />}<strong>{busy ? '后台正在加入，可继续选择更多照片' : '照片 / iCloud Photos'}</strong><span>从系统照片库多选。原图里存在的拍摄时间、GPS、尺寸和相机信息会在上传准备阶段读取并保留。</span>
+          <input id="archive-upload-input" ref={inputRef} className="mobile-native-file-control" type="file" multiple accept="image/*" disabled={storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} aria-label="选择照片、视频或文件" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} />
         </div>
-        <div className="mobile-video-row"><Video /><span>视频单独选择，避免系统相册把大量照片和视频一起准备而卡住。</span><input id="archive-video-upload-input" className="mobile-native-video-control" type="file" multiple accept="video/*" aria-label="选择视频" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} /></div>
-      </div> : <div className={`drop-zone${busy ? ' is-importing' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void addFiles(event.dataTransfer.files) }}>
-        {busy ? <LoaderCircle className="spin" /> : <FileUp />}<strong>{busy ? '后台正在加入，可继续选择更多文件' : '选择照片、视频或文件'}</strong><span>文件会进入后台上传队列，支持连续多批选择。</span>
-        <input id="archive-upload-input" ref={inputRef} className="drop-zone-input" type="file" multiple accept="image/*,video/*,.pdf,.txt,.zip" aria-label="选择照片、视频或文件" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (selected.length) void addFiles(selected) }} />
+        <div className="mobile-source-row"><Video /><span><strong>视频</strong><small>从“照片”或系统视频来源多选，读取尺寸、时长与可用文件时间。</small></span><input id="archive-video-upload-input" className="mobile-native-video-control" type="file" multiple accept="video/*" disabled={storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} aria-label="选择视频" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} /></div>
+        <div className="mobile-source-row"><FolderOpen /><span><strong>文件 / iCloud Drive</strong><small>打开 iOS“文件”选择器，可从 iCloud Drive、本机以及已接入 Files 的云盘选择任意文件类型。</small></span><input ref={mobileFileRef} className="mobile-native-file-control" type="file" multiple disabled={storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} aria-label="从文件或 iCloud Drive 选择" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} /></div>
+        <div className="mobile-source-row mobile-camera-row"><Camera /><span><strong>直接拍摄</strong><small>可直接调用相机拍照或录像，新生成文件进入同一队列、去重和断网恢复流程。</small></span><div className="mobile-capture-actions"><button className="secondary-button" type="button" onClick={() => cameraPhotoRef.current?.click()}>拍照</button><button className="secondary-button" type="button" onClick={() => cameraVideoRef.current?.click()}>录像</button></div><input ref={cameraPhotoRef} className="mobile-capture-input" type="file" accept="image/*" capture="environment" disabled={storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} aria-label="拍照上传" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} /><input ref={cameraVideoRef} className="mobile-capture-input" type="file" accept="video/*" capture="environment" disabled={storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} aria-label="录像上传" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (!selected.length) return; setUploadOpen(false); void addFiles(selected) }} /></div>
+      </div> : <div className="desktop-import-stack">
+        <div className={`drop-zone${busy ? ' is-importing' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void addFiles(event.dataTransfer.files) }}>
+          {busy ? <LoaderCircle className="spin" /> : <FileUp />}<strong>{busy ? '后台正在加入，可继续选择更多文件' : '选择或拖入任意文件'}</strong><span>照片、视频、文档、压缩包及其他文件类型都可进入同一上传队列；媒体原件中的可用时间、GPS 和技术元数据会被读取。</span>
+          <input id="archive-upload-input" ref={inputRef} className="drop-zone-input" type="file" multiple disabled={storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} aria-label="选择照片、视频或文件" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (selected.length) void addFiles(selected) }} />
+        </div>
+        <div className="icloud-folder-import">
+          <div><CloudDownload /><span><strong>文件夹 / iCloud Photos</strong><small>可选择 Windows 已同步的 iCloud Photos，也可选择普通文件夹。目录结构会尽量保留，所有项目统一执行 Hash 去重。</small></span></div>
+          <button className="secondary-button" type="button" disabled={busy || storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available} onClick={() => folderRef.current?.click()}>选择文件夹</button>
+          <input ref={folderRef} className="icloud-folder-input" type="file" multiple aria-label="选择文件夹或 iCloud Photos" onChange={(event) => { const selected = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; if (selected.length) void addFiles(selected) }} />
+        </div>
       </div>}
-      {importProgress && <div className="import-progress" role="status" aria-live="polite">
-        <div><strong>{activeImports > 1 ? '正在接收多批选择' : importProgress.phase === 'complete' ? '全部文件已加入后台队列' : `正在添加第 ${importProgress.window}/${importProgress.windows} 批`}</strong><span>本次已选择 {importProgress.total} 项 · 已安全加入 {importProgress.queued} 项 · 已检查 {importProgress.processed}/{importProgress.total}</span></div>
-        <div className="progress"><i style={{ width: `${importProgress.total ? Math.round(importProgress.processed / importProgress.total * 100) : 0}%` }} /></div>
+      <p className="upload-metadata-note">元数据策略：优先使用照片原件 EXIF 拍摄时间和 GPS；没有时再使用文件时间，最后才使用上传时间。浏览器没有暴露的 iOS 相册归属、人物识别等 Photos 内部数据库信息不会被伪造。</p>
+      {importStatus && <div className="import-progress" role="status" aria-live="polite">
+        <div><strong>{importStatus.phase === 'complete' ? (importStatus.error ? '部分文件未能写入本机队列' : '全部文件已写入本机恢复队列') : '正在写入本机恢复队列…'}</strong><span>本次已选择 {importStatus.total} 项 · 本机已保存 {importStatus.queued} 项 · 已检查 {importStatus.processed}/{importStatus.total}</span></div>
+        <div className="progress"><i style={{ width: `${importStatus.total ? Math.round(importStatus.processed / importStatus.total * 100) : 0}%` }} /></div>
       </div>}
-      <div className="size-policy"><div><b>≤20 MB</b><span>网页完整读取</span></div><div><b>20–48 MB</b><span>预览 + Telegram 原件</span></div><div><b>&gt;48 MB</b><span>明确阻止</span></div></div>
+      {storageBackend === 'telegram_user_group' ? <div className="size-policy"><div><b>MTProto</b><span>原件不经过 Bot getFile</span></div><div><b>大文件</b><span>适用当前 Telegram 账户限制</span></div><div><b>恢复</b><span>由本机 Bridge 下载</span></div></div> : <div className="size-policy"><div><b>≤20 MB</b><span>Bot 存储可上传 / 恢复</span></div><div><b>&gt;20 MB</b><span>请切换私人群组</span></div><div><b>无 fallback</b><span>不会静默改存储后端</span></div></div>}
       {!online && <p className="offline-notice"><WifiOff />当前离线。文件已进入本机队列，恢复网络并打开 PWA 后会继续。</p>}
       {error && <p className="inline-error" role="alert">{error}</p>}
       <UploadQueue compact />

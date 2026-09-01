@@ -1,4 +1,5 @@
 import type { AssetRow } from '../domain/types'
+import { refreshAssetSearchIndex } from './assets-repository'
 
 export interface AnalysisResult {
   primaryCategory: string
@@ -32,6 +33,7 @@ export async function saveAnalysis(db: D1Database, asset: AssetRow, result: Anal
     )
   }
   await db.batch(statements)
+  await refreshAssetSearchIndex(db, asset.id)
 }
 
 export async function markAnalysisLimited(db: D1Database, assetId: string): Promise<void> {

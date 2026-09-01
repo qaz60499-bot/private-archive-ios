@@ -1,12 +1,29 @@
 export type MediaType = 'photo' | 'video' | 'file'
+export type StorageBackend = 'telegram_user_group' | 'telegram_bot'
+export type FileCategory = 'documents' | 'spreadsheets' | 'images' | 'archives' | 'video' | 'audio' | 'code' | 'other'
 
 export interface Asset {
   id: string
   source: 'web' | 'telegram' | 'mock'
+  sourceId: string
+  storageBackend: StorageBackend
+  importOrigin: string
   mediaType: MediaType
   mimeType: string
   originalName: string
   sizeBytes: number
+  extension: string
+  fileCategory: FileCategory
+  metadata: Record<string, unknown> | null
+  archived: boolean
+  deletedAt: string | null
+  purgeAt: string | null
+  logicalPath: string
+  lastViewedAt: string | null
+  uploadSupported: boolean
+  downloadSupported: boolean
+  previewSupported: boolean
+  metadataSupported: boolean
   width: number | null
   height: number | null
   durationMs: number | null
@@ -28,6 +45,7 @@ export interface Asset {
   mediaUrl: string | null
   originalAvailableInApp: boolean
   tags?: Array<{ slug: string; name: string; confidence: number | null; source: string }>
+  albumNames?: string[]
 }
 
 export interface Album {
@@ -52,6 +70,37 @@ export interface DiscoverModule {
   coverAssetId: string | null
 }
 
+export interface TelegramSource {
+  id: string
+  displayName: string
+  botUserId: string | null
+  botUsername: string | null
+  chatId: string | null
+  chatType: string | null
+  sourceType: 'private_chat' | 'group' | 'channel' | null
+  enabled: boolean
+  connectionStatus: 'unconfigured' | 'legacy' | 'verified' | 'bound' | 'disabled' | 'error' | 'disconnected'
+  lastSyncAt: string | null
+  lastError: string | null
+  tokenConfigured: boolean
+  assetCount: number
+  storageObjectCount: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ShareLink {
+  id: string
+  name: string
+  scopeType: 'source' | 'album' | 'asset'
+  scopeId: string
+  permissions: Array<'read' | 'download'>
+  createdAt: string
+  expiresAt: string | null
+  lastUsedAt: string | null
+  revoked: boolean
+}
+
 export interface TelegramDiscovery {
   bot: { id: string; username: string | null; firstName: string | null }
   chats: Array<{
@@ -61,6 +110,36 @@ export interface TelegramDiscovery {
     username: string | null
     firstName: string | null
   }>
+}
+
+export type AppAccountRole = 'OWNER' | 'MEMBER'
+export type AppAccountStatus = 'ACTIVE' | 'DISABLED'
+export type AppAccessPreset = 'FULL' | 'VIEWER' | 'UPLOAD_ONLY' | 'SCOPED' | 'CUSTOM'
+export type AppPermission = 'read' | 'download' | 'upload' | 'edit' | 'delete'
+export type AppAccessScopeType = 'workspace' | 'source' | 'album' | 'asset'
+
+export interface AppAccessGrant {
+  scopeType: AppAccessScopeType
+  scopeId: string
+  permission: AppPermission
+}
+
+export interface AppAccount {
+  id: string
+  username: string
+  displayName: string
+  role: AppAccountRole
+  status: AppAccountStatus
+  accessPreset: AppAccessPreset
+  grants: AppAccessGrant[]
+  lastLoginAt: string | null
+  createdAt: string
+}
+
+export interface AuthStatus {
+  initialized: boolean
+  authenticated: boolean
+  user: AppAccount | null
 }
 
 export interface IntegrationStatus {
@@ -80,7 +159,21 @@ export interface IntegrationStatus {
     audienceConfigured: boolean
     teamDomainConfigured: boolean
   }
-  limits: { inAppOriginalBytes: number; maxUploadBytes: number }
+  workspace?: { id: string; kind: 'personal' | 'company' }
+  storage?: {
+    defaultStorageBackend: StorageBackend
+    userGroup: {
+      connectionStatus: 'disconnected' | 'auth_required' | 'connected' | 'syncing' | 'error'
+      storageChatId: string | null
+      storageChatTitle: string | null
+      lastSyncAt: string | null
+      lastError: string | null
+      lastAckMessageId: number | null
+    }
+  }
+  usage?: UsageSnapshot
+  trash?: { retentionDays: number | null }
+  limits: { inAppOriginalBytes: number; maxUploadBytes: number; userGroupAccountLimitApplies?: boolean }
   privacy: { cloudflareAccessExpected: boolean; tokenStoredInD1: boolean; endToEndEncrypted: boolean }
 }
 
@@ -93,10 +186,12 @@ export interface LocalUploadJob {
   schemaVersion: 2
   id: string
   batchId: string
+  principalId?: string
   fileName: string
   mimeType: string
   sizeBytes: number
   mediaType: MediaType
+  storageBackend: StorageBackend
   status: LocalUploadStatus
   prepareStatus: LocalUploadPrepareStatus
   controlState: LocalUploadControlState
@@ -120,5 +215,35 @@ export interface LocalUploadJob {
   opfsPath?: string
   fileBlob?: Blob
   previewBlob?: Blob
-  metadata: Record<string, string | number | undefined>
+  metadata: Record<string, unknown>
+}
+
+export interface UsageSnapshot {
+  workspaceId: string
+  fileCount: number
+  photoCount: number
+  storageBytes: number
+  uploadCount: number
+  uploadBytes: number
+  quotaFiles: number | null
+  quotaStorageBytes: number | null
+  updatedAt: string
+}
+
+export interface ArchiveSummary {
+  assetCount: number
+  photoCount: number
+  albumCount: number
+  lastUpdate: string | null
+}
+
+export interface ActivityItem {
+  id: string
+  action: string
+  assetId: string | null
+  albumId: string | null
+  detail: Record<string, unknown> | null
+  assetName?: string | null
+  assetSource?: string | null
+  createdAt: string
 }

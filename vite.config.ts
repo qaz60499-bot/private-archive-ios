@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [
     react(),
     tailwindcss(),
@@ -25,6 +25,9 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // Remove obsolete precache generations after a portal deployment so a browser
+        // previously controlled by the full SaaS shell cannot keep serving that shell.
+        cleanupOutdatedCaches: true,
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/api\//, /^\/cdn-cgi\//, /^\/access-check$/],
         globPatterns: ['**/*.{js,css,html,svg,png,webp,woff2}'],
@@ -35,18 +38,17 @@ export default defineConfig({
             handler: 'NetworkOnly',
           },
           {
+            // Private previews are authorization-gated API resources. Never satisfy
+            // them from an account-blind Service Worker cache: a cached 200 could
+            // otherwise outlive an app logout or a later permission downgrade.
+            // The Worker may still use its own edge cache *after* authorization.
             urlPattern: ({ url }) => url.pathname.startsWith('/api/assets/') && url.pathname.endsWith('/preview'),
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'archive-previews-v2',
-              expiration: { maxEntries: 600, maxAgeSeconds: 30 * 24 * 60 * 60 },
-              cacheableResponse: { statuses: [200] },
-            },
+            handler: 'NetworkOnly',
           },
           {
             urlPattern: ({ request }) => request.destination === 'image',
             handler: 'StaleWhileRevalidate',
-            options: { cacheName: 'archive-ui-images', expiration: { maxEntries: 120, maxAgeSeconds: 604800 } },
+            options: { cacheName: 'archive-ui-images-v2', expiration: { maxEntries: 120, maxAgeSeconds: 604800 } },
           },
         ],
       },
@@ -58,5 +60,8 @@ export default defineConfig({
     port: 5173,
     proxy: { '/api': 'http://127.0.0.1:8787' },
   },
-  build: { sourcemap: true, target: 'es2022' },
-})
+  // Hosted Web is a public static asset surface behind Access. Keep source maps
+  // only in the local desktop bundle so production Web deploys do not expose
+  // source files, internal route names, or implementation comments.
+  build: { sourcemap: mode !== 'web' && mode !== 'ios', target: 'es2022' },
+}))

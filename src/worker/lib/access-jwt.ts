@@ -21,7 +21,7 @@ interface AccessJwksResponse {
 
 export interface VerifyAccessJwtOptions {
   audience: string
-  ownerEmail: string
+  ownerEmail?: string
   teamDomain: string
   fetcher?: typeof fetch
   nowSeconds?: number
@@ -66,7 +66,7 @@ export async function verifyAccessJwt(token: string, options: VerifyAccessJwtOpt
   const teamDomain = normalizeTeamDomain(options.teamDomain)
   if (!teamDomain.startsWith('https://') || payload.iss !== teamDomain) return false
   if (!audienceMatches(payload.aud, options.audience)) return false
-  if (payload.email && payload.email.toLowerCase() !== options.ownerEmail.toLowerCase()) return false
+  if (options.ownerEmail && (!payload.email || payload.email.toLowerCase() !== options.ownerEmail.toLowerCase())) return false
 
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000)
   if (typeof payload.exp !== 'number' || payload.exp <= now) return false

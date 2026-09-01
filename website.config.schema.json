@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/website.config.schema.json",
+  "title": "Website workflow configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "project", "stack", "design", "routes", "quality", "threejs"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "project": { "type": "object", "additionalProperties": false, "required": ["name", "kind", "audience", "primaryGoal"], "properties": { "name": { "type": "string", "minLength": 1 }, "kind": { "enum": ["marketing", "app", "hybrid", "portfolio", "content"] }, "audience": { "type": "string", "minLength": 1 }, "primaryGoal": { "type": "string", "minLength": 1 } } },
+    "stack": { "type": "object", "additionalProperties": false, "required": ["framework", "language", "packageManager", "styling"], "properties": { "framework": { "type": "string", "minLength": 1 }, "language": { "enum": ["javascript", "typescript"] }, "packageManager": { "type": "string", "minLength": 1 }, "styling": { "type": "string", "minLength": 1 } } },
+    "design": { "type": "object", "additionalProperties": false, "required": ["theme", "direction", "signature", "source"], "properties": { "theme": { "enum": ["light", "dark", "system"] }, "direction": { "type": "string" }, "signature": { "type": "string" }, "source": { "type": "string", "minLength": 1 } } },
+    "routes": { "type": "array", "minItems": 1, "items": { "type": "object", "additionalProperties": false, "required": ["path", "purpose", "status"], "properties": { "path": { "type": "string", "pattern": "^/" }, "purpose": { "type": "string", "minLength": 1 }, "status": { "enum": ["planned", "in-progress", "complete"] } } } },
+    "quality": { "type": "object", "additionalProperties": false, "required": ["viewports", "maxInitialJavaScriptKb", "maxLcpSeconds", "minContrastRatio", "reducedMotion"], "properties": { "viewports": { "type": "array", "minItems": 2, "items": { "type": "integer", "minimum": 240 } }, "maxInitialJavaScriptKb": { "type": "number", "exclusiveMinimum": 0 }, "maxLcpSeconds": { "type": "number", "exclusiveMinimum": 0 }, "minContrastRatio": { "type": "number", "minimum": 3 }, "reducedMotion": { "type": "boolean" } } },
+    "threejs": { "type": "object", "additionalProperties": false, "required": ["enabled", "integration", "maxDevicePixelRatio", "renderMode", "pauseWhenHidden", "fallback"], "properties": { "enabled": { "type": "boolean" }, "integration": { "enum": ["vanilla", "r3f"] }, "maxDevicePixelRatio": { "type": "number", "minimum": 0.5, "maximum": 3 }, "renderMode": { "enum": ["on-demand", "continuous"] }, "pauseWhenHidden": { "type": "boolean" }, "fallback": { "enum": ["poster", "static-content", "none"] } } }
+  }
+}
+
