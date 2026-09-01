@@ -94,10 +94,14 @@ function ViewerPhoto({ asset, stageRef, transform }: { asset: Asset; stageRef: R
   const [source, setSource] = useState(asset.previewUrl)
   const [failed, setFailed] = useState(false)
   const loadingFull = useRef(false)
-  const nativePreview = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported })
+  const nativePreview = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported, priority: 'high' })
   const nativeFull = usePrivateMediaUrl(asset.mediaUrl, {
-    enabled: native && asset.originalAvailableInApp && Boolean(asset.mediaUrl) && asset.sizeBytes <= 20 * 1024 * 1024,
+    // The preview is enough for the normal viewer. Fetching the Telegram original at
+    // the same time doubled native network traffic and delayed every other module.
+    // Upgrade to the original only when the user actually zooms in.
+    enabled: native && Boolean(nativePreview.url) && transform.scale > 1.05 && asset.originalAvailableInApp && Boolean(asset.mediaUrl) && asset.sizeBytes <= 20 * 1024 * 1024,
     cache: false,
+    priority: 'high',
   })
   const displayedSource = native ? (nativeFull.url ?? nativePreview.url) : source
 
@@ -130,8 +134,8 @@ function ViewerPhoto({ asset, stageRef, transform }: { asset: Asset; stageRef: R
 
 function ViewerVideo({ asset }: { asset: Asset }) {
   const native = isNativeApp()
-  const nativeVideo = usePrivateMediaUrl(asset.mediaUrl, { enabled: native && asset.originalAvailableInApp && Boolean(asset.mediaUrl), cache: false })
-  const nativePoster = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported })
+  const nativeVideo = usePrivateMediaUrl(asset.mediaUrl, { enabled: native && asset.originalAvailableInApp && Boolean(asset.mediaUrl), cache: false, priority: 'high' })
+  const nativePoster = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported, priority: 'high' })
   const source = native ? nativeVideo.url : (asset.mediaUrl ?? asset.previewUrl)
   const poster = native ? nativePoster.url ?? undefined : asset.previewUrl
   if (native && nativeVideo.failed) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>视频读取失败</strong><span>请检查网络后重试。</span></div>
@@ -182,6 +186,8 @@ export function MediaViewer() {
   const [photoTransform, setPhotoTransform] = useState<PhotoTransform>({ scale: 1, x: 0, y: 0 })
   const [uiHidden, setUiHidden] = useState(false)
   const [metadataExpanded, setMetadataExpanded] = useState(false)
+  const [downloadRequested, setDownloadRequested] = useState(false)
+  const [downloadRetryKey, setDownloadRetryKey] = useState(0)
   const index = asset ? assets.findIndex((item) => item.id === asset.id) : -1
 
   const resetPhoto = useCallback(() => setPhotoTransform({ scale: 1, x: 0, y: 0 }), [])
@@ -202,6 +208,8 @@ export function MediaViewer() {
       resetPhoto()
       setUiHidden(false)
       setMetadataExpanded(false)
+      setDownloadRequested(false)
+      setDownloadRetryKey(0)
     }, 0)
     return () => window.clearTimeout(timer)
   }, [asset?.id, resetPhoto])
@@ -356,10 +364,29 @@ export function MediaViewer() {
     setScale(photoTransform.scale - event.deltaY * 0.004)
   }
 
-  const nativeDownload = usePrivateMediaUrl(asset?.mediaUrl, { enabled: Boolean(asset?.originalAvailableInApp && asset?.mediaUrl), cache: false })
+  const native = isNativeApp()
+  const nativeDownload = usePrivateMediaUrl(asset?.mediaUrl, {
+    enabled: Boolean(native && downloadRequested && asset?.originalAvailableInApp && asset?.mediaUrl),
+    cache: false,
+    retryKey: downloadRetryKey,
+    priority: 'high',
+  })
+
+  useEffect(() => {
+    if (!asset || !native || !downloadRequested || !nativeDownload.url) return
+    const link = document.createElement('a')
+    link.href = nativeDownload.url
+    link.download = asset.originalName
+    link.style.display = 'none'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    const timer = window.setTimeout(() => setDownloadRequested(false), 0)
+    return () => window.clearTimeout(timer)
+  }, [asset, downloadRequested, native, nativeDownload.url])
 
   if (!asset) return null
-  const downloadUrl = isNativeApp() ? nativeDownload.url : asset.mediaUrl
+  const downloadUrl = native ? nativeDownload.url : asset.mediaUrl
   const zoomable = asset.mediaType === 'photo'
   const trashed = asset.status === 'trashed'
   const canNavigate = index >= 0 && assets.length > 1
@@ -374,7 +401,9 @@ export function MediaViewer() {
             <button type="button" onClick={() => setScale(photoTransform.scale + 0.5)} aria-label="放大"><ZoomIn /><span>放大</span></button>
           </> : null}
           {!trashed ? <button type="button" onClick={() => void toggleFavorite(asset)} aria-label={asset.favorite ? '取消收藏' : '收藏'} aria-pressed={asset.favorite}><Heart fill={asset.favorite ? 'currentColor' : 'none'} /><span>收藏</span></button> : null}
-          {asset.originalAvailableInApp && downloadUrl && <a href={downloadUrl} download={asset.originalName} aria-label={`下载 ${asset.originalName}`}><Download /><span>下载</span></a>}
+          {asset.originalAvailableInApp && (native
+            ? <button type="button" disabled={downloadRequested && !nativeDownload.failed} onClick={() => { setDownloadRequested(true); setDownloadRetryKey((value) => value + 1) }} aria-label={`下载 ${asset.originalName}`}><Download /><span>{nativeDownload.failed ? '重试下载' : downloadRequested ? '准备中' : '下载'}</span></button>
+            : downloadUrl ? <a href={downloadUrl} download={asset.originalName} aria-label={`下载 ${asset.originalName}`}><Download /><span>下载</span></a> : null)}
           {!trashed ? <button className="danger-button" type="button" aria-label="移入回收站" onClick={() => { if (window.confirm(`将“${asset.originalName}”移入回收站？Telegram 中的原文件不会被删除。`)) void trashAsset(asset) }}><Trash2 /><span>回收站</span></button> : null}
         </div>
       </div>

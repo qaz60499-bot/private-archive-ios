@@ -244,19 +244,22 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func resumeJob(id: String) {
+        // An explicit user retry starts a fresh automatic retry budget. Without this,
+        // a job that reached the 24-attempt guard could never be resumed from the UI:
+        // resume immediately re-entered retryReserve with attempts == 24 and failed.
+        if let record = mutate(id, { value in
+            value.status = "retrying"
+            value.attempts = 0
+            value.error = nil
+        }) { notify(record) }
         if let reserveTask = stateQueue.sync(execute: { reserveTasks[id] }) {
             reserveTask.resume()
-            if let record = mutate(id, { value in value.status = "retrying"; value.error = nil }) { notify(record) }
             return
         }
         session.getAllTasks { tasks in
             let matches = tasks.filter { self.taskJobId($0) == id }
             if !matches.isEmpty {
                 matches.forEach { $0.resume() }
-                if let record = self.mutate(id, { value in
-                    value.status = "retrying"
-                    value.error = nil
-                }) { self.notify(record) }
                 return
             }
             guard let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready else { return }

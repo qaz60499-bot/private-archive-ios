@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Check, Heart, ImageOff, Play, RefreshCw, Send } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
 import { usePrivateMediaUrl } from '../../lib/native-media'
@@ -23,19 +23,38 @@ export function MediaTile({
 }) {
   const { openViewer, toggleFavorite } = useArchive()
   const ratio = asset.width && asset.height ? `${asset.width} / ${asset.height}` : '4 / 3'
-  // A failed preview must reach a real terminal state with a retry, not shimmer forever.
-  const [failed, setFailed] = useState(!asset.previewSupported)
+  const tileRef = useRef<HTMLElement>(null)
+  const [nearViewport, setNearViewport] = useState(priority || typeof IntersectionObserver === 'undefined')
+  // Track the exact preview URL that failed instead of a sticky boolean. If the
+  // server later publishes a new preview URL for the same asset, it becomes eligible
+  // immediately without an effect-driven state reset.
+  const [failedPreviewUrl, setFailedPreviewUrl] = useState<string | null>(null)
+  const failed = !asset.previewSupported || failedPreviewUrl === asset.previewUrl
   const [reloadNonce, setReloadNonce] = useState(0)
   const previewSrc = reloadNonce
     ? `${asset.previewUrl}${asset.previewUrl.includes('?') ? '&' : '?'}retry=${reloadNonce}`
     : asset.previewUrl
-  const nativePreview = usePrivateMediaUrl(previewSrc, { enabled: asset.previewSupported && !failed, retryKey: reloadNonce })
-  const previewFailed = failed || nativePreview.failed
-  const retryPreview = () => { setFailed(false); setReloadNonce((value) => value + 1) }
+  useEffect(() => {
+    if (priority || nearViewport || typeof IntersectionObserver === 'undefined') return
+    const node = tileRef.current
+    if (!node) return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setNearViewport(true)
+        observer.disconnect()
+      }
+    }, { rootMargin: '500px 0px' })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [nearViewport, priority])
+  const previewEnabled = asset.previewSupported && !failed && (priority || nearViewport)
+  const nativePreview = usePrivateMediaUrl(previewSrc, { enabled: previewEnabled, retryKey: reloadNonce, priority: priority ? 'high' : 'low' })
+  const previewFailed = failed || previewEnabled && nativePreview.failed
+  const retryPreview = () => { setFailedPreviewUrl(null); setNearViewport(true); setReloadNonce((value) => value + 1) }
   const takenTime = new Date(asset.takenAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   const archiveContext = asset.albumNames?.[0] ?? asset.tags?.[0]?.name ?? null
   return (
-    <article className={`media-tile media-${asset.mediaType}${selectionMode ? ' selection-mode' : ''}${selected ? ' selected' : ''}${previewFailed ? ' media-failed' : ''}`} style={{ aspectRatio: ratio }}>
+    <article ref={tileRef} className={`media-tile media-${asset.mediaType}${selectionMode ? ' selection-mode' : ''}${selected ? ' selected' : ''}${previewFailed ? ' media-failed' : ''}`} style={{ aspectRatio: ratio }}>
       <button
         type="button"
         className="media-open"
@@ -53,8 +72,8 @@ export function MediaTile({
           height={asset.height ?? undefined}
           draggable={false}
           onLoad={(event) => { event.currentTarget.dataset.loaded = 'true' }}
-          onError={() => setFailed(true)}
-        /> : <span className="media-preview-unavailable"><ImageOff /><b>预览不可用</b><small>其它档案不受影响</small></span>}
+          onError={() => setFailedPreviewUrl(asset.previewUrl)}
+        /> : previewFailed ? <span className="media-preview-unavailable"><ImageOff /><b>预览不可用</b><small>点“重新加载”再试一次</small></span> : null}
         <span className="media-overlay">
           <span className="media-overlay-copy">
             <small>{takenTime}</small>

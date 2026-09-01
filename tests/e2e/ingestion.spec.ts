@@ -64,6 +64,46 @@ test('concurrent reserve for the same content does not rotate the active upload 
   expect(duplicateBody).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
 })
 
+test('batch cleanup discards only unstored reservations', async ({ request }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'batch cleanup API only needs one browser project')
+
+  const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
+  const pendingBytes = Buffer.from(`pending-cleanup-${suffix}`)
+  const pendingHash = createHash('sha256').update(pendingBytes).digest('hex')
+  const pendingReserve = await request.post('/api/assets/reserve', { data: {
+    originalName: `pending-cleanup-${suffix}.txt`, mimeType: 'text/plain', sizeBytes: pendingBytes.byteLength,
+    mediaType: 'file', contentHash: pendingHash, storageBackend: 'telegram_bot', importOrigin: 'web',
+  } })
+  expect(pendingReserve.status()).toBe(201)
+  const pending = await pendingReserve.json() as { assetId: string }
+  const discardPending = await request.post('/api/assets/bulk-discard-unstored', { data: { ids: [pending.assetId] } })
+  expect(discardPending.status()).toBe(200)
+  await expect(discardPending.json()).resolves.toMatchObject({ ok: true, discarded: 1 })
+
+  const storedBytes = Buffer.from(`stored-cleanup-${suffix}`)
+  const storedHash = createHash('sha256').update(storedBytes).digest('hex')
+  const storedReserve = await request.post('/api/assets/reserve', { data: {
+    originalName: `stored-cleanup-${suffix}.txt`, mimeType: 'text/plain', sizeBytes: storedBytes.byteLength,
+    mediaType: 'file', contentHash: storedHash, storageBackend: 'telegram_bot', importOrigin: 'web',
+  } })
+  expect(storedReserve.status()).toBe(201)
+  const stored = await storedReserve.json() as { assetId: string; uploadToken: string }
+  const upload = await request.put(`/api/assets/${stored.assetId}/content`, {
+    data: storedBytes,
+    headers: {
+      'Content-Type': 'text/plain', 'Content-Length': String(storedBytes.byteLength), 'X-Upload-Token': stored.uploadToken,
+    },
+  })
+  expect(upload.status()).toBe(201)
+
+  const discardStored = await request.post('/api/assets/bulk-discard-unstored', { data: { ids: [stored.assetId] } })
+  expect(discardStored.status()).toBe(200)
+  await expect(discardStored.json()).resolves.toMatchObject({ ok: true, discarded: 0 })
+  const storedAsset = await request.get(`/api/assets/${stored.assetId}`)
+  expect(storedAsset.status()).toBe(200)
+  await expect(storedAsset.json()).resolves.toMatchObject({ asset: { id: stored.assetId } })
+})
+
 test('web upload and Telegram webhook converge into archive records', async ({ request }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'API convergence only needs one browser project')
 

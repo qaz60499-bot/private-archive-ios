@@ -23,14 +23,14 @@ systemRoutes.get('/tags', async (context) => {
   if (!user) return context.json({ error: 'APP_AUTH_REQUIRED' }, 401)
   if (user.role === 'OWNER') {
     const result = await context.env.DB.prepare(`SELECT tags.id, tags.slug, tags.name, tags.kind,
-      COUNT(CASE WHEN assets.workspace_id = ? AND assets.status != 'trashed' THEN asset_tags.asset_id END) AS asset_count
+      COUNT(CASE WHEN assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') THEN asset_tags.asset_id END) AS asset_count
       FROM tags LEFT JOIN asset_tags ON asset_tags.tag_id = tags.id LEFT JOIN assets ON assets.id = asset_tags.asset_id
       GROUP BY tags.id ORDER BY asset_count DESC, tags.name`).bind(PERSONAL_WORKSPACE_ID).all()
     return context.json({ items: result.results })
   }
   const result = await context.env.DB.prepare(`SELECT tags.id, tags.slug, tags.name, tags.kind, COUNT(*) AS asset_count
     FROM tags JOIN asset_tags ON asset_tags.tag_id = tags.id JOIN assets ON assets.id = asset_tags.asset_id
-    WHERE assets.workspace_id = ? AND assets.status != 'trashed' AND ${appUserAssetPermissionPredicate('assets')}
+    WHERE assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') AND ${appUserAssetPermissionPredicate('assets')}
     GROUP BY tags.id ORDER BY asset_count DESC, tags.name`)
     .bind(PERSONAL_WORKSPACE_ID, user.id, 'read').all()
   return context.json({ items: result.results })
@@ -41,15 +41,15 @@ systemRoutes.get('/places', async (context) => {
   if (!user) return context.json({ error: 'APP_AUTH_REQUIRED' }, 401)
   if (user.role === 'OWNER') {
     const result = await context.env.DB.prepare(`SELECT places.*,
-      COUNT(CASE WHEN assets.workspace_id = ? AND assets.status != 'trashed' THEN assets.id END) AS asset_count,
-      MAX(CASE WHEN assets.workspace_id = ? AND assets.status != 'trashed' THEN assets.taken_at END) AS latest_taken_at
+      COUNT(CASE WHEN assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') THEN assets.id END) AS asset_count,
+      MAX(CASE WHEN assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') THEN assets.taken_at END) AS latest_taken_at
       FROM places LEFT JOIN assets ON assets.place_id = places.id GROUP BY places.id ORDER BY latest_taken_at DESC`)
       .bind(PERSONAL_WORKSPACE_ID, PERSONAL_WORKSPACE_ID).all()
     return context.json({ items: result.results })
   }
   const result = await context.env.DB.prepare(`SELECT places.*, COUNT(*) AS asset_count, MAX(assets.taken_at) AS latest_taken_at
     FROM places JOIN assets ON assets.place_id = places.id
-    WHERE assets.workspace_id = ? AND assets.status != 'trashed' AND ${appUserAssetPermissionPredicate('assets')}
+    WHERE assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') AND ${appUserAssetPermissionPredicate('assets')}
     GROUP BY places.id ORDER BY latest_taken_at DESC`)
     .bind(PERSONAL_WORKSPACE_ID, user.id, 'read').all()
   return context.json({ items: result.results })
@@ -62,7 +62,7 @@ systemRoutes.get('/timeline/months', async (context) => {
   const values: unknown[] = [PERSONAL_WORKSPACE_ID]
   if (user.role === 'MEMBER') values.push(user.id, 'read')
   const result = await context.env.DB.prepare(`SELECT substr(taken_at, 1, 7) AS month, COUNT(*) AS asset_count
-    FROM assets WHERE workspace_id = ? AND status != 'trashed' ${accessFilter} GROUP BY substr(taken_at, 1, 7) ORDER BY month DESC LIMIT 240`)
+    FROM assets WHERE workspace_id = ? AND status NOT IN ('trashed', 'pending_upload', 'failed') ${accessFilter} GROUP BY substr(taken_at, 1, 7) ORDER BY month DESC LIMIT 240`)
     .bind(...values).all<{ month: string; asset_count: number }>()
   context.header('Cache-Control', 'private, max-age=300')
   return context.json({ items: result.results })
@@ -110,7 +110,7 @@ systemRoutes.get('/archive-summary', async (context) => {
       COUNT(*) AS asset_count,
       SUM(CASE WHEN media_type = 'photo' THEN 1 ELSE 0 END) AS photo_count,
       MAX(uploaded_at) AS last_update
-      FROM assets WHERE workspace_id = ? AND status != 'trashed' ${accessFilter}`)
+      FROM assets WHERE workspace_id = ? AND status NOT IN ('trashed', 'pending_upload', 'failed') ${accessFilter}`)
       .bind(...values)
       .first<{ asset_count: number; photo_count: number | null; last_update: string | null }>(),
     listAccessibleAlbumIdsForAppUser(context.env.DB, user),

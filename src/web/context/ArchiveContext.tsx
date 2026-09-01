@@ -111,32 +111,48 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
   const dismissedImportBatchesRef = useRef<Set<string>>(new Set())
   const [lastOptions, setLastOptions] = useState<LoadOptions>({})
   const [hasLoadedMore, setHasLoadedMore] = useState(false)
+  const prefetchedNextRef = useRef<{ cursor: string; result: Awaited<ReturnType<typeof api.listAssets>> } | null>(null)
+  const requestEpochRef = useRef(0)
+  const loadMoreRequestRef = useRef(0)
+  const syncInFlightRef = useRef<Promise<void> | null>(null)
 
   const load = useCallback(async (options: LoadOptions = {}) => {
+    const epoch = ++requestEpochRef.current
+    loadMoreRequestRef.current += 1
     setLoading(true)
+    setLoadingMore(false)
     setError(null)
     setLastOptions(options)
+    prefetchedNextRef.current = null
     try {
       const result = await api.listAssets(buildAssetParams(options))
+      if (requestEpochRef.current !== epoch) return
       clearAccessReauthGuard()
       setAssets(result.items)
       setNextCursor(result.nextCursor)
       setHasLoadedMore(false)
     } catch (caught) {
+      if (requestEpochRef.current !== epoch) return
       // A stale Cloudflare Access cookie is the dominant first-open failure: recover by
       // re-running the Access login instead of stranding the user on a dead error card.
       if (isAccessSignInRequired(caught) && requestAccessReauth()) return
       setError(friendlyLoadError(caught, '加载档案失败'))
     } finally {
-      setLoading(false)
+      if (requestEpochRef.current === epoch) setLoading(false)
     }
   }, [])
 
   const loadMore = useCallback(async () => {
     if (!nextCursor || loadingMore) return
+    const epoch = requestEpochRef.current
+    const requestId = ++loadMoreRequestRef.current
+    const cursor = nextCursor
     setLoadingMore(true)
     try {
-      const result = await api.listAssets(buildAssetParams(lastOptions, nextCursor))
+      const prefetched = prefetchedNextRef.current?.cursor === cursor ? prefetchedNextRef.current.result : null
+      prefetchedNextRef.current = null
+      const result = prefetched ?? await api.listAssets(buildAssetParams(lastOptions, cursor))
+      if (requestEpochRef.current !== epoch || loadMoreRequestRef.current !== requestId) return
       setAssets((current) => {
         const existing = new Set(current.map((item) => item.id))
         return [...current, ...result.items.filter((item) => !existing.has(item.id))]
@@ -144,30 +160,53 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
       setNextCursor(result.nextCursor)
       setHasLoadedMore(true)
     } catch (caught) {
-      setError(friendlyLoadError(caught, '加载更多档案失败'))
+      if (requestEpochRef.current === epoch && loadMoreRequestRef.current === requestId) setError(friendlyLoadError(caught, '加载更多档案失败'))
     } finally {
-      setLoadingMore(false)
+      if (loadMoreRequestRef.current === requestId) setLoadingMore(false)
     }
   }, [lastOptions, loadingMore, nextCursor])
 
   const refresh = useCallback(() => load(lastOptions), [lastOptions, load])
 
+  useEffect(() => {
+    if (!nextCursor || loading || document.visibilityState !== 'visible' || !navigator.onLine) return
+    const cursor = nextCursor
+    const epoch = requestEpochRef.current
+    const timer = window.setTimeout(() => {
+      void api.listAssets(buildAssetParams(lastOptions, cursor)).then((result) => {
+        if (requestEpochRef.current === epoch) prefetchedNextRef.current = { cursor, result }
+      }).catch(() => undefined)
+    }, 1_200)
+    return () => window.clearTimeout(timer)
+  }, [lastOptions, loading, nextCursor])
+
   const syncLatest = useCallback(async () => {
     if (!navigator.onLine || document.visibilityState !== 'visible') return
+    if (syncInFlightRef.current) return syncInFlightRef.current
+    const epoch = requestEpochRef.current
+    const promise = (async () => {
+      try {
+        const result = await api.listAssets(buildAssetParams(lastOptions))
+        if (requestEpochRef.current !== epoch) return
+        setAssets((current) => {
+          if (!hasLoadedMore) return result.items
+          const freshIds = new Set(result.items.map((item) => item.id))
+          return [...result.items, ...current.filter((item) => !freshIds.has(item.id))]
+        })
+        if (!hasLoadedMore) setNextCursor(result.nextCursor)
+        setViewerAsset((current) => {
+          if (!current) return current
+          return result.items.find((item) => item.id === current.id) ?? current
+        })
+      } catch {
+        // Background synchronization is best-effort. Foreground loads still surface errors.
+      }
+    })()
+    syncInFlightRef.current = promise
     try {
-      const result = await api.listAssets(buildAssetParams(lastOptions))
-      setAssets((current) => {
-        if (!hasLoadedMore) return result.items
-        const freshIds = new Set(result.items.map((item) => item.id))
-        return [...result.items, ...current.filter((item) => !freshIds.has(item.id))]
-      })
-      if (!hasLoadedMore) setNextCursor(result.nextCursor)
-      setViewerAsset((current) => {
-        if (!current) return current
-        return result.items.find((item) => item.id === current.id) ?? current
-      })
-    } catch {
-      // Background synchronization is best-effort. Foreground loads still surface errors.
+      await promise
+    } finally {
+      if (syncInFlightRef.current === promise) syncInFlightRef.current = null
     }
   }, [hasLoadedMore, lastOptions])
 
@@ -282,9 +321,9 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const syncIfVisible = () => {
-      if (document.visibilityState === 'visible' && navigator.onLine) void syncLatest()
+      if (document.visibilityState === 'visible' && navigator.onLine && !loading && !loadingMore) void syncLatest()
     }
-    const interval = window.setInterval(syncIfVisible, 8000)
+    const interval = window.setInterval(syncIfVisible, 20_000)
     window.addEventListener('focus', syncIfVisible)
     document.addEventListener('visibilitychange', syncIfVisible)
     return () => {
@@ -292,7 +331,7 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
       window.removeEventListener('focus', syncIfVisible)
       document.removeEventListener('visibilitychange', syncIfVisible)
     }
-  }, [syncLatest])
+  }, [loading, loadingMore, syncLatest])
 
   const value = useMemo<ArchiveContextValue>(() => ({
     assets, loading, loadingMore, nextCursor, error, viewerAsset, uploadOpen, online, importStatus, runImport, dismissImportStatus,

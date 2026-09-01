@@ -584,6 +584,24 @@ export async function bulkSoftDeleteAssets(db: D1Database, ids: string[]): Promi
   return result.meta.changes
 }
 
+export async function bulkDiscardUnstoredAssets(db: D1Database, ids: string[]): Promise<number> {
+  const uniqueIds = [...new Set(ids)].slice(0, 90)
+  if (!uniqueIds.length) return 0
+  const retention = await getTrashRetentionDays(db)
+  const now = new Date()
+  const purgeAt = retention === null ? null : new Date(now.getTime() + retention * 24 * 60 * 60 * 1000).toISOString()
+  const placeholders = uniqueIds.map(() => '?').join(', ')
+  // Queue cleanup must never hide media that actually reached storage in a race with
+  // the cancel action. Only discard reservations that are still explicitly unstored.
+  const result = await db.prepare(`UPDATE assets SET
+      pre_trash_status = status, status = 'trashed', deleted_at = ?, purge_at = ?, purge_state = 'active', purge_error = NULL, updated_at = ?
+    WHERE workspace_id = ? AND id IN (${placeholders})
+      AND status IN ('pending_upload', 'failed')
+      AND storage_object_id IS NULL AND storage_file_id IS NULL`)
+    .bind(now.toISOString(), purgeAt, now.toISOString(), PERSONAL_WORKSPACE_ID, ...uniqueIds).run()
+  return result.meta.changes
+}
+
 export async function restoreAsset(db: D1Database, id: string): Promise<boolean> {
   const now = new Date().toISOString()
   const result = await db.prepare(`UPDATE assets SET status = CASE
@@ -737,7 +755,7 @@ export async function listRecentAssets(db: D1Database, kind: 'added' | 'viewed',
   if (appUserId) values.push(appUserId, 'read')
   values.push(boundedLimit)
   const result = await db.prepare(`SELECT ${ASSET_COLUMNS} FROM ${ASSET_FROM}
-    WHERE assets.workspace_id = ? AND assets.status != 'trashed' ${viewed ? 'AND assets.last_viewed_at IS NOT NULL' : ''} ${accessFilter}
+    WHERE assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') ${viewed ? 'AND assets.last_viewed_at IS NOT NULL' : ''} ${accessFilter}
     ORDER BY ${viewed ? 'assets.last_viewed_at' : 'assets.uploaded_at'} DESC, assets.id DESC LIMIT ?`)
     .bind(...values).all<AssetRow>()
   return result.results

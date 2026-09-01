@@ -7,6 +7,8 @@ import { AssetPreviewById } from '../components/AssetPreviewById'
 import { api } from '../lib/api'
 import type { DiscoverModule } from '../types'
 
+let analysisRetryScheduledThisSession = false
+
 const moduleIcons: Record<string, LucideIcon> = {
   people: UsersRound,
   gathering: PartyPopper,
@@ -28,15 +30,25 @@ export function DiscoverPage() {
 
   useEffect(() => {
     let active = true
-    void Promise.all([
-      api.retryFailedAnalysis().catch(() => null),
-      api.listDiscoverModules(),
-    ]).then(([, result]) => {
+    void api.listDiscoverModules().then((result) => {
       if (active) setModules(result.items)
     }).catch((caught) => {
       if (active) setError(caught instanceof Error ? caught.message : '加载模块失败')
     })
-    return () => { active = false }
+
+    // Retrying failed AI analysis is maintenance work, not a prerequisite for
+    // rendering Discover. Previously Promise.all made every visit wait for the
+    // mutation/queue request before showing any modules. Run it once per app session
+    // and only after the UI has had time to become interactive.
+    let retryTimer: number | undefined
+    if (!analysisRetryScheduledThisSession) {
+      analysisRetryScheduledThisSession = true
+      retryTimer = window.setTimeout(() => { void api.retryFailedAnalysis().catch(() => null) }, 4_000)
+    }
+    return () => {
+      active = false
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+    }
   }, [])
 
   const categories = useMemo(() => [...modules].sort((left, right) => left.sortOrder - right.sortOrder), [modules])

@@ -17,7 +17,7 @@ function formatRange(album: Album): string {
 }
 
 function AlbumPickerPreview({ asset }: { asset: Asset }) {
-  const preview = usePrivateMediaUrl(asset.previewUrl, { enabled: asset.previewSupported })
+  const preview = usePrivateMediaUrl(asset.previewUrl, { enabled: asset.previewSupported, priority: 'low' })
   if (!preview.url) return <span className="album-picker-preview-placeholder" aria-hidden="true"><ImagePlus /></span>
   return <img src={preview.url} alt="" loading="lazy" decoding="async" />
 }

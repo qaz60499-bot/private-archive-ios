@@ -13,9 +13,7 @@ export interface AlbumRow {
 }
 
 function albumSelect(scoped: boolean): string {
-  const cover = scoped
-    ? `COALESCE(MAX(CASE WHEN assets.id = albums.cover_asset_id THEN assets.id END), MIN(assets.id)) AS cover_asset_id`
-    : 'albums.cover_asset_id'
+  const cover = `COALESCE(MAX(CASE WHEN assets.id = albums.cover_asset_id THEN assets.id END), MIN(assets.id)) AS cover_asset_id`
   const access = scoped ? ` AND ${appUserAssetPermissionPredicate('assets')}` : ''
   return `SELECT albums.id, albums.name, ${cover}, albums.created_at, albums.updated_at,
     COUNT(assets.id) AS asset_count,
@@ -23,7 +21,7 @@ function albumSelect(scoped: boolean): string {
     MAX(assets.taken_at) AS latest_taken_at
     FROM albums
     LEFT JOIN album_assets ON album_assets.album_id = albums.id
-    LEFT JOIN assets ON assets.id = album_assets.asset_id AND assets.status != 'trashed'${access}`
+    LEFT JOIN assets ON assets.id = album_assets.asset_id AND assets.status NOT IN ('trashed', 'pending_upload', 'failed')${access}`
 }
 
 export async function listAlbums(db: D1Database, appUserId?: string): Promise<AlbumRow[]> {
@@ -75,7 +73,7 @@ export async function updateAlbum(db: D1Database, id: string, input: { name?: st
     statements.push(
       db.prepare(`INSERT INTO album_assets (album_id, asset_id, sort_order)
         SELECT ?, assets.id, COALESCE((SELECT MAX(sort_order) + 1 FROM album_assets WHERE album_id = ?), 0)
-        FROM assets WHERE assets.id = ? AND assets.workspace_id = ? AND assets.status != 'trashed'
+        FROM assets WHERE assets.id = ? AND assets.workspace_id = ? AND assets.status NOT IN ('trashed', 'pending_upload', 'failed')
         ON CONFLICT(album_id, asset_id) DO NOTHING`).bind(id, id, input.assetId, PERSONAL_WORKSPACE_ID),
       db.prepare(`UPDATE albums SET cover_asset_id = COALESCE(cover_asset_id, ?), updated_at = ?
         WHERE id = ? AND workspace_id = ? AND EXISTS (

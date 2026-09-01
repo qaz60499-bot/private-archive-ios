@@ -3,7 +3,7 @@ import { sha256File } from '../file-hash'
 import { prepareMedia } from '../preview/media-metadata'
 import { telegramUserGroupBridge } from '../telegram-user-group'
 import {
-  getLocalUpload, getLocalUploadFile, getLocalUploadPreview, listLocalUploads, releaseLocalUploadPayload, storeLocalUploadPreview, updateLocalUpload,
+  getLocalUpload, getLocalUploadFile, getLocalUploadPreview, listLocalUploads, releaseLocalUploadPayload, removeLocalUpload, storeLocalUploadPreview, updateLocalUpload,
 } from './store'
 import type { LocalUploadJob } from '../../types'
 import { calculateRetryDelay, friendlyUploadError, getUploadSchedulerLimits as policyLimits } from './scheduler-policy'
@@ -309,5 +309,25 @@ export async function retryFailedUploadBatch(batchId: string): Promise<void> {
 export async function cancelUploadBatch(batchId: string): Promise<void> {
   const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId && job.status !== 'done' && job.controlState !== 'canceled')
   await Promise.all(jobs.map((job) => cancelLocalUpload(job.id)))
+}
+
+export async function deleteUploadBatch(batchId: string): Promise<void> {
+  const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId)
+  if (!jobs.length) return
+  const unfinished = jobs.filter((job) => job.status !== 'done' && job.controlState !== 'canceled')
+  await Promise.allSettled(unfinished.map((job) => cancelLocalUpload(job.id)))
+
+  // A canceled upload may already have created a server reservation. Clean up only
+  // reservations that are still unstored; the server endpoint refuses to touch any
+  // asset that won a race and actually reached Telegram.
+  const orphanReservationIds = [...new Set(jobs
+    .filter((job) => job.status !== 'done' && job.remoteAssetId)
+    .map((job) => job.remoteAssetId as string))]
+  if (orphanReservationIds.length && navigator.onLine) {
+    await api.discardUnstoredAssets(orphanReservationIds).catch(() => undefined)
+  }
+
+  await Promise.all(jobs.map((job) => removeLocalUpload(job.id)))
+  notify()
 }
 

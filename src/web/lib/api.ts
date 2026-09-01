@@ -125,6 +125,7 @@ export const api = {
   },
   deleteAsset: (id: string) => request<{ ok: true; telegramDeleted: boolean }>(`/api/assets/${id}`, { method: 'DELETE' }),
   bulkTrashAssets: (ids: string[]) => request<{ ok: true; deleted: number; telegramDeleted: boolean }>('/api/assets/bulk-trash', { method: 'POST', body: JSON.stringify({ ids }) }),
+  discardUnstoredAssets: (ids: string[]) => request<{ ok: true; discarded: number }>('/api/assets/bulk-discard-unstored', { method: 'POST', body: JSON.stringify({ ids }) }),
   bulkRestoreAssets: (ids: string[]) => request<{ ok: true; restored: number }>('/api/assets/bulk-restore', { method: 'POST', body: JSON.stringify({ ids }) }),
   bulkPatchAssets: (ids: string[], patch: { favorite?: boolean; archived?: boolean; tags?: string[] }) => request<{ ok: true; updated: number; tagged: number }>('/api/assets/bulk-patch', { method: 'POST', body: JSON.stringify({ ids, ...patch }) }),
   restoreAsset: async (id: string) => {

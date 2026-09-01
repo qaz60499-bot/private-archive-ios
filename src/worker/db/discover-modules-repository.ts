@@ -22,12 +22,12 @@ export async function listDiscoverModules(db: D1Database, appUserId?: string): P
         : "assets.media_type != 'video' AND COALESCE(assets.category_override, assets.primary_category, 'other') = ?"
       const aggregate = await db.prepare(`SELECT COUNT(*) AS asset_count,
           (SELECT assets2.id FROM assets assets2
-            WHERE assets2.workspace_id = 'personal' AND assets2.status != 'trashed'
+            WHERE assets2.workspace_id = 'personal' AND assets2.status NOT IN ('trashed', 'pending_upload', 'failed')
               AND ${module.kind === 'media' && module.slug === 'video' ? "assets2.media_type = 'video'" : "assets2.media_type != 'video' AND COALESCE(assets2.category_override, assets2.primary_category, 'other') = ?"}
               AND ${appUserAssetPermissionPredicate('assets2')}
             ORDER BY assets2.taken_at DESC, assets2.id DESC LIMIT 1) AS cover_asset_id
         FROM assets
-        WHERE assets.workspace_id = 'personal' AND assets.status != 'trashed' AND ${typeFilter}
+        WHERE assets.workspace_id = 'personal' AND assets.status NOT IN ('trashed', 'pending_upload', 'failed') AND ${typeFilter}
           AND ${appUserAssetPermissionPredicate('assets')}`)
         .bind(...(
           module.kind === 'media' && module.slug === 'video'
@@ -48,23 +48,23 @@ export async function listDiscoverModules(db: D1Database, appUserId?: string): P
       CASE
         WHEN modules.kind = 'media' AND modules.slug = 'video' THEN (
           SELECT COUNT(*) FROM assets
-          WHERE status != 'trashed' AND media_type = 'video'
+          WHERE status NOT IN ('trashed', 'pending_upload', 'failed') AND media_type = 'video'
         )
         ELSE (
           SELECT COUNT(*) FROM assets
-          WHERE status != 'trashed' AND media_type != 'video'
+          WHERE status NOT IN ('trashed', 'pending_upload', 'failed') AND media_type != 'video'
             AND COALESCE(category_override, primary_category, 'other') = modules.slug
         )
       END AS asset_count,
       CASE
         WHEN modules.kind = 'media' AND modules.slug = 'video' THEN (
           SELECT id FROM assets
-          WHERE status != 'trashed' AND media_type = 'video'
+          WHERE status NOT IN ('trashed', 'pending_upload', 'failed') AND media_type = 'video'
           ORDER BY taken_at DESC, id DESC LIMIT 1
         )
         ELSE (
           SELECT id FROM assets
-          WHERE status != 'trashed' AND media_type != 'video'
+          WHERE status NOT IN ('trashed', 'pending_upload', 'failed') AND media_type != 'video'
             AND COALESCE(category_override, primary_category, 'other') = modules.slug
           ORDER BY taken_at DESC, id DESC LIMIT 1
         )

@@ -2,7 +2,43 @@ import { useEffect, useMemo, useState } from 'react'
 import { isNativeApp, nativePlatform } from './native-platform'
 
 const NATIVE_API_ORIGIN = 'https://api.photo.joye.cc.cd'
-const MAX_CACHED_MEDIA = 120
+const MAX_CACHED_MEDIA = 64
+const MAX_CONCURRENT_NATIVE_MEDIA = 4
+
+export type NativeMediaPriority = 'high' | 'normal' | 'low'
+
+let activeNativeMediaRequests = 0
+const nativeMediaWaiters: Array<{ release: () => void; priority: NativeMediaPriority }> = []
+const nativeMediaPriorityRank: Record<NativeMediaPriority, number> = { high: 0, normal: 1, low: 2 }
+
+async function acquireNativeMediaSlot(signal: AbortSignal, priority: NativeMediaPriority): Promise<void> {
+  if (signal.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+  if (activeNativeMediaRequests < MAX_CONCURRENT_NATIVE_MEDIA) {
+    activeNativeMediaRequests += 1
+    return
+  }
+  await new Promise<void>((resolve, reject) => {
+    const releaseWaiter = () => {
+      signal.removeEventListener('abort', onAbort)
+      activeNativeMediaRequests += 1
+      resolve()
+    }
+    const onAbort = () => {
+      const index = nativeMediaWaiters.findIndex((waiter) => waiter.release === releaseWaiter)
+      if (index >= 0) nativeMediaWaiters.splice(index, 1)
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    nativeMediaWaiters.push({ release: releaseWaiter, priority })
+    nativeMediaWaiters.sort((left, right) => nativeMediaPriorityRank[left.priority] - nativeMediaPriorityRank[right.priority])
+  })
+}
+
+function releaseNativeMediaSlot(): void {
+  activeNativeMediaRequests = Math.max(0, activeNativeMediaRequests - 1)
+  const next = nativeMediaWaiters.shift()
+  if (next) next.release()
+}
 
 interface CachedMedia {
   objectUrl: string
@@ -33,7 +69,7 @@ function evictOldest(): void {
   }
 }
 
-async function fetchNativePrivateMedia(source: string, signal: AbortSignal, cacheResult: boolean): Promise<{ objectUrl: string; cached: boolean }> {
+async function fetchNativePrivateMedia(source: string, signal: AbortSignal, cacheResult: boolean, priority: NativeMediaPriority): Promise<{ objectUrl: string; cached: boolean }> {
   if (cacheResult) {
     const existing = cache.get(source)
     if (existing) {
@@ -45,18 +81,23 @@ async function fetchNativePrivateMedia(source: string, signal: AbortSignal, cach
   }
 
   const request = (async () => {
-    const response = await fetch(source, {
-      method: 'GET',
-      credentials: 'include',
-      signal,
-      headers: {
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-Private-Archive-Native': nativePlatform() ?? 'ios',
-      },
-    })
-    if (!response.ok) throw new Error(`PRIVATE_MEDIA_${response.status}`)
-    const blob = await response.blob()
-    return URL.createObjectURL(blob)
+    await acquireNativeMediaSlot(signal, priority)
+    try {
+      const response = await fetch(source, {
+        method: 'GET',
+        credentials: 'include',
+        signal,
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-Private-Archive-Native': nativePlatform() ?? 'ios',
+        },
+      })
+      if (!response.ok) throw new Error(`PRIVATE_MEDIA_${response.status}`)
+      const blob = await response.blob()
+      return URL.createObjectURL(blob)
+    } finally {
+      releaseNativeMediaSlot()
+    }
   })()
 
   if (cacheResult) inflight.set(source, request)
@@ -72,10 +113,11 @@ async function fetchNativePrivateMedia(source: string, signal: AbortSignal, cach
   }
 }
 
-export function usePrivateMediaUrl(source: string | null | undefined, options: { enabled?: boolean; cache?: boolean; retryKey?: number } = {}) {
+export function usePrivateMediaUrl(source: string | null | undefined, options: { enabled?: boolean; cache?: boolean; retryKey?: number; priority?: NativeMediaPriority } = {}) {
   const enabled = options.enabled ?? true
   const cacheResult = options.cache ?? true
   const retryKey = options.retryKey ?? 0
+  const priority = options.priority ?? 'normal'
   const nativePrivate = useMemo(() => isNativePrivateUrl(source), [source])
   const [state, setState] = useState<{ source: string | null; retryKey: number; url: string | null; failed: boolean; loading: boolean }>(() => ({
     source: source ?? null,
@@ -92,7 +134,7 @@ export function usePrivateMediaUrl(source: string | null | undefined, options: {
     const controller = new AbortController()
     let active = true
     let ownedObjectUrl: string | null = null
-    void fetchNativePrivateMedia(normalized, controller.signal, cacheResult).then(({ objectUrl, cached }) => {
+    void fetchNativePrivateMedia(normalized, controller.signal, cacheResult, priority).then(({ objectUrl, cached }) => {
       if (!active) {
         if (!cached) URL.revokeObjectURL(objectUrl)
         return
@@ -110,7 +152,7 @@ export function usePrivateMediaUrl(source: string | null | undefined, options: {
       controller.abort()
       if (ownedObjectUrl) URL.revokeObjectURL(ownedObjectUrl)
     }
-  }, [cacheResult, enabled, retryKey, source])
+  }, [cacheResult, enabled, priority, retryKey, source])
 
   const normalized = source ?? null
   if (!enabled || !normalized) return { url: null, failed: false, loading: false }

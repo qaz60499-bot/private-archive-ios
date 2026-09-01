@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import {
-  bulkPatchAssetFlags, bulkRestoreAssets, bulkSoftDeleteAssets, claimStorageObjectForPurge, claimUploadStarted, clearPreviewStored,
+  bulkDiscardUnstoredAssets, bulkPatchAssetFlags, bulkRestoreAssets, bulkSoftDeleteAssets, claimStorageObjectForPurge, claimUploadStarted, clearPreviewStored,
   createDeduplicatedLogicalAsset, createPendingAsset, createUploadJobForAsset, deleteLogicalAsset, getActiveAssetByContentHash,
   getAsset, getLatestUploadJobState, getTagsForAsset, listAssets, markAssetViewed, markPreviewStored, markPurgeFailure,
   markQueued, markReadyWithoutAnalysis, markStorageObjectDeleted, markStorageObjectDeleteFailed, markStored, markUploadFailed, patchAsset, restoreAsset,
@@ -614,6 +614,17 @@ assetsRoutes.post('/bulk-trash', async (context) => {
     scheduleUsageRefresh(context)
   }
   return context.json({ ok: true, deleted, telegramDeleted: false })
+})
+
+assetsRoutes.post('/bulk-discard-unstored', async (context) => {
+  const body = await context.req.json<{ ids?: unknown }>()
+  if (!Array.isArray(body.ids) || body.ids.length < 1 || body.ids.length > 90 || body.ids.some((id) => typeof id !== 'string' || id.length < 1 || id.length > 120)) {
+    return context.json({ error: 'INVALID_ASSET_IDS' }, 400)
+  }
+  if (await bulkPermissionDenied(context, body.ids as string[], 'delete')) return context.json({ error: 'APP_DELETE_NOT_ALLOWED' }, 403)
+  const discarded = await bulkDiscardUnstoredAssets(context.env.DB, body.ids as string[])
+  if (discarded) await logActivity(context.env.DB, { action: 'DELETE', detail: { count: discarded, bulk: true, reason: 'discard-unstored-upload' } })
+  return context.json({ ok: true, discarded })
 })
 
 assetsRoutes.post('/bulk-restore', async (context) => {

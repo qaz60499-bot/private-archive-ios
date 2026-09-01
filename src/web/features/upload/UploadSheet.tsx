@@ -9,7 +9,7 @@ import { isNativeApp, nativePlatform } from '../../lib/native-platform'
 import { summarizeUploadBatches, type UploadBatchSummary } from '../../lib/offline/batch'
 import { listLocalUploads, removeLocalUpload } from '../../lib/offline/store'
 import {
-  cancelLocalUpload, cancelUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload, resumeUploadBatch,
+  cancelLocalUpload, cancelUploadBatch, deleteUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload, resumeUploadBatch,
   retryFailedUploadBatch, subscribeUploadScheduler,
 } from '../../lib/offline/processor'
 import type { LocalUploadJob, StorageBackend } from '../../types'
@@ -55,6 +55,11 @@ function BatchSection({ batch, compact, reload }: { batch: UploadBatchSummary; c
       {batch.paused > 0 && <button type="button" onClick={async () => { await resumeUploadBatch(batch.id); await reload() }}><Play />继续全部</button>}
       {batch.failed > 0 && <button type="button" onClick={async () => { await retryFailedUploadBatch(batch.id); await reload() }}><RotateCcw />重试失败</button>}
       {unfinished > 0 && <button type="button" onClick={async () => { await cancelUploadBatch(batch.id); await reload() }}><XCircle />取消未完成</button>}
+      <button type="button" onClick={async () => {
+        if (!window.confirm('删除这个上传批次的本机记录？未完成任务会先取消；已经成功保存到图库的文件不会被删除。')) return
+        await deleteUploadBatch(batch.id)
+        await reload()
+      }}><Trash2 />删除批次</button>
     </div>
     <div className="upload-batch-jobs">{batch.jobs.slice(0, compact ? 8 : undefined).map((job) => <JobRow key={job.id} job={job} reload={reload} />)}</div>
     {compact && batch.jobs.length > 8 && <p className="batch-overflow-note">另有 {batch.jobs.length - 8} 项可在“上传队列”页面查看。</p>}

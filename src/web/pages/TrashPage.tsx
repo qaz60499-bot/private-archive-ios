@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Eye, FileText, Film, ImageOff, RotateCcw, Trash2 } from 'lucide-react'
+import { Eye, FileText, Film, ImageOff, LoaderCircle, RotateCcw, Trash2 } from 'lucide-react'
 import { EmptyState, ErrorState, PageIntro, SkeletonGrid } from '../components/States'
 import { useArchive } from '../context/ArchiveContext'
 import { assetKindLabel, assetSourceLabel, formatArchiveDate, formatBytes } from '../lib/asset-display'
@@ -18,14 +18,16 @@ function purgeLabel(asset: Asset): string {
 
 function TrashPreview({ asset, onOpen }: { asset: Asset; onOpen: () => void }) {
   const [failed, setFailed] = useState(false)
-  const privatePreview = usePrivateMediaUrl(asset.previewUrl, { enabled: asset.previewSupported && !failed })
-  const hasPreview = asset.previewSupported && Boolean(privatePreview.url) && !failed && !privatePreview.failed
+  const privatePreview = usePrivateMediaUrl(asset.previewUrl, { enabled: asset.previewSupported && !failed, priority: 'low' })
+  const previewFailed = !asset.previewSupported || failed || privatePreview.failed
+  const hasPreview = Boolean(privatePreview.url) && !previewFailed
+  const previewLoading = asset.previewSupported && !previewFailed && !privatePreview.url
   const Icon = asset.mediaType === 'video' ? Film : asset.mediaType === 'file' ? FileText : ImageOff
 
-  return <button className={`trash-preview-button${hasPreview ? '' : ' unavailable'}`} type="button" onClick={onOpen} aria-label={`查看 ${asset.originalName}`}>
+  return <button className={`trash-preview-button${previewFailed ? ' unavailable' : previewLoading ? ' loading' : ''}`} type="button" onClick={onOpen} aria-label={`查看 ${asset.originalName}`}>
     <span className="trash-preview">
       {hasPreview ? <img src={privatePreview.url ?? undefined} alt="" loading="lazy" decoding="async" onError={() => setFailed(true)} /> : null}
-      {!hasPreview ? <span className="trash-preview-fallback"><Icon /><b>{assetKindLabel(asset)}</b><small>预览不可用</small></span> : null}
+      {previewFailed ? <span className="trash-preview-fallback"><Icon /><b>{assetKindLabel(asset)}</b><small>预览不可用</small></span> : previewLoading ? <span className="trash-preview-fallback"><LoaderCircle className="spin" /><b>{assetKindLabel(asset)}</b><small>正在载入</small></span> : null}
       {asset.mediaType === 'video' && hasPreview ? <span className="trash-media-badge">VIDEO</span> : null}
     </span>
     <span className="trash-preview-open"><Eye />查看</span>

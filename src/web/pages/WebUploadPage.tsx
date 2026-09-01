@@ -10,7 +10,7 @@ import { api } from '../lib/api'
 import { summarizeImportErrors } from '../lib/import-error-summary'
 import { summarizeUploadBatches } from '../lib/offline/batch'
 import {
-  cancelLocalUpload, cancelUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload,
+  cancelLocalUpload, cancelUploadBatch, deleteUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload,
   resumeUploadBatch, retryFailedUploadBatch, subscribeUploadScheduler,
 } from '../lib/offline/processor'
 import { listLocalUploads, removeLocalUpload } from '../lib/offline/store'
@@ -90,6 +90,11 @@ function WebUploadQueue() {
           {batch.paused > 0 ? <button type="button" onClick={async () => { await resumeUploadBatch(batch.id); await reload() }}><Play />继续批次</button> : null}
           {batch.failed > 0 ? <button type="button" onClick={async () => { await retryFailedUploadBatch(batch.id); await reload() }}><RotateCcw />重试失败</button> : null}
           {unfinished > 0 ? <button type="button" onClick={async () => { await cancelUploadBatch(batch.id); await reload() }}><XCircle />取消未完成</button> : null}
+          <button type="button" onClick={async () => {
+            if (!window.confirm('删除这个上传批次的本机记录？未完成任务会先取消；已经成功保存到图库的文件不会被删除。')) return
+            await deleteUploadBatch(batch.id)
+            await reload()
+          }}><Trash2 />删除批次</button>
         </div>
         <div className="web-queue-items">
           {batch.jobs.map((job) => <article className={`web-queue-item ${job.status}`} key={job.id}>
