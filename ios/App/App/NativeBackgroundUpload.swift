@@ -588,7 +588,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    private func restartReservation(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?) {
+    private func restartReservation(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, cookieOverride: String? = nil) {
         guard let retrying = stateQueue.sync(execute: { () -> NativeUploadRecord? in
             guard var value = records[record.id], value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused" else { return nil }
@@ -606,7 +606,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }) else { return }
         notify(retrying)
         do {
-            try scheduleReserve(retrying, earliest: delay > 0 ? Date().addingTimeInterval(delay) : nil)
+            try scheduleReserve(retrying, earliest: delay > 0 ? Date().addingTimeInterval(delay) : nil, cookieOverride: cookieOverride)
         } catch {
             if nativeUploadErrorCode(error) == 9 {
                 if let waiting = markAwaitingAuthIfActive(record.id) { notify(waiting) }
@@ -982,7 +982,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 
     private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, consumeAttempt: Bool = true, cookieOverride: String? = nil) {
         guard let assetId = record.remoteAssetId, let uploadToken = record.uploadToken else {
-            restartReservation(record, after: delay, reason: reason)
+            restartReservation(record, after: delay, reason: reason, cookieOverride: cookieOverride)
             return
         }
         let effectiveDelay = consumeAttempt ? retryBackoff(record, requested: delay) : max(0, delay)
@@ -1014,7 +1014,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             case 11:
                 if let waiting = markAwaitingAuthIfActive(record.id) { notify(waiting) }
             case 10:
-                restartReservation(retrying, after: 2, reason: error.localizedDescription)
+                restartReservation(retrying, after: 2, reason: error.localizedDescription, cookieOverride: cookieOverride)
             default:
                 if let failed = markFailedIfActive(record.id, error: error.localizedDescription) { notify(failed) }
             }
@@ -1364,7 +1364,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             // therefore means this reservation capability is no longer usable. Clear it
             // explicitly before asking for a fresh reservation; otherwise retryReserve's
             // valid-capability guard would keep replaying the poisoned token forever.
-            restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED")
+            restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED", cookieOverride: requestCookie)
             return
         }
         if status == 409 && code == "UPLOAD_ALREADY_IN_PROGRESS" {

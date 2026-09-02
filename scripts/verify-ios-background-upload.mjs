@@ -63,6 +63,8 @@ const retries = section('private func retryReserve(', 'private func complete(')
 assert(retries.includes('if record.remoteAssetId != nil, record.uploadToken != nil'), 'retryReserve must reuse an existing valid reservation instead of creating duplicates')
 assert(retries.includes('retryContent(reserved, after: delay'), 'existing reservation recovery must route back to content upload')
 assert(retries.includes('markAwaitingAuthIfActive'), 'cold-launch auth gaps must stay recoverable during retry')
+assert(source.includes('private func restartReservation(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, cookieOverride: String? = nil)'), 'reservation restart helpers must accept the persisted background-task cookie')
+assert(source.includes('scheduleReserve(retrying, earliest: delay > 0 ? Date().addingTimeInterval(delay) : nil, cookieOverride: cookieOverride)'), 'reservation restart must forward the background-task cookie')
 
 const completion = section('private func complete(', 'private func cleanupFiles(')
 assert(completion.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'completion must not overwrite paused/failed jobs')
@@ -75,7 +77,7 @@ assert(finishJob.includes('self.nativeUploadErrorCode(error) == 9'), 'finishJob 
 
 const taskCompletion = section('func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)', 'func urlSessionDidFinishEvents')
 assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'background callbacks must recover using the cookie persisted on the URLSession task')
-assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response)'), 'expired content capability must explicitly clear and recreate reservation state')
+assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED", cookieOverride: requestCookie)'), 'expired content capability must explicitly clear and recreate reservation state using the persisted task cookie')
 assert(!taskCompletion.includes('markFailedIfActive(id, error: code ?? "APP_AUTH_REQUIRED")'), 'APP_AUTH_REQUIRED must never be terminal in a cold background callback')
 
 const pauseAndCancel = section('func pauseJob(', 'func resumeJob(')
