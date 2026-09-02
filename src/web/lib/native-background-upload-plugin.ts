@@ -3,6 +3,7 @@ import type { LocalUploadJob, LocalUploadStage, LocalUploadStatus, MediaType } f
 
 export interface NativeBackgroundUploadJob {
   id: string
+  batchId?: string
   fileName: string
   mimeType: string
   sizeBytes: number
@@ -21,6 +22,7 @@ export interface NativeBackgroundUploadJob {
 interface NativeBackgroundUploadPlugin {
   createJob(options: {
     id: string
+    batchId?: string
     fileName: string
     mimeType: string
     sizeBytes: number
@@ -43,7 +45,9 @@ interface NativeBackgroundUploadPlugin {
   }): Promise<void>
   cancelJob(options: { id: string }): Promise<void>
   removeJob(options: { id: string }): Promise<void>
+  pickPhotos(options: { batchId: string }): Promise<{ batchId: string; count: number }>
   addListener(eventName: 'stateChanged', listener: (event: { job: NativeBackgroundUploadJob }) => void): Promise<PluginListenerHandle>
+  addListener(eventName: 'pickerError', listener: (event: { batchId: string; jobId?: string; message: string }) => void): Promise<PluginListenerHandle>
 }
 
 export const NativeBackgroundUpload = registerPlugin<NativeBackgroundUploadPlugin>('NativeBackgroundUpload')

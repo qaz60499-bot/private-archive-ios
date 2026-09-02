@@ -33,6 +33,13 @@ assert(recovery.includes('record.remoteAssetId = nil'), 'failed-cache recovery m
 assert(recovery.includes('record.uploadToken = nil'), 'failed-cache recovery must discard stale upload token')
 assert(!recovery.includes('cleanupFiles('), 'failed-cache recovery must never release original bytes')
 
+const pickedPhoto = section('func importPickedPhoto(', 'func appendChunk(')
+assert(!pickedPhoto.includes('workerQueue.async'), 'PHPicker temporary files must be copied before loadFileRepresentation returns')
+assert(pickedPhoto.includes('copyItem(at: sourceURL, to: destination)'), 'native photo picker must copy the selected original into app-owned durable storage')
+assert(source.includes('PHPickerViewControllerDelegate'), 'native photo selection must use PHPicker rather than the WebView file input')
+assert(source.includes('picker.dismiss(animated: true)'), 'system photo picker must dismiss immediately after the user confirms selection')
+assert(source.includes('CAPPluginMethod(name: "pickPhotos"'), 'native picker must be exposed through the Capacitor bridge')
+
 const resume = section('func resumeJob(', 'func cancelJob(')
 assert(resume.includes('已从本机缓存重建上传记录'), 'manual retry must reconstruct a missing native index from durable cache')
 assert(resume.includes('value.remoteAssetId = nil') && resume.includes('value.uploadToken = nil'), 'manual retry must force a fresh reservation after failure')

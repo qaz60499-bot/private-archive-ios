@@ -7,6 +7,7 @@ import {
   getLocalUploadFile,
   listLocalUploads,
   registerNativeLocalUpload,
+  registerNativeLocalUploadMirror,
   releaseLocalUploadPayload,
   updateLocalUpload,
 } from './offline/store'
@@ -31,7 +32,30 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
-  const local = await getLocalUpload(job.id)
+  let local = await getLocalUpload(job.id)
+  if (!local && job.batchId) {
+    try {
+      local = await registerNativeLocalUploadMirror({
+        id: job.id,
+        batchId: job.batchId,
+        fileName: job.fileName,
+        mimeType: job.mimeType,
+        sizeBytes: job.sizeBytes,
+        mediaType: job.mediaType,
+        status: job.status,
+        stage: job.stage,
+        progress: job.progress,
+        attempts: job.attempts,
+        error: job.error,
+        remoteAssetId: job.remoteAssetId,
+        deduplicated: job.deduplicated,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+      })
+    } catch {
+      return
+    }
+  }
   if (!local?.nativeBackground) return
   await updateLocalUpload(job.id, {
     status: job.status,
@@ -50,7 +74,7 @@ async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
   // duplicate bytes. This makes force-quit recovery independent of a transient picker
   // File handle while avoiding permanent double storage.
   if (job.status === 'done') await releaseLocalUploadPayload(job.id)
-  globalThis.dispatchEvent(new Event('private-archive:native-upload-state'))
+  globalThis.dispatchEvent(new CustomEvent('private-archive:native-upload-state', { detail: { batchId: job.batchId ?? local.batchId, jobId: job.id } }))
 }
 
 export async function beginIosBackgroundUploadStaging(): Promise<void> {
@@ -65,11 +89,13 @@ export async function endIosBackgroundUploadStaging(): Promise<void> {
 
 async function stageNativeOriginal(options: {
   id: string
+  batchId?: string
   file: File
   mediaType: MediaType
 }): Promise<NativeBackgroundUploadJob> {
   await NativeBackgroundUpload.createJob({
     id: options.id,
+    batchId: options.batchId,
     fileName: options.file.name,
     mimeType: options.file.type || 'application/octet-stream',
     sizeBytes: options.file.size,
@@ -91,6 +117,11 @@ async function stageNativeOriginal(options: {
   return result.job
 }
 
+export async function pickIosBackgroundPhotos(batchId: string): Promise<{ batchId: string; count: number }> {
+  if (!canUseIosBackgroundUpload('telegram_bot')) throw new Error('NATIVE_BACKGROUND_UPLOAD_UNAVAILABLE')
+  return NativeBackgroundUpload.pickPhotos({ batchId })
+}
+
 export async function enqueueIosBackgroundUpload(options: {
   file: File
   batchId: string
@@ -104,7 +135,7 @@ export async function enqueueIosBackgroundUpload(options: {
   // durable fallback is what lets startup rebuild the native .upload file automatically.
   await registerNativeLocalUpload({ id, batchId: options.batchId, file: options.file, mediaType: options.mediaType, storageBackend: options.storageBackend })
   try {
-    await stageNativeOriginal({ id, file: options.file, mediaType: options.mediaType })
+    await stageNativeOriginal({ id, batchId: options.batchId, file: options.file, mediaType: options.mediaType })
   } catch (error) {
     // Never translate an automatic staging/reservation error into cancelJob: cancelJob
     // intentionally destroys the native original. Preserve both recovery copies so a
@@ -128,7 +159,7 @@ async function restageFromDurableFallback(job: LocalUploadJob): Promise<boolean>
   // of an incomplete native staging file, not a user cancellation. The Web-side copy
   // remains intact while the native cache is rebuilt under the same job id.
   await NativeBackgroundUpload.removeJob({ id: job.id }).catch(() => undefined)
-  await stageNativeOriginal({ id: job.id, file, mediaType: job.mediaType })
+  await stageNativeOriginal({ id: job.id, batchId: job.batchId, file, mediaType: job.mediaType })
   return true
 }
 
@@ -189,6 +220,9 @@ export async function initializeIosBackgroundUploadSync(): Promise<void> {
   listenerReady = true
   try {
     await NativeBackgroundUpload.addListener('stateChanged', ({ job }) => { void mirrorNativeJob(job) })
+    await NativeBackgroundUpload.addListener('pickerError', ({ batchId, jobId, message }) => {
+      globalThis.dispatchEvent(new CustomEvent('private-archive:native-picker-error', { detail: { batchId, jobId, message } }))
+    })
   } catch {
     listenerReady = false
   }

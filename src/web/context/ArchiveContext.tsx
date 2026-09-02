@@ -2,6 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api } from '../lib/api'
 import { summarizeImportErrors } from '../lib/import-error-summary'
 import { importFiles, type ImportFilesResult } from '../lib/import-files'
+import { pickIosBackgroundPhotos } from '../lib/native-background-upload'
+import { getLocalUploadsByBatch } from '../lib/offline/store'
 import { clearAccessReauthGuard, isAccessSignInRequired, requestAccessReauth } from '../lib/access-session'
 import type { Asset, StorageBackend } from '../types'
 
@@ -61,6 +63,7 @@ interface ArchiveContextValue {
   online: boolean
   importStatus: ImportStatus | null
   runImport: (files: FileList | File[], options?: { mobile?: boolean; storageBackend?: StorageBackend }) => Promise<ImportFilesResult | undefined>
+  runNativePhotoImport: () => Promise<{ batchId: string; count: number } | undefined>
   dismissImportStatus: () => void
   load: (options?: LoadOptions) => Promise<void>
   loadMore: () => Promise<void>
@@ -109,6 +112,7 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null)
   const currentImportBatchRef = useRef<string | null>(null)
   const dismissedImportBatchesRef = useRef<Set<string>>(new Set())
+  const nativePickerMissingJobsRef = useRef<Map<string, Set<string>>>(new Map())
   const [lastOptions, setLastOptions] = useState<LoadOptions>({})
   const [hasLoadedMore, setHasLoadedMore] = useState(false)
   const prefetchedNextRef = useRef<{ cursor: string; result: Awaited<ReturnType<typeof api.listAssets>> } | null>(null)
@@ -258,6 +262,42 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
+  const runNativePhotoImport = useCallback(async () => {
+    const batchId = crypto.randomUUID()
+    currentImportBatchRef.current = batchId
+    dismissedImportBatchesRef.current.delete(batchId)
+    nativePickerMissingJobsRef.current.delete(batchId)
+    setUploadOpen(false)
+    setImportStatus({ batchId, active: true, total: 0, queued: 0, processed: 0, phase: 'registering', error: null })
+    try {
+      const result = await pickIosBackgroundPhotos(batchId)
+      if (!result.count) {
+        if (currentImportBatchRef.current === batchId) currentImportBatchRef.current = null
+        setImportStatus((current) => current?.batchId === batchId ? null : current)
+        return result
+      }
+      const jobs = await getLocalUploadsByBatch(batchId)
+      const processed = Math.min(result.count, jobs.length)
+      const complete = processed >= result.count
+      setImportStatus((current) => current?.batchId === batchId ? {
+        batchId,
+        active: !complete,
+        total: result.count,
+        queued: jobs.length,
+        processed,
+        phase: complete ? 'complete' : 'registering',
+        error: current.error,
+      } : current)
+      return result
+    } catch (caught) {
+      setImportStatus((current) => current?.batchId === batchId ? {
+        batchId, active: false, total: current.total, queued: current.queued, processed: current.processed,
+        phase: 'complete', error: caught instanceof Error ? caught.message : '无法打开系统照片选择器。',
+      } : current)
+      return undefined
+    }
+  }, [])
+
   const runImport = useCallback(async (files: FileList | File[], options?: { mobile?: boolean; storageBackend?: StorageBackend }) => {
     const selected = Array.from(files)
     if (!selected.length) return undefined
@@ -306,6 +346,60 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
+    const refreshNativeBatch = async (batchId: string) => {
+      if (currentImportBatchRef.current !== batchId || dismissedImportBatchesRef.current.has(batchId)) return
+      const jobs = await getLocalUploadsByBatch(batchId)
+      const missing = nativePickerMissingJobsRef.current.get(batchId)
+      if (missing) {
+        for (const job of jobs) missing.delete(job.id)
+        if (!missing.size) nativePickerMissingJobsRef.current.delete(batchId)
+      }
+      setImportStatus((current) => {
+        if (!current || current.batchId !== batchId) return current
+        const missingCount = nativePickerMissingJobsRef.current.get(batchId)?.size ?? 0
+        const processed = current.total > 0 ? Math.min(current.total, jobs.length + missingCount) : jobs.length + missingCount
+        const complete = current.total > 0 && processed >= current.total
+        return {
+          ...current,
+          active: !complete,
+          queued: jobs.length,
+          processed,
+          phase: complete ? 'complete' : 'registering',
+        }
+      })
+    }
+    const onNativeState = (event: Event) => {
+      const detail = (event as CustomEvent<{ batchId?: string }>).detail
+      if (detail?.batchId) void refreshNativeBatch(detail.batchId)
+    }
+    const onNativePickerError = (event: Event) => {
+      const detail = (event as CustomEvent<{ batchId?: string; jobId?: string; message?: string }>).detail
+      if (!detail?.batchId || currentImportBatchRef.current !== detail.batchId) return
+      void (async () => {
+        if (detail.jobId) {
+          const jobs = await getLocalUploadsByBatch(detail.batchId as string)
+          if (!jobs.some((job) => job.id === detail.jobId)) {
+            const missing = nativePickerMissingJobsRef.current.get(detail.batchId as string) ?? new Set<string>()
+            missing.add(detail.jobId)
+            nativePickerMissingJobsRef.current.set(detail.batchId as string, missing)
+          }
+        }
+        setImportStatus((current) => {
+          if (!current || current.batchId !== detail.batchId) return current
+          return { ...current, error: detail.message ?? '部分照片无法读取。' }
+        })
+        await refreshNativeBatch(detail.batchId as string)
+      })()
+    }
+    window.addEventListener('private-archive:native-upload-state', onNativeState)
+    window.addEventListener('private-archive:native-picker-error', onNativePickerError)
+    return () => {
+      window.removeEventListener('private-archive:native-upload-state', onNativeState)
+      window.removeEventListener('private-archive:native-picker-error', onNativePickerError)
+    }
+  }, [])
+
+  useEffect(() => {
     const onOnline = () => {
       setOnline(true)
       void syncLatest()
@@ -334,10 +428,10 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
   }, [loading, loadingMore, syncLatest])
 
   const value = useMemo<ArchiveContextValue>(() => ({
-    assets, loading, loadingMore, nextCursor, error, viewerAsset, uploadOpen, online, importStatus, runImport, dismissImportStatus,
+    assets, loading, loadingMore, nextCursor, error, viewerAsset, uploadOpen, online, importStatus, runImport, runNativePhotoImport, dismissImportStatus,
     load, loadMore, refresh, toggleFavorite, setAssetCategory, trashAsset,
     openViewer: setViewerAsset, closeViewer: () => setViewerAsset(null), setUploadOpen,
-  }), [assets, loading, loadingMore, nextCursor, error, viewerAsset, uploadOpen, online, importStatus, runImport, dismissImportStatus, load, loadMore, refresh, toggleFavorite, setAssetCategory, trashAsset])
+  }), [assets, loading, loadingMore, nextCursor, error, viewerAsset, uploadOpen, online, importStatus, runImport, runNativePhotoImport, dismissImportStatus, load, loadMore, refresh, toggleFavorite, setAssetCategory, trashAsset])
 
   return <ArchiveContext.Provider value={value}>{children}</ArchiveContext.Provider>
 }

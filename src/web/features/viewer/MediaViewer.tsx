@@ -134,13 +134,20 @@ function ViewerPhoto({ asset, stageRef, transform }: { asset: Asset; stageRef: R
 
 function ViewerVideo({ asset }: { asset: Asset }) {
   const native = isNativeApp()
-  const nativeVideo = usePrivateMediaUrl(asset.mediaUrl, { enabled: native && asset.originalAvailableInApp && Boolean(asset.mediaUrl), cache: false, priority: 'high' })
+  const [directFailedAssetId, setDirectFailedAssetId] = useState<string | null>(null)
+  const directFailed = directFailedAssetId === asset.id
+  // Let WKWebView/AVFoundation stream the authenticated HTTPS resource directly first.
+  // This preserves HTTP Range semantics and avoids waiting for JS to fetch the entire
+  // video into a Blob before playback can even begin. If a native cookie/header edge
+  // case rejects the direct request, fall back to the explicit authenticated fetch.
+  const directSource = native && asset.originalAvailableInApp && asset.mediaUrl && !directFailed ? asset.mediaUrl : null
+  const nativeVideo = usePrivateMediaUrl(asset.mediaUrl, { enabled: native && directFailed && asset.originalAvailableInApp && Boolean(asset.mediaUrl), cache: false, priority: 'high' })
   const nativePoster = usePrivateMediaUrl(asset.previewUrl, { enabled: native && asset.previewSupported, priority: 'high' })
-  const source = native ? nativeVideo.url : (asset.mediaUrl ?? asset.previewUrl)
+  const source = native ? directSource ?? nativeVideo.url : (asset.mediaUrl ?? asset.previewUrl)
   const poster = native ? nativePoster.url ?? undefined : asset.previewUrl
-  if (native && nativeVideo.failed) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>视频读取失败</strong><span>请检查网络后重试。</span></div>
+  if (native && directFailed && nativeVideo.failed) return <div className="viewer-preview-unavailable" role="status"><ImageOff /><strong>视频读取失败</strong><span>请检查网络后重试。</span></div>
   if (!source) return <div className="viewer-preview-unavailable" role="status"><strong>正在加载</strong><span>正在安全读取私有视频。</span></div>
-  return <video src={source} poster={poster} controls autoPlay={false} />
+  return <video src={source} poster={poster} controls autoPlay={false} playsInline preload="metadata" onError={() => { if (native && !directFailed) setDirectFailedAssetId(asset.id) }} />
 }
 
 interface GestureState {

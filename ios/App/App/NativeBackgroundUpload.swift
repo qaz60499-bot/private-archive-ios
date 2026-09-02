@@ -4,11 +4,15 @@ import Capacitor
 import CryptoKit
 import ImageIO
 import AVFoundation
+import Photos
+import PhotosUI
+import UniformTypeIdentifiers
 
 private let nativeUploadChanged = Notification.Name("PrivateArchiveNativeBackgroundUploadChanged")
 
 struct NativeUploadRecord: Codable {
     var id: String
+    var batchId: String?
     var fileName: String
     var mimeType: String
     var sizeBytes: Int64
@@ -207,10 +211,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if changed { saveStateLocked() }
     }
 
-    func createJob(id: String, fileName: String, mimeType: String, sizeBytes: Int64, mediaType: String, lastModifiedMs: Double?) throws {
+    func createJob(id: String, batchId: String? = nil, fileName: String, mimeType: String, sizeBytes: Int64, mediaType: String, lastModifiedMs: Double?) throws {
         guard UUID(uuidString: id) != nil, sizeBytes >= 0, ["photo", "video", "file"].contains(mediaType) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 1, userInfo: [NSLocalizedDescriptionKey: "INVALID_JOB"])
         }
+        var created: NativeUploadRecord?
         try stateQueue.sync {
             guard records[id] == nil, !fileManager.fileExists(atPath: originalURL(id).path) else {
                 throw NSError(domain: "NativeBackgroundUpload", code: 14, userInfo: [NSLocalizedDescriptionKey: "JOB_ALREADY_HAS_LOCAL_CACHE"])
@@ -220,14 +225,51 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             }
             let timestamp = now()
             stagingHashers[id] = SHA256()
-            records[id] = NativeUploadRecord(
-                id: id, fileName: fileName, mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
+            let record = NativeUploadRecord(
+                id: id, batchId: batchId, fileName: fileName, mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: lastModifiedMs,
                 status: "waiting", stage: "registered", progress: 0, attempts: 0, error: nil,
                 remoteAssetId: nil, uploadToken: nil, contentHash: nil, deduplicated: nil, contentTaskToken: nil, ready: false,
                 createdAt: timestamp, updatedAt: timestamp
             )
+            records[id] = record
+            created = record
             saveStateLocked()
+        }
+        if let created { notify(created) }
+    }
+
+    func importPickedPhoto(id: String, batchId: String, sourceURL: URL, fileName: String, mimeType: String, lastModifiedMs: Double?, completion: @escaping (Result<NativeUploadRecord, Error>) -> Void) {
+        // loadFileRepresentation only guarantees that sourceURL is valid for the
+        // duration of its completion callback. Copy into our app-owned durable cache
+        // synchronously before returning from that callback; hashing/reservation can
+        // continue asynchronously afterward.
+        do {
+            let sizeBytes = try fileSize(sourceURL)
+            guard sizeBytes >= 0, sizeBytes <= 20 * 1024 * 1024 else {
+                throw NSError(domain: "NativeBackgroundUpload", code: 15, userInfo: [NSLocalizedDescriptionKey: "照片超过 Bot 20MB 上传限制。"])
+            }
+            try createJob(
+                id: id, batchId: batchId, fileName: fileName, mimeType: mimeType,
+                sizeBytes: sizeBytes, mediaType: "photo", lastModifiedMs: lastModifiedMs
+            )
+            let destination = originalURL(id)
+            try fileManager.removeItem(at: destination)
+            try fileManager.copyItem(at: sourceURL, to: destination)
+            stateQueue.sync { stagingHashers.removeValue(forKey: id) }
+            finishJob(id: id, completion: completion)
+        } catch {
+            let failed = stateQueue.sync { () -> NativeUploadRecord? in
+                guard var record = records[id], record.status != "done" else { return nil }
+                record.status = "failed"
+                record.error = error.localizedDescription
+                record.updatedAt = now()
+                records[id] = record
+                saveStateLocked()
+                return record
+            }
+            if let failed { notify(failed) }
+            completion(.failure(error))
         }
     }
 
@@ -362,7 +404,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             }
             let timestamp = now()
             let rebuilt = NativeUploadRecord(
-                id: id, fileName: fileName, mimeType: mimeType?.isEmpty == false ? mimeType! : "application/octet-stream",
+                id: id, batchId: nil, fileName: fileName, mimeType: mimeType?.isEmpty == false ? mimeType! : "application/octet-stream",
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: nil,
                 status: "failed", stage: "reserving", progress: 15, attempts: 0, error: "已从本机缓存重建上传记录。",
                 remoteAssetId: nil, uploadToken: nil, contentHash: contentHash ?? (try? sha256(url: url)), deduplicated: nil, contentTaskToken: nil, ready: true,
@@ -1394,7 +1436,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 }
 
 @objc(NativeBackgroundUploadPlugin)
-public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
+public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPickerViewControllerDelegate {
     public let identifier = "NativeBackgroundUploadPlugin"
     public let jsName = "NativeBackgroundUpload"
     public let pluginMethods: [CAPPluginMethod] = [
@@ -1407,10 +1449,13 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "pauseJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "resumeJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "cancelJob", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "removeJob", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "removeJob", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "pickPhotos", returnType: CAPPluginReturnPromise)
     ]
 
     private var observer: NSObjectProtocol?
+    private var photoPickerCall: CAPPluginCall?
+    private var photoPickerBatchId: String?
 
     @objc override public func load() {
         _ = NativeBackgroundUploadManager.shared
@@ -1424,6 +1469,88 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 
+    @objc func pickPhotos(_ call: CAPPluginCall) {
+        guard photoPickerCall == nil else { return call.reject("PHOTO_PICKER_ALREADY_OPEN") }
+        guard let batchId = call.getString("batchId"), UUID(uuidString: batchId) != nil else {
+            return call.reject("INVALID_BATCH")
+        }
+        var configuration = PHPickerConfiguration(photoLibrary: PHPhotoLibrary.shared())
+        configuration.filter = .images
+        configuration.selectionLimit = 0
+        configuration.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: configuration)
+        picker.delegate = self
+        photoPickerCall = call
+        photoPickerBatchId = batchId
+        DispatchQueue.main.async {
+            guard let viewController = self.bridge?.viewController else {
+                self.photoPickerCall = nil
+                self.photoPickerBatchId = nil
+                call.reject("PHOTO_PICKER_UNAVAILABLE")
+                return
+            }
+            viewController.present(picker, animated: true)
+        }
+    }
+
+    public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        let call = photoPickerCall
+        let batchId = photoPickerBatchId
+        photoPickerCall = nil
+        photoPickerBatchId = nil
+        picker.dismiss(animated: true)
+        guard let call, let batchId else { return }
+        call.resolve(["batchId": batchId, "count": results.count])
+        guard !results.isEmpty else { return }
+
+        NativeBackgroundUploadManager.shared.beginStagingProtection()
+        let group = DispatchGroup()
+        for result in results {
+            let provider = result.itemProvider
+            let jobId = UUID().uuidString
+            let typeIdentifier = provider.registeredTypeIdentifiers.first(where: {
+                guard let type = UTType($0) else { return false }
+                return type.conforms(to: .image)
+            }) ?? UTType.image.identifier
+            group.enter()
+            provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
+                guard let url else {
+                    self.notifyListeners("pickerError", data: [
+                        "batchId": batchId,
+                        "jobId": jobId,
+                        "message": error?.localizedDescription ?? "无法读取所选照片。"
+                    ], retainUntilConsumed: true)
+                    group.leave()
+                    return
+                }
+                let type = UTType(typeIdentifier)
+                var fileName = provider.suggestedName ?? url.lastPathComponent
+                if (fileName as NSString).pathExtension.isEmpty, let ext = type?.preferredFilenameExtension {
+                    fileName += ".\(ext)"
+                }
+                let mimeType = type?.preferredMIMEType ?? "image/jpeg"
+                let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? nil
+                let lastModifiedMs = modified.map { $0.timeIntervalSince1970 * 1000 }
+                NativeBackgroundUploadManager.shared.importPickedPhoto(
+                    id: jobId, batchId: batchId, sourceURL: url, fileName: fileName,
+                    mimeType: mimeType, lastModifiedMs: lastModifiedMs
+                ) { result in
+                    if case .failure(let importError) = result {
+                        self.notifyListeners("pickerError", data: [
+                            "batchId": batchId,
+                            "jobId": jobId,
+                            "message": importError.localizedDescription
+                        ], retainUntilConsumed: true)
+                    }
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main) {
+            NativeBackgroundUploadManager.shared.endStagingProtection()
+        }
+    }
+
     @objc func createJob(_ call: CAPPluginCall) {
         guard let id = call.getString("id"), let fileName = call.getString("fileName"),
               let size = call.getInt("sizeBytes"), let mediaType = call.getString("mediaType") else {
@@ -1431,7 +1558,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         do {
             try NativeBackgroundUploadManager.shared.createJob(
-                id: id, fileName: fileName, mimeType: call.getString("mimeType") ?? "application/octet-stream",
+                id: id, batchId: call.getString("batchId"), fileName: fileName, mimeType: call.getString("mimeType") ?? "application/octet-stream",
                 sizeBytes: Int64(size), mediaType: mediaType, lastModifiedMs: call.getDouble("lastModifiedMs")
             )
             call.resolve()

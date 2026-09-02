@@ -205,6 +205,61 @@ export async function registerNativeLocalUpload(options: {
   return job
 }
 
+export async function registerNativeLocalUploadMirror(options: {
+  id: string
+  batchId: string
+  fileName: string
+  mimeType: string
+  sizeBytes: number
+  mediaType: LocalUploadJob['mediaType']
+  status: LocalUploadJob['status']
+  stage: LocalUploadJob['stage']
+  progress: number
+  attempts: number
+  error?: string
+  remoteAssetId?: string
+  deduplicated?: boolean
+  createdAt: string
+  updatedAt: string
+}): Promise<LocalUploadJob> {
+  if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
+  const existing = await (await dbPromise).get('uploads', options.id)
+  if (existing) return normalizeLocalUpload(existing)
+  const job: LocalUploadJob = {
+    id: options.id,
+    schemaVersion: 2,
+    batchId: options.batchId,
+    principalId: activePrincipalId,
+    fileName: options.fileName,
+    mimeType: options.mimeType || 'application/octet-stream',
+    sizeBytes: options.sizeBytes,
+    mediaType: options.mediaType,
+    storageBackend: 'telegram_bot',
+    status: options.status,
+    prepareStatus: options.status === 'failed' ? 'failed' : 'ready',
+    controlState: 'active',
+    stage: options.stage,
+    progress: Math.max(0, Math.min(100, Math.round(options.progress))),
+    attempts: options.attempts,
+    error: options.error,
+    remoteAssetId: options.remoteAssetId,
+    deduplicated: options.deduplicated,
+    createdAt: options.createdAt,
+    updatedAt: options.updatedAt,
+    nativeBackground: true,
+    metadata: {
+      originalName: options.fileName,
+      mimeType: options.mimeType || 'application/octet-stream',
+      sizeBytes: options.sizeBytes,
+      mediaType: options.mediaType,
+      storageBackend: 'telegram_bot',
+      importOrigin: 'ios-background',
+    },
+  }
+  await (await dbPromise).put('uploads', job)
+  return job
+}
+
 export async function enqueueLocalUpload(options: {
   file: File
   batchId: string

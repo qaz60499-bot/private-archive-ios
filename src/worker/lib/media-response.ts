@@ -16,6 +16,23 @@ export function isSafeInlineMediaType(value: string | null | undefined): boolean
   return SAFE_INLINE_IMAGE_TYPES.has(mimeType) || mimeType.startsWith('video/') || mimeType.startsWith('audio/')
 }
 
+export function resolveOriginalMediaMimeType(options: {
+  fileName: string
+  upstreamMimeType?: string | null
+  storedMimeType?: string | null
+}): string {
+  const lowerName = options.fileName.toLowerCase()
+  if (lowerName.endsWith('.mov')) return 'video/quicktime'
+  if (lowerName.endsWith('.m4v')) return 'video/mp4'
+  if (lowerName.endsWith('.mp4')) return 'video/mp4'
+  if (lowerName.endsWith('.webm')) return 'video/webm'
+  const upstream = baseMimeType(options.upstreamMimeType)
+  if (isSafeInlineMediaType(upstream)) return upstream
+  const stored = baseMimeType(options.storedMimeType)
+  if (isSafeInlineMediaType(stored)) return stored
+  return stored || upstream || 'application/octet-stream'
+}
+
 export function applySafeMediaHeaders(headers: Headers, options: {
   fileName: string
   mimeType: string | null | undefined

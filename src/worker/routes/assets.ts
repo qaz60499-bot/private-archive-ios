@@ -19,7 +19,7 @@ import { toPublicAsset } from '../domain/types'
 import type { Env } from '../env'
 import { isMockMode } from '../env'
 import { createUploadToken } from '../lib/crypto'
-import { applySafeMediaHeaders, isSafeInlineMediaType } from '../lib/media-response'
+import { applySafeMediaHeaders, isSafeInlineMediaType, resolveOriginalMediaMimeType } from '../lib/media-response'
 import { requireAccount, resolveRequestAppUser } from '../lib/security'
 import { readBoundedJsonObject } from '../lib/request-json'
 import { canAppUserAccessAsset, canAppUserAccessAssets, canAppUserAccessSource } from '../db/app-user-access-repository'
@@ -615,12 +615,17 @@ assetsRoutes.get('/:id/media', async (context) => {
   }
 
   const response = await (await storageFor(context.env, asset.source_id)).fetchFile(asset.storage_file_id, range ? { headers: { Range: range } } : undefined)
+  const responseMimeType = resolveOriginalMediaMimeType({
+    fileName: asset.original_name,
+    upstreamMimeType: response.headers.get('Content-Type'),
+    storedMimeType: asset.mime_type,
+  })
   const headers = applySafeMediaHeaders(new Headers({
     'Cache-Control': browserCacheControl,
     'X-Private-Archive-Upstream': 'telegram',
   }), {
     fileName: asset.original_name,
-    mimeType: response.headers.get('Content-Type') ?? asset.mime_type,
+    mimeType: responseMimeType,
   })
   for (const name of ['Content-Range', 'Content-Length', 'Accept-Ranges', 'ETag', 'Last-Modified']) {
     const value = response.headers.get(name)
