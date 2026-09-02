@@ -96,6 +96,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         _ = rootDirectory
         loadState()
         recoverInterruptedStaging()
+        recoverRetryableFailures()
         _ = session
         reconcileTasks()
     }
@@ -161,6 +162,29 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 record.error = "本机缓存尚未完整写入，请重新选择这个文件。"
                 try? fileManager.removeItem(at: url)
             }
+            record.updatedAt = timestamp
+            records[id] = record
+            changed = true
+        }
+        if changed { saveStateLocked() }
+    }
+
+    private func recoverRetryableFailures() {
+        var changed = false
+        let timestamp = now()
+        for (id, var record) in records where record.ready && record.status == "failed" {
+            guard fileManager.fileExists(atPath: originalURL(id).path) else { continue }
+            let reason = record.error ?? ""
+            let retryable = reason.contains("重试次数过多")
+                || reason.contains("UPLOAD_ALREADY_IN_PROGRESS")
+                || reason.contains("STORAGE_OBJECT_DELETE_IN_PROGRESS")
+                || reason.contains("STALE_UPLOAD_ATTEMPT")
+                || reason.contains("TELEGRAM_TIMEOUT")
+                || reason.contains("STORAGE_UPLOAD_FAILED")
+            guard retryable else { continue }
+            record.status = "retrying"
+            record.attempts = 0
+            record.error = "检测到上次未完成的后台上传，正在自动恢复。"
             record.updatedAt = timestamp
             records[id] = record
             changed = true
@@ -568,14 +592,15 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let task = session.uploadTask(with: request, fromFile: originalURL(record.id))
         task.taskDescription = "content|\(record.id)"
         task.earliestBeginDate = earliest
+        let delayed = earliest.map { $0 > Date() } ?? false
         if let updated = mutate(record.id, { value in
-            value.status = "uploading"
+            value.status = delayed ? "retrying" : "uploading"
             value.stage = "original"
             // Recreated upload tasks resend the HTTP body from byte zero. Reset the
             // visible transfer portion so a retry does not appear frozen at an old
             // value such as 91% while it silently catches back up.
             value.progress = 32
-            value.error = nil
+            value.error = delayed ? record.error : nil
         }) { notify(updated) }
         task.resume()
     }
@@ -688,42 +713,43 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return code == "DUPLICATE_UPLOAD_IN_PROGRESS" || code == "UPLOAD_ALREADY_IN_PROGRESS"
     }
 
+    private func retryBackoff(_ record: NativeUploadRecord, requested delay: TimeInterval) -> TimeInterval {
+        let exponent = min(5, max(0, record.attempts - 1))
+        let automatic = min(60.0, 3.0 * pow(2.0, Double(exponent)))
+        return max(delay, automatic)
+    }
+
     private func retryReserve(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?) {
-        guard record.attempts < 24 else {
-            if let failed = mutate(record.id, { value in value.status = "failed"; value.error = reason ?? "后台上传重试次数过多。" }) { notify(failed) }
-            return
-        }
-        do { try scheduleReserve(record, earliest: Date().addingTimeInterval(delay)) }
+        let effectiveDelay = retryBackoff(record, requested: delay)
+        do { try scheduleReserve(record, earliest: Date().addingTimeInterval(effectiveDelay)) }
         catch {
             if let failed = mutate(record.id, { value in value.status = "failed"; value.error = error.localizedDescription }) { notify(failed) }
         }
     }
 
-    private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?) {
+    private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, consumeAttempt: Bool = true) {
         guard record.remoteAssetId != nil, record.uploadToken != nil else {
             retryReserve(record, after: delay, reason: reason)
             return
         }
-        guard record.attempts < 24 else {
-            if let failed = mutate(record.id, { value in value.status = "failed"; value.error = reason ?? "后台上传重试次数过多，请点击重试继续。" }) { notify(failed) }
-            return
-        }
-        if let retrying = mutate(record.id, { value in
+        let effectiveDelay = consumeAttempt ? retryBackoff(record, requested: delay) : max(0, delay)
+        guard let retrying = mutate(record.id, { value in
             value.status = "retrying"
             value.stage = "original"
             value.progress = 32
-            value.attempts += 1
+            if consumeAttempt { value.attempts += 1 }
             value.error = reason ?? "正在重新连接后台上传。"
-        }) { notify(retrying) }
-        workerQueue.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
-            guard let self,
-                  let current = self.stateQueue.sync(execute: { self.records[record.id] }),
-                  current.ready,
-                  current.status != "done",
-                  current.status != "failed",
-                  current.status != "paused" else { return }
-            do { try self.scheduleContent(current, earliest: nil) }
-            catch { self.retryReserve(current, after: 2, reason: error.localizedDescription) }
+        }) else { return }
+        notify(retrying)
+
+        // Schedule the retry on the background URLSession immediately. A DispatchQueue
+        // timer is suspended with the app and was the reason a retry scheduled after a
+        // 409/timeout could remain dead until the next foreground launch. earliestBeginDate
+        // is owned by the system and survives normal app suspension/termination.
+        do {
+            try scheduleContent(retrying, earliest: effectiveDelay > 0 ? Date().addingTimeInterval(effectiveDelay) : nil)
+        } catch {
+            retryReserve(retrying, after: 2, reason: error.localizedDescription)
         }
     }
 
@@ -772,6 +798,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 guard let id = self.taskJobId(task), let record = recordsById[id],
                       record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { continue }
                 if task.state == .suspended { task.resume() }
+                if let earliest = task.earliestBeginDate, earliest > Date() {
+                    // This task is intentionally waiting for a server Retry-After or
+                    // transport backoff. Do not let the foreground stale-task watchdog
+                    // cancel a healthy system-scheduled retry before its lease expires.
+                    continue
+                }
 
                 // A task can survive in URLSession as nominally running after the
                 // transport has stopped making progress. When the app is relaunched or
@@ -855,6 +887,18 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
         if status == 401 {
             retryReserve(record, after: retryDelay(response), reason: code)
+            return
+        }
+        if status == 409 && code == "UPLOAD_ALREADY_IN_PROGRESS" {
+            retryContent(record, after: max(20, retryDelay(response)), reason: code, consumeAttempt: false)
+            return
+        }
+        if status == 409 && code == "STORAGE_OBJECT_DELETE_IN_PROGRESS" {
+            retryContent(record, after: max(20, retryDelay(response)), reason: code, consumeAttempt: false)
+            return
+        }
+        if status == 409 && code == "STALE_UPLOAD_ATTEMPT" {
+            retryContent(record, after: max(5, retryDelay(response)), reason: code, consumeAttempt: false)
             return
         }
         if shouldRetry(status: status, code: code) || status == 0 {

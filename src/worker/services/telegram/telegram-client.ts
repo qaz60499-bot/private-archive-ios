@@ -17,10 +17,11 @@ export class TelegramApiError extends Error {
 }
 
 const TELEGRAM_REQUEST_TIMEOUT_MS = 180_000
+const TELEGRAM_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000
 
-async function telegramFetch(url: string, init: RequestInit): Promise<Response> {
+async function telegramFetch(url: string, init: RequestInit, timeoutMs = TELEGRAM_REQUEST_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), TELEGRAM_REQUEST_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     return await fetch(url, { ...init, signal: controller.signal })
   } catch (error) {
@@ -95,7 +96,7 @@ export class TelegramStorageAdapter implements StorageAdapter {
       method: 'POST',
       headers: { 'Content-Type': multipart.contentType },
       body: multipart.body,
-    })
+    }, TELEGRAM_UPLOAD_TIMEOUT_MS)
     const data = await response.json<TelegramResponse<TelegramMessage>>()
     if (!response.ok || !data.ok || !data.result) {
       throw new TelegramApiError(response.status, options.method, data.parameters?.retry_after, data.description)

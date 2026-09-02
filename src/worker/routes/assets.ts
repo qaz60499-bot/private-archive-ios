@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import {
   bulkDiscardUnstoredAssets, bulkPatchAssetFlags, bulkRestoreAssets, bulkSoftDeleteAssets, claimStorageObjectForPurge, claimUploadStarted, clearPreviewStored,
   createDeduplicatedLogicalAsset, createPendingAsset, createUploadJobForAsset, deleteLogicalAsset, getActiveAssetByContentHash,
-  getAsset, getLatestUploadJobState, getTagsForAsset, listAssets, markAssetViewed, markPreviewStored, markPurgeFailure,
+  getAsset, getLatestUploadJobState, getTagsForAsset, listAssets, markAssetViewed, markPreviewStored, markPurgeFailure, repairAssetFromActiveStorageObject,
   markQueued, markReadyWithoutAnalysis, markStorageObjectDeleted, markStorageObjectDeleteFailed, markStored, markUploadFailed, patchAsset, restoreAsset,
   setManualTags, setManualTagsForAssets, softDeleteAsset, verifyUploadToken,
 } from '../db/assets-repository'
@@ -13,6 +13,7 @@ import { LEGACY_TELEGRAM_SOURCE_ID, resolveTelegramSourceConfig } from '../db/te
 import { getDiscoverModule } from '../db/discover-modules-repository'
 import { getTelegramUserGroupRuntime } from '../db/user-group-storage-repository'
 import { MAX_UPLOAD_BYTES, USER_GROUP_CLIENT_SAFETY_MAX_BYTES, UPLOAD_TOKEN_TTL_MS, getSizeTier, hasUnsafeControlCharacters, selectTakenAt, validateReserveInput } from '../domain/policy'
+import { activeUploadRetryAfterSeconds, botUploadLeaseMs } from '../domain/upload-retry'
 import { sanitizeLogicalPath } from '../domain/asset-metadata'
 import { toPublicAsset } from '../domain/types'
 import type { Env } from '../env'
@@ -139,6 +140,17 @@ assetsRoutes.post('/reserve', async (context) => {
     const sizeTier = getSizeTier(input.sizeBytes, input.storageBackend)
     const maxUploadBytes = input.storageBackend === 'telegram_user_group' ? USER_GROUP_CLIENT_SAFETY_MAX_BYTES : MAX_UPLOAD_BYTES
     const reserveExisting = async (existing: NonNullable<Awaited<ReturnType<typeof getActiveAssetByContentHash>>>) => {
+      if (!existing.storage_file_id && input.importOrigin === 'ios-background') {
+        const repaired = await repairAssetFromActiveStorageObject(context.env.DB, existing.id)
+        if (repaired) {
+          await enqueueIfReady(context.env, existing.id)
+          scheduleUsageRefresh(context)
+          return context.json({
+            assetId: existing.id, duplicate: true, duplicateOfAssetId: existing.id, reusedStorage: true, recoveredOrphanedStorage: true,
+            storageBackend: input.storageBackend, sizeTier, maxUploadBytes,
+          }, 200)
+        }
+      }
       if (existing.storage_file_id) {
         if (!existing.storage_object_id) throw new Error('DEDUP_STORAGE_OBJECT_MISSING')
         if (existing.size_bytes !== input.sizeBytes) return context.json({ error: 'CONTENT_HASH_SIZE_MISMATCH' }, 409)
@@ -232,17 +244,29 @@ assetsRoutes.put('/:id/content', async (context) => {
     return context.json({ error: 'CONTENT_LENGTH_MISMATCH' }, 400)
   }
   if (!context.req.raw.body) return context.json({ error: 'EMPTY_UPLOAD_BODY' }, 400)
+  if (asset.import_origin === 'ios-background' && await repairAssetFromActiveStorageObject(context.env.DB, assetId)) {
+    await enqueueIfReady(context.env, assetId)
+    scheduleUsageRefresh(context)
+    const repaired = await getAsset(context.env.DB, assetId)
+    return context.json({
+      asset: repaired ? toPublicAsset(repaired, undefined, { allowDownload: await canAppUserAccessAsset(context.env.DB, user, assetId, 'download') }) : null,
+      alreadyStored: true,
+      recoveredOrphanedStorage: true,
+      previewAvailable: Boolean(repaired?.preview_file_id),
+    }, 200)
+  }
   // iOS can tear down a background transfer after the request has already claimed the
   // upload row (for example after a force-quit). Without a stale lease takeover the next
   // launch retries forever with UPLOAD_ALREADY_IN_PROGRESS. Keep the lease size-aware so
   // genuinely slow larger uploads get more time before another attempt can reclaim it.
-  const staleAfterMs = Math.max(180_000, Math.min(10 * 60_000, Math.ceil(asset.size_bytes / (64 * 1024)) * 1000 + 60_000))
+  const staleAfterMs = botUploadLeaseMs(asset.size_bytes)
   const uploadAttempt = await claimUploadStarted(context.env.DB, assetId, uploadToken, staleAfterMs)
   if (!uploadAttempt) {
     if (!(await verifyUploadToken(context.env.DB, assetId, uploadToken))) {
       return context.json({ error: 'UPLOAD_TOKEN_INVALID_OR_EXPIRED' }, 401)
     }
-    context.header('Retry-After', '1')
+    const latestJob = await getLatestUploadJobState(context.env.DB, assetId)
+    context.header('Retry-After', String(activeUploadRetryAfterSeconds(latestJob?.updated_at, staleAfterMs)))
     return context.json({ error: 'UPLOAD_ALREADY_IN_PROGRESS' }, 409)
   }
   try {
@@ -251,25 +275,30 @@ assetsRoutes.put('/:id/content', async (context) => {
       await storage.deleteMessage(asset.preview_message_id)
       await clearPreviewStored(context.env.DB, assetId)
     }
-    const stored = await storage.storeOriginal({
-      body: context.req.raw.body,
-      fileName: asset.original_name,
-      mimeType: asset.mime_type,
-      mediaType: asset.media_type,
-      sizeBytes: asset.size_bytes,
-      manifest: createStorageManifest(asset),
-    })
+    const stored = {
+      ...await storage.storeOriginal({
+        body: context.req.raw.body,
+        fileName: asset.original_name,
+        mimeType: asset.mime_type,
+        mediaType: asset.media_type,
+        sizeBytes: asset.size_bytes,
+        manifest: createStorageManifest(asset),
+      }),
+      // Preserve the reservation origin so successful native iOS uploads remain
+      // diagnosable as ios-background instead of being rewritten to generic "web".
+      importOrigin: asset.import_origin,
+    }
     const storedResult = await markStored(context.env.DB, assetId, stored, uploadAttempt)
     if (storedResult.discardStoredMessage) {
       try { await storage.deleteMessage(stored.messageId) } catch { /* best-effort duplicate/conflict cleanup */ }
     }
     if (!storedResult.attached) {
       if (storedResult.staleAttempt) {
-        context.header('Retry-After', '1')
+        context.header('Retry-After', '5')
         return context.json({ error: 'STALE_UPLOAD_ATTEMPT', recoverable: true }, 409)
       }
       await markUploadFailed(context.env.DB, assetId, 'STORAGE_OBJECT_DELETE_IN_PROGRESS', uploadAttempt)
-      context.header('Retry-After', '1')
+      context.header('Retry-After', '20')
       return context.json({ error: 'STORAGE_OBJECT_DELETE_IN_PROGRESS', recoverable: true }, 409)
     }
     await enqueueIfReady(context.env, assetId)

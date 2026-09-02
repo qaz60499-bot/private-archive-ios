@@ -94,6 +94,33 @@ export async function getStorageObjectStateByFileUniqueId(db: D1Database, fileUn
   return row ? { id: row.id, deleteState: row.delete_state } : null
 }
 
+export async function repairAssetFromActiveStorageObject(db: D1Database, assetId: string): Promise<boolean> {
+  const asset = await db.prepare(`SELECT source_id, storage_backend, content_hash, size_bytes, mime_type
+    FROM assets WHERE id = ? AND workspace_id = ? AND storage_object_id IS NULL AND storage_file_id IS NULL`)
+    .bind(assetId, PERSONAL_WORKSPACE_ID)
+    .first<{ source_id: string; storage_backend: AssetRow['storage_backend']; content_hash: string | null; size_bytes: number; mime_type: string }>()
+  if (!asset?.content_hash) return false
+
+  const object = await db.prepare(`SELECT id FROM storage_objects
+    WHERE workspace_id = ? AND source_id = ? AND storage_backend = ? AND content_hash = ?
+      AND size_bytes = ? AND mime_type = ? AND delete_state = 'active'
+    ORDER BY created_at DESC LIMIT 1`)
+    .bind(PERSONAL_WORKSPACE_ID, asset.source_id, asset.storage_backend, asset.content_hash, asset.size_bytes, asset.mime_type)
+    .first<{ id: string }>()
+  if (!object) return false
+
+  const now = new Date().toISOString()
+  const attached = await db.prepare(`UPDATE assets SET storage_object_id = ?, status = 'stored', updated_at = ?
+    WHERE id = ? AND workspace_id = ? AND storage_object_id IS NULL AND storage_file_id IS NULL`)
+    .bind(object.id, now, assetId, PERSONAL_WORKSPACE_ID).run()
+  if (attached.meta.changes === 0) return false
+
+  await db.prepare(`UPDATE upload_jobs SET status = 'done', last_error = NULL, updated_at = ?
+    WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)`)
+    .bind(now, assetId).run()
+  return true
+}
+
 export async function createDeduplicatedLogicalAsset(db: D1Database, params: {
   id: string
   existing: AssetRow
