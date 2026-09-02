@@ -52,7 +52,14 @@ assert(completion.includes('value.status != "done", value.status != "failed", va
 assert(completion.includes('value.contentTaskToken = nil'), 'successful completion must release the content-task generation token')
 
 const finishJob = section('func finishJob(', 'func listJobs()')
+assert(finishJob.includes('if value.status == "failed" || value.status == "done"'), 'finishJob must not resurrect a canceled/completed job')
 assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'finishJob must preserve pause state while hashing/staging completes')
+
+const pauseAndCancel = section('func pauseJob(', 'func resumeJob(')
+assert(pauseAndCancel.includes('value.status != "done", value.status != "failed"'), 'pause must not overwrite a terminal state')
+const cancel = section('func cancelJob(', 'func removeJob(')
+assert(cancel.includes('guard var value = records[id], value.status != "done"'), 'cancel must not overwrite a completed upload')
+assert(cancel.indexOf('value.status = "failed"') < cancel.indexOf('performOnTasks(id: id, action: { $0.cancel() })'), 'cancel state must be serialized before task cancellation callbacks')
 
 const destructiveOriginalDeletes = [...source.matchAll(/removeItem\(at: originalURL\(id\)\)/g)]
 assert(destructiveOriginalDeletes.length === 1, `cached original has ${destructiveOriginalDeletes.length} direct deletion sites; expected cleanupFiles only`)

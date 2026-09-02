@@ -281,11 +281,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 }
                 let transition = self.stateQueue.sync { () -> (NativeUploadRecord, Bool)? in
                     guard var value = self.records[id] else { return nil }
+                    if value.status == "failed" || value.status == "done" { return (value, false) }
                     value.contentHash = hash
                     value.ready = true
                     value.contentTaskToken = nil
                     value.progress = max(value.progress, 15)
-                    let shouldSchedule = value.status != "paused" && value.status != "failed" && value.status != "done"
+                    let shouldSchedule = value.status != "paused"
                     if shouldSchedule {
                         value.status = "uploading"
                         value.stage = "reserving"
@@ -303,7 +304,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 completion(.success(updated))
             } catch {
                 let failed = self.stateQueue.sync { () -> NativeUploadRecord? in
-                    guard var value = self.records[id], value.status != "paused", value.status != "done" else { return nil }
+                    guard var value = self.records[id],
+                          value.status != "paused", value.status != "done", value.status != "failed" else { return nil }
                     value.status = "failed"
                     value.error = error.localizedDescription
                     value.updatedAt = self.now()
@@ -322,11 +324,18 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func pauseJob(id: String) {
-        performOnTasks(id: id, action: { $0.suspend() })
-        if let record = mutate(id, { value in
+        let paused = stateQueue.sync { () -> NativeUploadRecord? in
+            guard var value = records[id], value.status != "done", value.status != "failed" else { return nil }
             value.status = "paused"
             value.error = "已暂停，后台原件仍安全保存在本机。"
-        }) { notify(record) }
+            value.updatedAt = now()
+            records[id] = value
+            saveStateLocked()
+            return value
+        }
+        guard let paused else { return }
+        notify(paused)
+        performOnTasks(id: id, action: { $0.suspend() })
     }
 
     func resumeJob(id: String, fileName: String?, mimeType: String?, sizeBytes: Int64?, mediaType: String?, contentHash: String?) throws {
@@ -419,18 +428,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func cancelJob(id: String) {
-        performOnTasks(id: id, action: { $0.cancel() })
-        stateQueue.sync {
+        let canceled = stateQueue.sync { () -> NativeUploadRecord? in
+            guard var value = records[id], value.status != "done" else { return nil }
             stagingHashers.removeValue(forKey: id)
             reserveTaskTokens.removeValue(forKey: id)
-        }
-        DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
-        if let record = mutate(id, { value in
             value.status = "failed"
             value.error = "已取消，本机临时原件已释放。"
             value.contentTaskToken = nil
             value.ready = false
-        }) { notify(record) }
+            value.updatedAt = now()
+            records[id] = value
+            saveStateLocked()
+            return value
+        }
+        guard let canceled else { return }
+        notify(canceled)
+        performOnTasks(id: id, action: { $0.cancel() })
+        DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
         cleanupFiles(id)
     }
 
