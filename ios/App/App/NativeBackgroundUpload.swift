@@ -51,6 +51,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private var responseBuffers: [String: Data] = [:]
     private var backgroundCompletionHandlers: [String: () -> Void] = [:]
     private var foregroundWatchdogGeneration = 0
+    private var reconcileInFlight = false
+    private var reconcilePending = false
     private var stagingProtectionDepth = 0
     private var stagingBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -979,12 +981,40 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     private func reconcileTasks() {
+        let shouldStart = stateQueue.sync { () -> Bool in
+            if reconcileInFlight {
+                reconcilePending = true
+                return false
+            }
+            reconcileInFlight = true
+            return true
+        }
+        guard shouldStart else { return }
+        performReconcileTasks()
+    }
+
+    private func finishReconcileTasks() {
+        let rerun = stateQueue.sync { () -> Bool in
+            if reconcilePending {
+                reconcilePending = false
+                return true
+            }
+            reconcileInFlight = false
+            return false
+        }
+        if rerun { performReconcileTasks() }
+    }
+
+    private func performReconcileTasks() {
+        // Capture records before asking URLSession for its task snapshots. This prevents
+        // a task created during getAllTasks from being mistaken for an orphan whose
+        // persisted owner token should be reclaimed.
+        let recordsById = stateQueue.sync { records }
         reserveSession.getAllTasks { dedicatedReserveTasks in
             self.session.getAllTasks { legacyAndContentTasks in
                 let legacyReserveTasks = legacyAndContentTasks.filter { self.taskStage($0) == "reserve" }
                 let reserveTasks = dedicatedReserveTasks + legacyReserveTasks
                 let contentTasks = legacyAndContentTasks.filter { self.taskStage($0) == "content" }
-                let recordsById = self.stateQueue.sync { self.records }
 
                 var activeReserveIds = Set<String>()
                 for task in reserveTasks {
@@ -1088,6 +1118,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     var changed = false
                     for (id, snapshot) in recordsById where !validContentIds.contains(id) {
                         guard let snapshotToken = snapshot.contentTaskToken,
+                              let snapshotUpdatedAt = ISO8601DateFormatter().date(from: snapshot.updatedAt),
+                              Date().timeIntervalSince(snapshotUpdatedAt) >= 10,
                               var current = self.records[id],
                               current.contentTaskToken == snapshotToken else { continue }
                         current.contentTaskToken = nil
@@ -1113,6 +1145,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                         self.retryReserve(record, after: 0, reason: nil)
                     }
                 }
+                self.finishReconcileTasks()
             }
         }
     }
@@ -1210,7 +1243,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
         if status == 401 && code == "APP_AUTH_REQUIRED" {
-            if let failed = markFailedIfActive(id, error: code) { notify(failed) }
+            if let failed = markFailedIfActive(id, error: code ?? "APP_AUTH_REQUIRED") { notify(failed) }
             return
         }
         if status == 401 {

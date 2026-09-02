@@ -40,8 +40,11 @@ assert(reserve.includes('value.status != "done", value.status != "failed", value
 
 const reconcile = section('private func reconcileTasks()', 'func urlSession(_ session: URLSession, dataTask: URLSessionDataTask')
 assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks from stale reservations')
+assert(reconcile.includes('reconcileInFlight'), 'reconciliation must be serialized')
+assert(reconcile.indexOf('let recordsById = stateQueue.sync { records }') < reconcile.indexOf('reserveSession.getAllTasks'), 'record snapshot must precede URLSession task snapshots')
 assert(reconcile.includes('contentTaskToken'), 'reconcile must enforce one persisted content-task owner per job')
 assert(reconcile.includes('current.contentTaskToken == snapshotToken'), 'reconcile must reclaim an orphaned persisted content-task token when iOS lost the task')
+assert(reconcile.includes('Date().timeIntervalSince(snapshotUpdatedAt) >= 10'), 'orphan-token reclaim must not race a freshly created content task')
 assert(reconcile.includes('validContentIds'), 'reconcile must distinguish a valid content task from stale siblings')
 
 const completion = section('private func complete(', 'private func cleanupFiles(')
