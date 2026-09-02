@@ -36,6 +36,20 @@ assert(resume.includes('scheduleReserve(retrying, earliest: nil)'), 'manual retr
 const reserve = section('private func scheduleReserve(', 'private func handleReserveResult(')
 assert(reserve.includes('reserveSession.uploadTask'), 'reservation must be owned by the dedicated background session')
 assert(!reserve.includes('asyncAfter'), 'reservation retry must not depend on a suspended dispatch timer')
+assert(reserve.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'reserve scheduling must recheck active state before task resume')
+
+const reconcile = section('private func reconcileTasks()', 'func urlSession(_ session: URLSession, dataTask: URLSessionDataTask')
+assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks from stale reservations')
+assert(reconcile.includes('contentTaskToken'), 'reconcile must enforce one persisted content-task owner per job')
+assert(reconcile.includes('current.contentTaskToken == snapshotToken'), 'reconcile must reclaim an orphaned persisted content-task token when iOS lost the task')
+assert(reconcile.includes('validContentIds'), 'reconcile must distinguish a valid content task from stale siblings')
+
+const completion = section('private func complete(', 'private func cleanupFiles(')
+assert(completion.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'completion must not overwrite paused/failed jobs')
+assert(completion.includes('value.contentTaskToken = nil'), 'successful completion must release the content-task generation token')
+
+const finishJob = section('func finishJob(', 'func listJobs()')
+assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'finishJob must preserve pause state while hashing/staging completes')
 
 const destructiveOriginalDeletes = [...source.matchAll(/removeItem\(at: originalURL\(id\)\)/g)]
 assert(destructiveOriginalDeletes.length === 1, `cached original has ${destructiveOriginalDeletes.length} direct deletion sites; expected cleanupFiles only`)

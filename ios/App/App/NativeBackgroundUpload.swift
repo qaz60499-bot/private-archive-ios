@@ -23,6 +23,7 @@ struct NativeUploadRecord: Codable {
     var uploadToken: String?
     var contentHash: String?
     var deduplicated: Bool?
+    var contentTaskToken: String?
     var ready: Bool
     var createdAt: String
     var updatedAt: String
@@ -195,6 +196,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             record.attempts = 0
             record.remoteAssetId = nil
             record.uploadToken = nil
+            record.contentTaskToken = nil
             record.error = "检测到完整本机缓存，正在重新建立后台上传。"
             record.updatedAt = timestamp
             records[id] = record
@@ -220,7 +222,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 id: id, fileName: fileName, mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: lastModifiedMs,
                 status: "waiting", stage: "registered", progress: 0, attempts: 0, error: nil,
-                remoteAssetId: nil, uploadToken: nil, contentHash: nil, deduplicated: nil, ready: false,
+                remoteAssetId: nil, uploadToken: nil, contentHash: nil, deduplicated: nil, contentTaskToken: nil, ready: false,
                 createdAt: timestamp, updatedAt: timestamp
             )
             saveStateLocked()
@@ -275,21 +277,37 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     // turning a complete cached original into an unrecoverable failure.
                     return try self.sha256(url: self.originalURL(id))
                 }
-                let updated = self.mutate(id) { value in
+                let transition = self.stateQueue.sync { () -> (NativeUploadRecord, Bool)? in
+                    guard var value = self.records[id] else { return nil }
                     value.contentHash = hash
                     value.ready = true
-                    value.status = "uploading"
-                    value.stage = "reserving"
+                    value.contentTaskToken = nil
                     value.progress = max(value.progress, 15)
-                    value.error = nil
+                    let shouldSchedule = value.status != "paused" && value.status != "failed" && value.status != "done"
+                    if shouldSchedule {
+                        value.status = "uploading"
+                        value.stage = "reserving"
+                        value.error = nil
+                    }
+                    value.updatedAt = self.now()
+                    self.records[id] = value
+                    self.saveStateLocked()
+                    return (value, shouldSchedule)
                 }
-                guard let updated else { throw NSError(domain: "NativeBackgroundUpload", code: 7, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"]) }
-                try self.scheduleReserve(updated, earliest: nil)
+                guard let (updated, shouldSchedule) = transition else {
+                    throw NSError(domain: "NativeBackgroundUpload", code: 7, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"])
+                }
+                if shouldSchedule { try self.scheduleReserve(updated, earliest: nil) }
                 completion(.success(updated))
             } catch {
-                let failed = self.mutate(id) { value in
+                let failed = self.stateQueue.sync { () -> NativeUploadRecord? in
+                    guard var value = self.records[id], value.status != "paused", value.status != "done" else { return nil }
                     value.status = "failed"
                     value.error = error.localizedDescription
+                    value.updatedAt = self.now()
+                    self.records[id] = value
+                    self.saveStateLocked()
+                    return value
                 }
                 if let failed { self.notify(failed) }
                 completion(.failure(error))
@@ -330,7 +348,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 id: id, fileName: fileName, mimeType: mimeType?.isEmpty == false ? mimeType! : "application/octet-stream",
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: nil,
                 status: "failed", stage: "reserving", progress: 15, attempts: 0, error: "已从本机缓存重建上传记录。",
-                remoteAssetId: nil, uploadToken: nil, contentHash: contentHash ?? (try? sha256(url: url)), deduplicated: nil, ready: true,
+                remoteAssetId: nil, uploadToken: nil, contentHash: contentHash ?? (try? sha256(url: url)), deduplicated: nil, contentTaskToken: nil, ready: true,
                 createdAt: timestamp, updatedAt: timestamp
             )
             stateQueue.sync {
@@ -368,6 +386,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 value.attempts = 0
                 value.remoteAssetId = nil
                 value.uploadToken = nil
+                value.contentTaskToken = nil
                 value.error = "正在从本机缓存重新建立上传。"
             }) else { return }
             notify(retrying)
@@ -375,9 +394,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             performOnTasks(id: id, action: { $0.cancel() }) { _ in
                 do { try self.scheduleReserve(retrying, earliest: nil) }
                 catch {
-                    if let failed = self.mutate(id, { value in value.status = "failed"; value.error = error.localizedDescription }) {
-                        self.notify(failed)
-                    }
+                    if let failed = self.markFailedIfActive(id, error: error.localizedDescription) { self.notify(failed) }
                 }
             }
             return
@@ -409,6 +426,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if let record = mutate(id, { value in
             value.status = "failed"
             value.error = "已取消，本机临时原件已释放。"
+            value.contentTaskToken = nil
             value.ready = false
         }) { notify(record) }
         cleanupFiles(id)
@@ -510,6 +528,19 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
+    private func markFailedIfActive(_ id: String, error: String) -> NativeUploadRecord? {
+        stateQueue.sync {
+            guard var record = records[id], record.ready,
+                  record.status != "done", record.status != "failed", record.status != "paused" else { return nil }
+            record.status = "failed"
+            record.error = error
+            record.updatedAt = now()
+            records[id] = record
+            saveStateLocked()
+            return record
+        }
+    }
+
     private func dictionary(_ record: NativeUploadRecord) -> [String: Any] {
         guard let data = try? JSONEncoder().encode(record),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
@@ -521,6 +552,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         value.removeValue(forKey: "uploadToken")
         value.removeValue(forKey: "contentHash")
         value.removeValue(forKey: "ready")
+        value.removeValue(forKey: "contentTaskToken")
         value.removeValue(forKey: "lastModifiedMs")
         return value
     }
@@ -573,14 +605,31 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             task.taskDescription = "reserve|\(record.id)|\(reserveToken)"
             task.earliestBeginDate = earliest
             let delayed = earliest.map { $0 > Date() } ?? false
-            let updated = mutate(record.id) { value in
+            let updated = stateQueue.sync { () -> NativeUploadRecord? in
+                guard var value = records[record.id],
+                      value.ready,
+                      value.status != "done", value.status != "failed", value.status != "paused",
+                      reserveTaskTokens[record.id] == reserveToken,
+                      !(value.stage == "original" && value.remoteAssetId != nil && value.uploadToken != nil) else { return nil }
                 value.status = delayed || value.attempts > 0 ? "retrying" : "uploading"
                 value.stage = "reserving"
                 value.progress = max(value.progress, 18)
                 value.attempts += 1
-                value.error = delayed ? record.error : nil
+                value.error = delayed ? value.error : nil
+                value.updatedAt = now()
+                records[record.id] = value
+                saveStateLocked()
+                return value
             }
-            if let updated { notify(updated) }
+            guard let updated else {
+                stateQueue.sync {
+                    if reserveTaskTokens[record.id] == reserveToken { reserveTaskTokens.removeValue(forKey: record.id) }
+                }
+                task.cancel()
+                try? fileManager.removeItem(at: bodyURL)
+                return
+            }
+            notify(updated)
             task.resume()
         } catch {
             stateQueue.sync {
@@ -604,32 +653,49 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let code = responseErrorCode(data)
         if (200...299).contains(status), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if json["duplicate"] as? Bool == true {
-                if let assetId = json["assetId"] as? String { _ = mutate(record.id) { $0.remoteAssetId = assetId } }
-                complete(record, deduplicated: true)
+                let duplicateAssetId = json["assetId"] as? String
+                guard let duplicate = stateQueue.sync(execute: { () -> NativeUploadRecord? in
+                    guard var value = records[record.id], value.ready,
+                          value.status != "done", value.status != "failed", value.status != "paused",
+                          value.stage == "reserving" else { return nil }
+                    value.remoteAssetId = duplicateAssetId ?? value.remoteAssetId
+                    value.updatedAt = now()
+                    records[record.id] = value
+                    saveStateLocked()
+                    return value
+                }) else { return }
+                complete(duplicate, deduplicated: true)
                 return
             }
             guard let assetId = json["assetId"] as? String, let token = json["uploadToken"] as? String else {
                 retryReserve(record, after: 2, reason: "上传预约响应不完整。")
                 return
             }
-            guard let reserved = mutate(record.id, { value in
+            guard let reserved = stateQueue.sync(execute: { () -> NativeUploadRecord? in
+                guard var value = records[record.id], value.ready,
+                      value.status != "done", value.status != "failed", value.status != "paused",
+                      value.stage == "reserving" else { return nil }
                 value.remoteAssetId = assetId
                 value.uploadToken = token
                 value.progress = max(value.progress, 28)
+                value.updatedAt = now()
+                records[record.id] = value
+                saveStateLocked()
+                return value
             }) else { return }
             do { try scheduleContent(reserved, earliest: nil) }
             catch { retryReserve(reserved, after: 2, reason: error.localizedDescription) }
             return
         }
         if status == 401 || status == 403 {
-            if let failed = mutate(record.id, { value in value.status = "failed"; value.error = code ?? "APP_AUTH_REQUIRED" }) { notify(failed) }
+            if let failed = markFailedIfActive(record.id, error: code ?? "APP_AUTH_REQUIRED") { notify(failed) }
             return
         }
         if shouldRetry(status: status, code: code) || status == 0 {
             retryReserve(record, after: retryDelay(response), reason: code)
             return
         }
-        if let failed = mutate(record.id, { value in value.status = "failed"; value.error = code ?? "RESERVATION_FAILED" }) { notify(failed) }
+        if let failed = markFailedIfActive(record.id, error: code ?? "RESERVATION_FAILED") { notify(failed) }
     }
 
     private func scheduleContent(_ record: NativeUploadRecord, earliest: Date?) throws {
@@ -639,23 +705,39 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         guard let cookie = cookieHeader() else {
             throw NSError(domain: "NativeBackgroundUpload", code: 11, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
+        guard fileManager.fileExists(atPath: originalURL(record.id).path) else {
+            throw NSError(domain: "NativeBackgroundUpload", code: 8, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_MISSING"])
+        }
         var request = baseRequest(url: apiBase.appendingPathComponent("api/assets/\(assetId)/content"), method: "PUT", cookie: cookie)
         request.setValue(token, forHTTPHeaderField: "X-Upload-Token")
         request.setValue(record.mimeType, forHTTPHeaderField: "Content-Type")
         request.setValue(String(record.sizeBytes), forHTTPHeaderField: "Content-Length")
+        let contentTaskToken = UUID().uuidString
         let task = session.uploadTask(with: request, fromFile: originalURL(record.id))
-        task.taskDescription = "content|\(record.id)"
+        task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
         task.earliestBeginDate = earliest
         let delayed = earliest.map { $0 > Date() } ?? false
-        if let updated = mutate(record.id, { value in
+        let updated = stateQueue.sync { () -> NativeUploadRecord? in
+            guard var value = records[record.id],
+                  value.ready,
+                  value.status != "done", value.status != "failed", value.status != "paused",
+                  value.remoteAssetId == assetId, value.uploadToken == token,
+                  value.contentTaskToken == nil else { return nil }
+            value.contentTaskToken = contentTaskToken
             value.status = delayed ? "retrying" : "uploading"
             value.stage = "original"
-            // Recreated upload tasks resend the HTTP body from byte zero. Reset the
-            // visible transfer portion so a retry does not appear frozen at an old
-            // value such as 91% while it silently catches back up.
             value.progress = 32
-            value.error = delayed ? record.error : nil
-        }) { notify(updated) }
+            value.error = delayed ? value.error : nil
+            value.updatedAt = now()
+            records[record.id] = value
+            saveStateLocked()
+            return value
+        }
+        guard let updated else {
+            task.cancel()
+            return
+        }
+        notify(updated)
         task.resume()
     }
 
@@ -777,22 +859,30 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let effectiveDelay = retryBackoff(record, requested: delay)
         do { try scheduleReserve(record, earliest: Date().addingTimeInterval(effectiveDelay)) }
         catch {
-            if let failed = mutate(record.id, { value in value.status = "failed"; value.error = error.localizedDescription }) { notify(failed) }
+            if let failed = markFailedIfActive(record.id, error: error.localizedDescription) { notify(failed) }
         }
     }
 
     private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, consumeAttempt: Bool = true) {
-        guard record.remoteAssetId != nil, record.uploadToken != nil else {
+        guard let assetId = record.remoteAssetId, let uploadToken = record.uploadToken else {
             retryReserve(record, after: delay, reason: reason)
             return
         }
         let effectiveDelay = consumeAttempt ? retryBackoff(record, requested: delay) : max(0, delay)
-        guard let retrying = mutate(record.id, { value in
+        guard let retrying = stateQueue.sync(execute: { () -> NativeUploadRecord? in
+            guard var value = records[record.id], value.ready,
+                  value.status != "done", value.status != "failed", value.status != "paused",
+                  value.stage == "original",
+                  value.remoteAssetId == assetId, value.uploadToken == uploadToken,
+                  value.contentTaskToken == nil else { return nil }
             value.status = "retrying"
-            value.stage = "original"
             value.progress = 32
             if consumeAttempt { value.attempts += 1 }
             value.error = reason ?? "正在重新连接后台上传。"
+            value.updatedAt = now()
+            records[record.id] = value
+            saveStateLocked()
+            return value
         }) else { return }
         notify(retrying)
 
@@ -808,14 +898,28 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     private func complete(_ record: NativeUploadRecord, deduplicated: Bool) {
-        if let finished = mutate(record.id, { value in
+        let finished = stateQueue.sync { () -> NativeUploadRecord? in
+            guard var value = records[record.id], value.ready,
+                  value.status != "done", value.status != "failed", value.status != "paused" else { return nil }
+            if !deduplicated {
+                guard value.stage == "original",
+                      value.remoteAssetId == record.remoteAssetId,
+                      value.uploadToken == record.uploadToken else { return nil }
+            }
             value.status = "done"
             value.stage = "completed"
             value.progress = 100
             value.error = nil
             value.uploadToken = nil
+            value.contentTaskToken = nil
             value.deduplicated = deduplicated
-        }) { notify(finished) }
+            value.updatedAt = now()
+            records[record.id] = value
+            saveStateLocked()
+            return value
+        }
+        guard let finished else { return }
+        notify(finished)
         cleanupFiles(record.id)
     }
 
@@ -846,15 +950,18 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return parts.count == 3 ? parts[2] : nil
     }
 
-    private func contentTaskMatchesRecord(_ task: URLSessionTask, record: NativeUploadRecord) -> Bool {
+    private func contentRequestMatchesRecord(_ task: URLSessionTask, record: NativeUploadRecord) -> Bool {
         guard record.ready,
-              record.status != "done", record.status != "failed", record.status != "paused",
               record.stage == "original",
               let assetId = record.remoteAssetId,
               let uploadToken = record.uploadToken,
               task.originalRequest?.url?.path.contains("/api/assets/\(assetId)/content") == true,
               task.originalRequest?.value(forHTTPHeaderField: "X-Upload-Token") == uploadToken else { return false }
         return true
+    }
+
+    private func contentTaskIdentity(_ task: URLSessionTask) -> String {
+        taskToken(task) ?? "legacy:\(task.taskIdentifier)"
     }
 
     private func taskBufferKey(_ session: URLSession, task: URLSessionTask) -> String {
@@ -879,52 +986,120 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 let contentTasks = legacyAndContentTasks.filter { self.taskStage($0) == "content" }
                 let recordsById = self.stateQueue.sync { self.records }
 
-                let activeReserveIds = Set(reserveTasks.compactMap { task -> String? in
-                    guard let id = self.taskJobId(task), let record = recordsById[id],
-                          record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { return nil }
-                    // A reserve task only belongs to jobs still waiting for a fresh
-                    // reservation. If state already advanced to content, retire the
-                    // stale handshake rather than letting it overwrite a newer token.
-                    if record.stage == "original", record.remoteAssetId != nil, record.uploadToken != nil {
-                        task.cancel()
-                        return nil
-                    }
-                    if task.state == .suspended { task.resume() }
+                var activeReserveIds = Set<String>()
+                for task in reserveTasks {
+                    let taskId = self.taskJobId(task)
                     let token = self.taskToken(task) ?? "legacy:\(task.taskIdentifier)"
-                    self.stateQueue.sync {
-                        if self.reserveTaskTokens[id] == nil { self.reserveTaskTokens[id] = token }
+                    guard let id = taskId, let record = recordsById[id],
+                          record.ready, record.status != "done", record.status != "failed", record.status != "paused" else {
+                        if let id = taskId {
+                            self.stateQueue.sync {
+                                if self.reserveTaskTokens[id] == token { self.reserveTaskTokens.removeValue(forKey: id) }
+                            }
+                        }
+                        task.cancel()
+                        continue
                     }
-                    return id
-                })
-
-                var restartIds = Set<String>()
-                var restartReserveIds = Set<String>()
-                for task in contentTasks {
-                    guard let id = self.taskJobId(task), let record = recordsById[id],
-                          record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { continue }
-                    if record.stage != "original" || record.remoteAssetId == nil || record.uploadToken == nil {
-                        restartReserveIds.insert(id)
+                    if record.stage == "original", record.remoteAssetId != nil, record.uploadToken != nil {
+                        self.stateQueue.sync {
+                            if self.reserveTaskTokens[id] == token { self.reserveTaskTokens.removeValue(forKey: id) }
+                        }
+                        task.cancel()
+                        continue
+                    }
+                    let ownsReservation = self.stateQueue.sync { () -> Bool in
+                        if let current = self.reserveTaskTokens[id] { return current == token }
+                        self.reserveTaskTokens[id] = token
+                        return true
+                    }
+                    guard ownsReservation else {
                         task.cancel()
                         continue
                     }
                     if task.state == .suspended { task.resume() }
-                    if let earliest = task.earliestBeginDate, earliest > Date() { continue }
+                    activeReserveIds.insert(id)
+                }
+
+                var validContentIds = Set<String>()
+                var needsContentRestartIds = Set<String>()
+                for task in contentTasks {
+                    guard let id = self.taskJobId(task) else {
+                        task.cancel()
+                        continue
+                    }
+                    let taskIdentity = self.contentTaskIdentity(task)
+                    let ownership = self.stateQueue.sync { () -> (Bool, NativeUploadRecord?) in
+                        guard var current = self.records[id], current.ready,
+                              current.status != "done", current.status != "failed", current.status != "paused" else { return (false, nil) }
+                        guard self.contentRequestMatchesRecord(task, record: current) else {
+                            if current.contentTaskToken == taskIdentity {
+                                current.contentTaskToken = nil
+                                current.updatedAt = self.now()
+                                self.records[id] = current
+                                self.saveStateLocked()
+                            }
+                            return (false, current)
+                        }
+                        if let owner = current.contentTaskToken {
+                            return (owner == taskIdentity, current)
+                        }
+                        current.contentTaskToken = taskIdentity
+                        current.updatedAt = self.now()
+                        self.records[id] = current
+                        self.saveStateLocked()
+                        return (true, current)
+                    }
+                    guard ownership.0, let record = ownership.1 else {
+                        if let record = ownership.1, record.stage == "original", record.remoteAssetId != nil, record.uploadToken != nil {
+                            needsContentRestartIds.insert(id)
+                        }
+                        task.cancel()
+                        continue
+                    }
+                    if task.state == .suspended { task.resume() }
+                    if let earliest = task.earliestBeginDate, earliest > Date() {
+                        validContentIds.insert(id)
+                        continue
+                    }
 
                     let staleSeconds = max(120.0, min(360.0, Double(record.sizeBytes) / (128.0 * 1024.0) + 60.0))
                     let lastProgress = self.stateQueue.sync { self.lastProgressAt[id] } ?? ISO8601DateFormatter().date(from: record.updatedAt)
-                    if record.stage == "original",
-                       let updated = lastProgress,
-                       Date().timeIntervalSince(updated) > staleSeconds {
-                        restartIds.insert(id)
+                    if let updated = lastProgress, Date().timeIntervalSince(updated) > staleSeconds {
+                        self.stateQueue.sync {
+                            guard var current = self.records[id], current.contentTaskToken == taskIdentity else { return }
+                            current.contentTaskToken = nil
+                            current.updatedAt = self.now()
+                            self.records[id] = current
+                            self.saveStateLocked()
+                        }
+                        needsContentRestartIds.insert(id)
                         task.cancel()
+                    } else {
+                        validContentIds.insert(id)
                     }
                 }
 
-                let activeContentIds = Set(contentTasks.compactMap { task -> String? in
-                    guard let id = self.taskJobId(task), !restartIds.contains(id), !restartReserveIds.contains(id) else { return nil }
-                    return id
-                })
-                let activeIds = activeReserveIds.union(activeContentIds)
+                // contentTaskToken is persisted so an in-place relaunch can reject
+                // duplicate tasks. If iOS has already discarded the owned task, clear
+                // only the token observed in this reconciliation snapshot. A newly
+                // scheduled task racing this pass has a different/current token and is
+                // therefore never cleared here.
+                self.stateQueue.sync {
+                    var changed = false
+                    for (id, snapshot) in recordsById where !validContentIds.contains(id) {
+                        guard let snapshotToken = snapshot.contentTaskToken,
+                              var current = self.records[id],
+                              current.contentTaskToken == snapshotToken else { continue }
+                        current.contentTaskToken = nil
+                        current.updatedAt = self.now()
+                        self.records[id] = current
+                        changed = true
+                    }
+                    if changed { self.saveStateLocked() }
+                }
+
+                let restartIds = needsContentRestartIds.subtracting(validContentIds)
+                let activeIds = activeReserveIds.union(validContentIds)
                 let resumable = self.stateQueue.sync {
                     self.records.values.filter {
                         $0.ready && $0.status != "done" && $0.status != "failed" && $0.status != "paused" && !activeIds.contains($0.id)
@@ -948,18 +1123,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard taskStage(task) == "content", let id = taskJobId(task), totalBytesExpectedToSend > 0 else { return }
+        let taskIdentity = contentTaskIdentity(task)
         let ratio = min(1, max(0, Double(totalBytesSent) / Double(totalBytesExpectedToSend)))
         let nextProgress = 32 + ratio * 63
-        let shouldPersist = stateQueue.sync { () -> Bool in
+        let updated = stateQueue.sync { () -> NativeUploadRecord? in
+            guard var current = records[id],
+                  current.status != "done", current.status != "failed", current.status != "paused",
+                  current.contentTaskToken == taskIdentity,
+                  contentRequestMatchesRecord(task, record: current) else { return nil }
             lastProgressAt[id] = Date()
-            guard let current = records[id] else { return false }
-            // Persist coarse transfer milestones instead of rewriting the entire
-            // jobs.json for every 1%. With 90 photos, 1% updates caused thousands of
-            // full-state rewrites and made the uploader itself compete with networking.
-            return nextProgress >= 95 || nextProgress - current.progress >= 5
+            guard nextProgress >= 95 || nextProgress - current.progress >= 5 else { return nil }
+            current.progress = max(current.progress, nextProgress)
+            current.updatedAt = now()
+            records[id] = current
+            saveStateLocked()
+            return current
         }
-        guard shouldPersist else { return }
-        if let record = mutate(id, { value in value.progress = max(value.progress, nextProgress) }) { notify(record) }
+        if let updated { notify(updated) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -982,8 +1162,32 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
             guard reserveResultIsCurrent else { return }
         }
-        guard let record = stateQueue.sync(execute: { records[id] }) else { return }
-        if stage == "content", !contentTaskMatchesRecord(task, record: record) { return }
+        let record: NativeUploadRecord?
+        if stage == "content" {
+            let taskIdentity = contentTaskIdentity(task)
+            record = stateQueue.sync { () -> NativeUploadRecord? in
+                guard var current = records[id], contentRequestMatchesRecord(task, record: current) else { return nil }
+                if let owner = current.contentTaskToken {
+                    guard owner == taskIdentity else { return nil }
+                } else {
+                    // In-place upgrades can inherit a legacy content task whose old
+                    // taskDescription had no generation token. Claim that single task
+                    // before handling its terminal callback.
+                    current.contentTaskToken = taskIdentity
+                }
+                current.contentTaskToken = nil
+                current.updatedAt = now()
+                records[id] = current
+                saveStateLocked()
+                return current
+            }
+            guard let current = record,
+                  current.status != "done", current.status != "failed", current.status != "paused" else { return }
+        } else {
+            record = stateQueue.sync(execute: { records[id] })
+            guard record != nil else { return }
+        }
+        guard let record else { return }
         let response = task.response as? HTTPURLResponse
 
         if let error {
@@ -1006,7 +1210,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
         if status == 401 && code == "APP_AUTH_REQUIRED" {
-            if let failed = mutate(id, { value in value.status = "failed"; value.error = code }) { notify(failed) }
+            if let failed = markFailedIfActive(id, error: code) { notify(failed) }
             return
         }
         if status == 401 {
@@ -1029,7 +1233,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             retryContent(record, after: retryDelay(response), reason: code)
             return
         }
-        if let failed = mutate(id, { value in value.status = "failed"; value.error = code ?? "STORAGE_UPLOAD_FAILED" }) { notify(failed) }
+        if let failed = markFailedIfActive(id, error: code ?? "STORAGE_UPLOAD_FAILED") { notify(failed) }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
