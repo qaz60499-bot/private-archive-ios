@@ -26,6 +26,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run upload regression suite
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run test -- --run
+
       - name: Prepare Capacitor iOS project
         run: npm run ios:prepare
 
@@ -33,6 +39,21 @@ jobs:
         run: |
           xcodebuild -version
           xcodebuild -list -project ios/App/App.xcodeproj
+
+      - name: Analyze iOS upload implementation
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/AnalyzeData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            analyze
 
       - name: Build iPhone app without Apple signing
         run: |

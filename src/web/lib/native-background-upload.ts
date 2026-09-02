@@ -4,7 +4,7 @@ import { isNativeApp, nativePlatform } from './native-platform'
 import { NativeBackgroundUpload, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
 import { getLocalUpload, registerNativeLocalUpload, updateLocalUpload } from './offline/store'
 
-const NATIVE_CHUNK_BYTES = 1024 * 1024
+const NATIVE_CHUNK_BYTES = 2 * 1024 * 1024
 let listenerReady = false
 
 export function canUseIosBackgroundUpload(storageBackend: StorageBackend): boolean {
@@ -39,6 +39,16 @@ async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
     nextAttemptAt: undefined,
   })
   globalThis.dispatchEvent(new Event('private-archive:native-upload-state'))
+}
+
+export async function beginIosBackgroundUploadStaging(): Promise<void> {
+  if (!isNativeApp() || nativePlatform() !== 'ios') return
+  try { await NativeBackgroundUpload.beginStagingProtection() } catch { /* old native shell: continue without the grace period */ }
+}
+
+export async function endIosBackgroundUploadStaging(): Promise<void> {
+  if (!isNativeApp() || nativePlatform() !== 'ios') return
+  try { await NativeBackgroundUpload.endStagingProtection() } catch { /* old native shell */ }
 }
 
 export async function enqueueIosBackgroundUpload(options: {

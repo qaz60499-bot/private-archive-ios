@@ -29,6 +29,8 @@ interface NativeBackgroundUploadPlugin {
   }): Promise<void>
   appendChunk(options: { id: string; base64: string }): Promise<void>
   finishJob(options: { id: string }): Promise<{ job: NativeBackgroundUploadJob }>
+  beginStagingProtection(): Promise<void>
+  endStagingProtection(): Promise<void>
   listJobs(): Promise<{ items: NativeBackgroundUploadJob[] }>
   pauseJob(options: { id: string }): Promise<void>
   resumeJob(options: { id: string }): Promise<void>
@@ -40,13 +42,13 @@ interface NativeBackgroundUploadPlugin {
 export const NativeBackgroundUpload = registerPlugin<NativeBackgroundUploadPlugin>('NativeBackgroundUpload')
 
 export async function pauseNativeBackgroundTransfer(id: string): Promise<void> {
-  try { await NativeBackgroundUpload.pauseJob({ id }) } catch { /* web/unsupported fallback */ }
+  await NativeBackgroundUpload.pauseJob({ id })
 }
 
 export async function resumeNativeBackgroundTransfer(id: string): Promise<void> {
-  try { await NativeBackgroundUpload.resumeJob({ id }) } catch { /* web/unsupported fallback */ }
+  await NativeBackgroundUpload.resumeJob({ id })
 }
 
 export async function cancelNativeBackgroundTransfer(id: string): Promise<void> {
-  try { await NativeBackgroundUpload.cancelJob({ id }) } catch { /* web/unsupported fallback */ }
+  await NativeBackgroundUpload.cancelJob({ id })
 }

@@ -272,7 +272,18 @@ export async function pauseLocalUpload(id: string): Promise<void> {
 
 export async function resumeLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
-  if (job?.nativeBackground) await resumeNativeBackgroundTransfer(id)
+  if (job?.nativeBackground) {
+    try {
+      await resumeNativeBackgroundTransfer(id)
+    } catch (error) {
+      await updateLocalUpload(id, {
+        controlState: 'active', status: 'failed', nextAttemptAt: undefined,
+        error: error instanceof Error ? error.message : '后台上传无法恢复，请重新选择原文件。',
+      })
+      notify()
+      return
+    }
+  }
   await updateLocalUpload(id, {
     controlState: 'active', status: 'retrying', nextAttemptAt: undefined, error: undefined,
     prepareStatus: job?.prepareStatus === 'failed' ? 'pending' : job?.prepareStatus,
@@ -298,12 +309,12 @@ export async function pauseUploadBatch(batchId: string): Promise<void> {
 
 export async function resumeUploadBatch(batchId: string): Promise<void> {
   const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId && job.status !== 'done' && job.controlState !== 'canceled')
-  await Promise.all(jobs.map((job) => resumeLocalUpload(job.id)))
+  await Promise.allSettled(jobs.map((job) => resumeLocalUpload(job.id)))
 }
 
 export async function retryFailedUploadBatch(batchId: string): Promise<void> {
   const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId && job.status === 'failed' && job.controlState !== 'canceled')
-  await Promise.all(jobs.map((job) => resumeLocalUpload(job.id)))
+  await Promise.allSettled(jobs.map((job) => resumeLocalUpload(job.id)))
 }
 
 export async function cancelUploadBatch(batchId: string): Promise<void> {

@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import Capacitor
 import CryptoKit
 import ImageIO
@@ -42,8 +43,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return queue
     }()
     private var records: [String: NativeUploadRecord] = [:]
+    private var stagingHashers: [String: SHA256] = [:]
     private var responseBuffers: [Int: Data] = [:]
     private var backgroundCompletionHandler: (() -> Void)?
+    private var foregroundWatchdogGeneration = 0
+    private var stagingProtectionDepth = 0
+    private var stagingBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
@@ -131,18 +136,36 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     private func recoverInterruptedStaging() {
-        var changed: [NativeUploadRecord] = []
+        var changed = false
         let timestamp = now()
         for (id, var record) in records where !record.ready && record.status != "done" {
-            record.status = "failed"
-            record.stage = "registered"
-            record.error = "本机保存被中断，请重新选择这个文件。"
+            let url = originalURL(id)
+            let actualSize = (try? fileSize(url)) ?? -1
+            if actualSize == record.sizeBytes, actualSize >= 0,
+               let hash = try? sha256(url: url) {
+                // The process can be suspended after the final chunk reaches durable
+                // storage but before finishJob commits the ready flag. Recover that
+                // complete cache automatically instead of forcing the user to reselect.
+                record.contentHash = hash
+                record.ready = true
+                record.status = "retrying"
+                record.stage = "reserving"
+                record.progress = max(record.progress, 15)
+                record.error = "检测到完整本机缓存，正在恢复上传。"
+            } else {
+                // A partial WebView-to-native copy cannot be reconstructed after the
+                // original picker File handle is gone. Keep the record visible, but do
+                // not pretend the bytes can be resumed from an incomplete cache.
+                record.status = "failed"
+                record.stage = "registered"
+                record.error = "本机缓存尚未完整写入，请重新选择这个文件。"
+                try? fileManager.removeItem(at: url)
+            }
             record.updatedAt = timestamp
             records[id] = record
-            changed.append(record)
-            try? fileManager.removeItem(at: originalURL(id))
+            changed = true
         }
-        if !changed.isEmpty { saveStateLocked() }
+        if changed { saveStateLocked() }
     }
 
     func createJob(id: String, fileName: String, mimeType: String, sizeBytes: Int64, mediaType: String, lastModifiedMs: Double?) throws {
@@ -155,6 +178,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 throw NSError(domain: "NativeBackgroundUpload", code: 2, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_CREATE_FAILED"])
             }
             let timestamp = now()
+            stagingHashers[id] = SHA256()
             records[id] = NativeUploadRecord(
                 id: id, fileName: fileName, mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: lastModifiedMs,
@@ -176,6 +200,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             defer { try? handle.close() }
             handle.seekToEndOfFile()
             handle.write(data)
+            if var hasher = stagingHashers[id] {
+                hasher.update(data: data)
+                stagingHashers[id] = hasher
+            }
             let currentSize = (try? fileSize(url)) ?? 0
             if currentSize > record.sizeBytes {
                 throw NSError(domain: "NativeBackgroundUpload", code: 4, userInfo: [NSLocalizedDescriptionKey: "STAGED_FILE_TOO_LARGE"])
@@ -194,7 +222,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     func finishJob(id: String, completion: @escaping (Result<NativeUploadRecord, Error>) -> Void) {
         workerQueue.async {
             do {
-                let record = try self.stateQueue.sync { () throws -> NativeUploadRecord in
+                let hash = try self.stateQueue.sync { () throws -> String in
                     guard let record = self.records[id] else {
                         throw NSError(domain: "NativeBackgroundUpload", code: 5, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"])
                     }
@@ -202,9 +230,14 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     guard actualSize == record.sizeBytes else {
                         throw NSError(domain: "NativeBackgroundUpload", code: 6, userInfo: [NSLocalizedDescriptionKey: "STAGED_FILE_SIZE_MISMATCH"])
                     }
-                    return record
+                    if let hasher = self.stagingHashers.removeValue(forKey: id) {
+                        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+                    }
+                    // If the WebView or process was briefly interrupted after the last
+                    // chunk reached disk, recover by hashing the durable file instead of
+                    // turning a complete cached original into an unrecoverable failure.
+                    return try self.sha256(url: self.originalURL(id))
                 }
-                let hash = try self.sha256(url: self.originalURL(id))
                 let updated = self.mutate(id) { value in
                     value.contentHash = hash
                     value.ready = true
@@ -216,7 +249,6 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 guard let updated else { throw NSError(domain: "NativeBackgroundUpload", code: 7, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"]) }
                 try self.scheduleReserve(updated, earliest: nil)
                 completion(.success(updated))
-                _ = record
             } catch {
                 let failed = self.mutate(id) { value in
                     value.status = "failed"
@@ -243,10 +275,19 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }) { notify(record) }
     }
 
-    func resumeJob(id: String) {
+    func resumeJob(id: String) throws {
+        // Refuse a misleading "retrying" state when the original never finished
+        // staging. A ready native job always owns a durable file that can survive an
+        // app update; an interrupted staging job must be reselected by the user.
+        guard let current = stateQueue.sync(execute: { records[id] }) else {
+            throw NSError(domain: "NativeBackgroundUpload", code: 5, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"])
+        }
+        guard current.ready, fileManager.fileExists(atPath: originalURL(id).path) else {
+            throw NSError(domain: "NativeBackgroundUpload", code: 13, userInfo: [NSLocalizedDescriptionKey: "本机原件未完整保存，请重新选择这个文件。"])
+        }
+
         // An explicit user retry starts a fresh automatic retry budget. Without this,
-        // a job that reached the 24-attempt guard could never be resumed from the UI:
-        // resume immediately re-entered retryReserve with attempts == 24 and failed.
+        // a job that reached the 24-attempt guard could never be resumed from the UI.
         if let record = mutate(id, { value in
             value.status = "retrying"
             value.attempts = 0
@@ -275,7 +316,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         session.getAllTasks { tasks in
             tasks.filter { self.taskJobId($0) == id }.forEach { $0.cancel() }
         }
-        stateQueue.sync { reserveTasks.removeValue(forKey: id)?.cancel() }
+        stateQueue.sync {
+            stagingHashers.removeValue(forKey: id)
+            reserveTasks.removeValue(forKey: id)?.cancel()
+        }
+        DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
         if let record = mutate(id, { value in
             value.status = "failed"
             value.error = "已取消，本机临时原件已释放。"
@@ -289,10 +334,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             tasks.filter { self.taskJobId($0) == id }.forEach { $0.cancel() }
         }
         stateQueue.sync {
+            stagingHashers.removeValue(forKey: id)
             reserveTasks.removeValue(forKey: id)?.cancel()
             records.removeValue(forKey: id)
             saveStateLocked()
         }
+        DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
         cleanupFiles(id)
     }
 
@@ -307,6 +354,62 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     func resumePendingTransfers() {
         _ = session
         reconcileTasks()
+    }
+
+    func startForegroundRecoveryWatchdog() {
+        let generation = stateQueue.sync { () -> Int in
+            foregroundWatchdogGeneration += 1
+            return foregroundWatchdogGeneration
+        }
+        reconcileTasks()
+        scheduleForegroundRecoveryWatchdog(generation: generation)
+    }
+
+    func stopForegroundRecoveryWatchdog() {
+        stateQueue.sync { foregroundWatchdogGeneration += 1 }
+    }
+
+    private func scheduleForegroundRecoveryWatchdog(generation: Int) {
+        workerQueue.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self else { return }
+            let stillCurrent = self.stateQueue.sync { self.foregroundWatchdogGeneration == generation }
+            guard stillCurrent else { return }
+            self.reconcileTasks()
+            self.scheduleForegroundRecoveryWatchdog(generation: generation)
+        }
+    }
+
+    func beginStagingProtection() {
+        let work = {
+            self.stagingProtectionDepth += 1
+            guard self.stagingBackgroundTask == .invalid else { return }
+            self.stagingBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "PrivateArchiveUploadStaging") { [weak self] in
+                guard let self else { return }
+                DispatchQueue.main.async {
+                    let task = self.stagingBackgroundTask
+                    self.stagingBackgroundTask = .invalid
+                    if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
+                }
+            }
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+    }
+
+    func endStagingProtection() {
+        let work = {
+            self.stagingProtectionDepth = max(0, self.stagingProtectionDepth - 1)
+            self.endStagingProtectionIfIdleOnMain()
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+    }
+
+    private func endStagingProtectionIfIdleOnMain() {
+        guard stagingProtectionDepth == 0, stagingBackgroundTask != .invalid else { return }
+        let hasPendingReserve = stateQueue.sync { !reserveTasks.isEmpty }
+        guard !hasPendingReserve else { return }
+        let task = stagingBackgroundTask
+        stagingBackgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
     }
 
     private func mutate(_ id: String, _ body: (inout NativeUploadRecord) -> Void) -> NativeUploadRecord? {
@@ -391,6 +494,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let task = foregroundSession.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             _ = self.stateQueue.sync { self.reserveTasks.removeValue(forKey: record.id) }
+            DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
             guard let current = self.stateQueue.sync(execute: { self.records[record.id] }), current.ready else { return }
             self.handleReserveResult(current, data: data ?? Data(), response: response as? HTTPURLResponse, error: error)
         }
@@ -600,10 +704,15 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             retryReserve(record, after: delay, reason: reason)
             return
         }
+        guard record.attempts < 24 else {
+            if let failed = mutate(record.id, { value in value.status = "failed"; value.error = reason ?? "后台上传重试次数过多，请点击重试继续。" }) { notify(failed) }
+            return
+        }
         if let retrying = mutate(record.id, { value in
             value.status = "retrying"
             value.stage = "original"
             value.progress = 32
+            value.attempts += 1
             value.error = reason ?? "正在重新连接后台上传。"
         }) { notify(retrying) }
         workerQueue.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
@@ -669,7 +778,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 // returns to foreground, replace only tasks whose progress timestamp is
                 // stale for a size-aware window. The server-side attempt lease rejects
                 // a late completion from the old request.
-                let staleSeconds = max(180.0, min(600.0, Double(record.sizeBytes) / (64.0 * 1024.0) + 60.0))
+                let staleSeconds = max(90.0, min(240.0, Double(record.sizeBytes) / (128.0 * 1024.0) + 45.0))
                 if record.stage == "original",
                    let updated = ISO8601DateFormatter().date(from: record.updatedAt),
                    Date().timeIntervalSince(updated) > staleSeconds {
@@ -703,7 +812,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard taskStage(task) == "content", let id = taskJobId(task), totalBytesExpectedToSend > 0 else { return }
         let ratio = min(1, max(0, Double(totalBytesSent) / Double(totalBytesExpectedToSend)))
-        if let record = mutate(id, { value in value.progress = 32 + ratio * 63 }) { notify(record) }
+        let nextProgress = 32 + ratio * 63
+        let shouldPersist = stateQueue.sync { () -> Bool in
+            guard let current = records[id] else { return false }
+            return nextProgress >= 95 || nextProgress - current.progress >= 1
+        }
+        guard shouldPersist else { return }
+        if let record = mutate(id, { value in value.progress = max(value.progress, nextProgress) }) { notify(record) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -767,6 +882,8 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "createJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "appendChunk", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "finishJob", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "beginStagingProtection", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "endStagingProtection", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "listJobs", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "pauseJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "resumeJob", returnType: CAPPluginReturnPromise),
@@ -820,6 +937,16 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    @objc func beginStagingProtection(_ call: CAPPluginCall) {
+        NativeBackgroundUploadManager.shared.beginStagingProtection()
+        call.resolve()
+    }
+
+    @objc func endStagingProtection(_ call: CAPPluginCall) {
+        NativeBackgroundUploadManager.shared.endStagingProtection()
+        call.resolve()
+    }
+
     @objc func listJobs(_ call: CAPPluginCall) {
         call.resolve(["items": NativeBackgroundUploadManager.shared.listJobs().map { NativeBackgroundUploadManager.shared.publicDictionary($0) }])
     }
@@ -832,8 +959,12 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func resumeJob(_ call: CAPPluginCall) {
         guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
-        NativeBackgroundUploadManager.shared.resumeJob(id: id)
-        call.resolve()
+        do {
+            try NativeBackgroundUploadManager.shared.resumeJob(id: id)
+            call.resolve()
+        } catch {
+            call.reject(error.localizedDescription)
+        }
     }
 
     @objc func cancelJob(_ call: CAPPluginCall) {

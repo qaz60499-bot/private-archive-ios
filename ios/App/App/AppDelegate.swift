@@ -22,8 +22,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationWillResignActive(_ application: UIApplication) {
-        // Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
-        // Use this method to pause ongoing tasks, disable timers, and invalidate graphics rendering callbacks. Games should use this method to pause the game.
+        NativeBackgroundUploadManager.shared.stopForegroundRecoveryWatchdog()
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
@@ -37,10 +36,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // Reconcile tasks immediately on return. This repairs transfers that iOS
-        // canceled while the process was gone instead of leaving their old percentage
-        // visible until the next manual retry.
-        NativeBackgroundUploadManager.shared.resumePendingTransfers()
+        // Reconcile immediately and keep rechecking while the app is foregrounded.
+        // This prevents a task that was not yet stale at launch from remaining frozen
+        // forever at values such as 34% after the app is reopened.
+        NativeBackgroundUploadManager.shared.startForegroundRecoveryWatchdog()
     }
 
     func applicationWillTerminate(_ application: UIApplication) {

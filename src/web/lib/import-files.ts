@@ -1,11 +1,17 @@
 import { enqueueLocalUpload } from './offline/store'
 import { wakeUploadScheduler } from './offline/processor'
-import { canUseIosBackgroundUpload, enqueueIosBackgroundUpload } from './native-background-upload'
+import {
+  beginIosBackgroundUploadStaging,
+  canUseIosBackgroundUpload,
+  endIosBackgroundUploadStaging,
+  enqueueIosBackgroundUpload,
+} from './native-background-upload'
 import type { MediaType, StorageBackend } from '../types'
 
 export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 export const MOBILE_IMPORT_WINDOW = 8
 export const DESKTOP_IMPORT_WINDOW = 24
+export const IOS_NATIVE_STAGING_CONCURRENCY = 3
 
 export interface ImportFilesProgress {
   batchId: string
@@ -67,36 +73,53 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
   // did not. The store releases each payload as soon as its upload completes, and surfaces
   // quota errors per-file, so durable persistence is the safe default on every device.
   const persistPayload = true
+  const iosBackgroundUpload = canUseIosBackgroundUpload(storageBackend)
   report('registering', 1)
   if (persistPayload) void requestPersistentStorage()
-  for (let start = 0; start < total; start += windowSize) {
-    const windowNumber = Math.floor(start / windowSize) + 1
-    const end = Math.min(start + windowSize, total)
-    for (let index = start; index < end; index += 1) {
-      const file = selectedFiles[index]
-      processed += 1
-      report('registering', windowNumber)
-      if (storageBackend === 'telegram_bot' && file.size > MAX_UPLOAD_BYTES) {
-        errors.push(`${file.name} 超过 Bot 存储安全处理范围，请切换到“Telegram 私人群组”。不会自动回退到 Bot。`)
-      } else {
-        try {
-          const mediaType: MediaType = file.type.startsWith('image/') ? 'photo' : file.type.startsWith('video/') ? 'video' : 'file'
-          if (canUseIosBackgroundUpload(storageBackend)) {
-            await enqueueIosBackgroundUpload({ file, batchId, mediaType, storageBackend })
-          } else {
-            await enqueueLocalUpload({ file, batchId, mediaType, persistPayload, storageBackend })
-          }
-          queued += 1
-          report('registering', windowNumber)
-          if (online && navigator.onLine && !canUseIosBackgroundUpload(storageBackend)) void wakeUploadScheduler('import-window')
-        } catch (error) {
-          errors.push(`${file.name}：${error instanceof Error ? error.message : '无法加入上传队列'}`)
-        }
-      }
-    }
 
-    if (online && navigator.onLine && !canUseIosBackgroundUpload(storageBackend)) void wakeUploadScheduler('import-window-ready')
-    if (end < total) await yieldToBrowser()
+  const processFile = async (index: number, windowNumber: number): Promise<void> => {
+    const file = selectedFiles[index]
+    processed += 1
+    report('registering', windowNumber)
+    if (storageBackend === 'telegram_bot' && file.size > MAX_UPLOAD_BYTES) {
+      errors.push(`${file.name} 超过 Bot 存储安全处理范围，请切换到“Telegram 私人群组”。不会自动回退到 Bot。`)
+      return
+    }
+    try {
+      const mediaType: MediaType = file.type.startsWith('image/') ? 'photo' : file.type.startsWith('video/') ? 'video' : 'file'
+      if (iosBackgroundUpload) {
+        await enqueueIosBackgroundUpload({ file, batchId, mediaType, storageBackend })
+      } else {
+        await enqueueLocalUpload({ file, batchId, mediaType, persistPayload, storageBackend })
+      }
+      queued += 1
+      report('registering', windowNumber)
+      if (online && navigator.onLine && !iosBackgroundUpload) void wakeUploadScheduler('import-window')
+    } catch (error) {
+      errors.push(`${file.name}：${error instanceof Error ? error.message : '无法加入上传队列'}`)
+    }
+  }
+
+  if (iosBackgroundUpload) await beginIosBackgroundUploadStaging()
+  try {
+    for (let start = 0; start < total; start += windowSize) {
+      const windowNumber = Math.floor(start / windowSize) + 1
+      const end = Math.min(start + windowSize, total)
+      if (iosBackgroundUpload) {
+        for (let groupStart = start; groupStart < end; groupStart += IOS_NATIVE_STAGING_CONCURRENCY) {
+          const groupEnd = Math.min(end, groupStart + IOS_NATIVE_STAGING_CONCURRENCY)
+          await Promise.all(Array.from({ length: groupEnd - groupStart }, (_, offset) => processFile(groupStart + offset, windowNumber)))
+          if (groupEnd < end) await yieldToBrowser()
+        }
+      } else {
+        for (let index = start; index < end; index += 1) await processFile(index, windowNumber)
+      }
+
+      if (online && navigator.onLine && !iosBackgroundUpload) void wakeUploadScheduler('import-window-ready')
+      if (end < total) await yieldToBrowser()
+    }
+  } finally {
+    if (iosBackgroundUpload) await endIosBackgroundUploadStaging()
   }
 
   const lastWindow = Math.min(windows, Math.floor(Math.max(0, processed - 1) / windowSize) + 1)
