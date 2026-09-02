@@ -303,6 +303,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 if shouldSchedule { try self.scheduleReserve(updated, earliest: nil) }
                 completion(.success(updated))
             } catch {
+                if self.nativeUploadErrorCode(error) == 9,
+                   let waiting = self.markAwaitingAuthIfActive(id) {
+                    self.notify(waiting)
+                    completion(.success(waiting))
+                    return
+                }
                 let failed = self.stateQueue.sync { () -> NativeUploadRecord? in
                     guard var value = self.records[id],
                           value.status != "paused", value.status != "done", value.status != "failed" else { return nil }
@@ -557,6 +563,59 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
+    private func nativeUploadErrorCode(_ error: Error) -> Int? {
+        let value = error as NSError
+        guard value.domain == "NativeBackgroundUpload" else { return nil }
+        return value.code
+    }
+
+    private func markAwaitingAuthIfActive(_ id: String, reason: String = "APP_AUTH_REQUIRED") -> NativeUploadRecord? {
+        stateQueue.sync {
+            guard var record = records[id], record.ready,
+                  record.status != "done", record.status != "paused" else { return nil }
+            // A cold/background relaunch can recreate URLSession before the WebView has
+            // restored its HttpOnly app cookie. That is not a terminal upload failure:
+            // keep the durable original and any valid reservation so foreground auth can
+            // resume the exact same transfer instead of creating another server job.
+            record.status = "retrying"
+            record.error = reason == "APP_AUTH_REQUIRED"
+                ? "等待应用登录会话恢复，原件与上传进度已保留。"
+                : reason
+            record.updatedAt = now()
+            records[id] = record
+            saveStateLocked()
+            return record
+        }
+    }
+
+    private func restartReservation(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?) {
+        guard let retrying = stateQueue.sync(execute: { () -> NativeUploadRecord? in
+            guard var value = records[record.id], value.ready,
+                  value.status != "done", value.status != "failed", value.status != "paused" else { return nil }
+            value.status = "retrying"
+            value.stage = "reserving"
+            value.progress = min(value.progress, 18)
+            value.remoteAssetId = nil
+            value.uploadToken = nil
+            value.contentTaskToken = nil
+            value.error = reason ?? "正在重新建立上传预约。"
+            value.updatedAt = now()
+            records[record.id] = value
+            saveStateLocked()
+            return value
+        }) else { return }
+        notify(retrying)
+        do {
+            try scheduleReserve(retrying, earliest: delay > 0 ? Date().addingTimeInterval(delay) : nil)
+        } catch {
+            if nativeUploadErrorCode(error) == 9 {
+                if let waiting = markAwaitingAuthIfActive(record.id) { notify(waiting) }
+            } else if let failed = markFailedIfActive(record.id, error: error.localizedDescription) {
+                notify(failed)
+            }
+        }
+    }
+
     private func dictionary(_ record: NativeUploadRecord) -> [String: Any] {
         guard let data = try? JSONEncoder().encode(record),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
@@ -595,11 +654,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return request
     }
 
-    private func scheduleReserve(_ record: NativeUploadRecord, earliest: Date?) throws {
+    private func scheduleReserve(_ record: NativeUploadRecord, earliest: Date?, cookieOverride: String? = nil) throws {
         guard record.ready, fileManager.fileExists(atPath: originalURL(record.id).path) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 8, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_MISSING"])
         }
-        guard let cookie = cookieHeader() else {
+        guard let cookie = cookieOverride ?? cookieHeader() else {
             throw NSError(domain: "NativeBackgroundUpload", code: 9, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
         let reserveToken = UUID().uuidString
@@ -655,7 +714,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    private func handleReserveResult(_ record: NativeUploadRecord, data: Data, response: HTTPURLResponse?, error: Error?) {
+    private func handleReserveResult(_ record: NativeUploadRecord, data: Data, response: HTTPURLResponse?, error: Error?, requestCookie: String? = nil) {
         guard let current = stateQueue.sync(execute: { records[record.id] }),
               current.ready, current.status != "done", current.status != "failed", current.status != "paused" else { return }
         let record = current
@@ -693,32 +752,46 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                       value.stage == "reserving" else { return nil }
                 value.remoteAssetId = assetId
                 value.uploadToken = token
+                // The reservation capability is already valid at this point. Persist
+                // that ownership before creating the content task so a cold-launch auth
+                // gap cannot send the same original back through /reserve repeatedly.
+                value.stage = "original"
                 value.progress = max(value.progress, 28)
                 value.updatedAt = now()
                 records[record.id] = value
                 saveStateLocked()
                 return value
             }) else { return }
-            do { try scheduleContent(reserved, earliest: nil) }
-            catch { retryReserve(reserved, after: 2, reason: error.localizedDescription) }
+            do { try scheduleContent(reserved, earliest: nil, cookieOverride: requestCookie) }
+            catch {
+                if nativeUploadErrorCode(error) == 11 {
+                    if let waiting = markAwaitingAuthIfActive(record.id) { notify(waiting) }
+                } else {
+                    retryContent(reserved, after: 2, reason: error.localizedDescription, consumeAttempt: false, cookieOverride: requestCookie)
+                }
+            }
             return
         }
-        if status == 401 || status == 403 {
-            if let failed = markFailedIfActive(record.id, error: code ?? "APP_AUTH_REQUIRED") { notify(failed) }
+        if status == 401 {
+            if let waiting = markAwaitingAuthIfActive(record.id, reason: code ?? "APP_AUTH_REQUIRED") { notify(waiting) }
+            return
+        }
+        if status == 403 {
+            if let failed = markFailedIfActive(record.id, error: code ?? "APP_UPLOAD_NOT_ALLOWED") { notify(failed) }
             return
         }
         if shouldRetry(status: status, code: code) || status == 0 {
-            retryReserve(record, after: retryDelay(response), reason: code)
+            retryReserve(record, after: retryDelay(response), reason: code, cookieOverride: requestCookie)
             return
         }
         if let failed = markFailedIfActive(record.id, error: code ?? "RESERVATION_FAILED") { notify(failed) }
     }
 
-    private func scheduleContent(_ record: NativeUploadRecord, earliest: Date?) throws {
+    private func scheduleContent(_ record: NativeUploadRecord, earliest: Date?, cookieOverride: String? = nil) throws {
         guard let assetId = record.remoteAssetId, let token = record.uploadToken else {
             throw NSError(domain: "NativeBackgroundUpload", code: 10, userInfo: [NSLocalizedDescriptionKey: "UPLOAD_RESERVATION_MISSING"])
         }
-        guard let cookie = cookieHeader() else {
+        guard let cookie = cookieOverride ?? cookieHeader() else {
             throw NSError(domain: "NativeBackgroundUpload", code: 11, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
         guard fileManager.fileExists(atPath: originalURL(record.id).path) else {
@@ -871,17 +944,45 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return max(delay, automatic)
     }
 
-    private func retryReserve(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?) {
+    private func retryReserve(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, cookieOverride: String? = nil) {
+        // A legacy/cold-launch record may still say "reserving" even though the server
+        // already returned a valid asset/token. Never create another reservation in that
+        // state: normalize it to content ownership and continue the existing transfer.
+        if record.remoteAssetId != nil, record.uploadToken != nil {
+            let reserved = stateQueue.sync { () -> NativeUploadRecord? in
+                guard var value = records[record.id], value.ready,
+                      value.status != "done", value.status != "failed", value.status != "paused",
+                      value.remoteAssetId != nil, value.uploadToken != nil else { return nil }
+                value.stage = "original"
+                value.status = "retrying"
+                value.error = reason ?? value.error
+                value.updatedAt = now()
+                records[record.id] = value
+                saveStateLocked()
+                return value
+            }
+            if let reserved {
+                notify(reserved)
+                retryContent(reserved, after: delay, reason: reason, consumeAttempt: false, cookieOverride: cookieOverride)
+            }
+            return
+        }
+
         let effectiveDelay = retryBackoff(record, requested: delay)
-        do { try scheduleReserve(record, earliest: Date().addingTimeInterval(effectiveDelay)) }
-        catch {
-            if let failed = markFailedIfActive(record.id, error: error.localizedDescription) { notify(failed) }
+        do {
+            try scheduleReserve(record, earliest: effectiveDelay > 0 ? Date().addingTimeInterval(effectiveDelay) : nil, cookieOverride: cookieOverride)
+        } catch {
+            if nativeUploadErrorCode(error) == 9 {
+                if let waiting = markAwaitingAuthIfActive(record.id) { notify(waiting) }
+            } else if let failed = markFailedIfActive(record.id, error: error.localizedDescription) {
+                notify(failed)
+            }
         }
     }
 
-    private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, consumeAttempt: Bool = true) {
+    private func retryContent(_ record: NativeUploadRecord, after delay: TimeInterval, reason: String?, consumeAttempt: Bool = true, cookieOverride: String? = nil) {
         guard let assetId = record.remoteAssetId, let uploadToken = record.uploadToken else {
-            retryReserve(record, after: delay, reason: reason)
+            restartReservation(record, after: delay, reason: reason)
             return
         }
         let effectiveDelay = consumeAttempt ? retryBackoff(record, requested: delay) : max(0, delay)
@@ -907,9 +1008,16 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         // 409/timeout could remain dead until the next foreground launch. earliestBeginDate
         // is owned by the system and survives normal app suspension/termination.
         do {
-            try scheduleContent(retrying, earliest: effectiveDelay > 0 ? Date().addingTimeInterval(effectiveDelay) : nil)
+            try scheduleContent(retrying, earliest: effectiveDelay > 0 ? Date().addingTimeInterval(effectiveDelay) : nil, cookieOverride: cookieOverride)
         } catch {
-            retryReserve(retrying, after: 2, reason: error.localizedDescription)
+            switch nativeUploadErrorCode(error) {
+            case 11:
+                if let waiting = markAwaitingAuthIfActive(record.id) { notify(waiting) }
+            case 10:
+                restartReservation(retrying, after: 2, reason: error.localizedDescription)
+            default:
+                if let failed = markFailedIfActive(record.id, error: error.localizedDescription) { notify(failed) }
+            }
         }
     }
 
@@ -1101,26 +1209,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                         continue
                     }
                     if task.state == .suspended { task.resume() }
-                    if let earliest = task.earliestBeginDate, earliest > Date() {
-                        validContentIds.insert(id)
-                        continue
-                    }
-
-                    let staleSeconds = max(120.0, min(360.0, Double(record.sizeBytes) / (128.0 * 1024.0) + 60.0))
-                    let lastProgress = self.stateQueue.sync { self.lastProgressAt[id] } ?? ISO8601DateFormatter().date(from: record.updatedAt)
-                    if let updated = lastProgress, Date().timeIntervalSince(updated) > staleSeconds {
-                        self.stateQueue.sync {
-                            guard var current = self.records[id], current.contentTaskToken == taskIdentity else { return }
-                            current.contentTaskToken = nil
-                            current.updatedAt = self.now()
-                            self.records[id] = current
-                            self.saveStateLocked()
-                        }
-                        needsContentRestartIds.insert(id)
-                        task.cancel()
-                    } else {
-                        validContentIds.insert(id)
-                    }
+                    // A background URLSession task is allowed to wait for connectivity or
+                    // system scheduling for an extended period. Lack of didSendBodyData is
+                    // not evidence that the task is dead, especially after a cold launch
+                    // where lastProgressAt is intentionally in-memory only. Keep every
+                    // request whose persisted owner and request capability still match;
+                    // URLSession's terminal callback is the authority for retry/rebuild.
+                    validContentIds.insert(id)
                 }
 
                 // contentTaskToken is persisted so an in-place relaunch can reject
@@ -1236,19 +1331,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
         guard let record else { return }
         let response = task.response as? HTTPURLResponse
+        // A background task can wake a cold process before the WebView has restored the
+        // shared app-session cookie. Reuse the exact Cookie header captured when iOS
+        // originally scheduled this task so recovery does not depend on launch ordering.
+        let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")
 
         if let error {
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return }
-            if stage == "content" { retryContent(record, after: 5, reason: error.localizedDescription) }
-            else { retryReserve(record, after: 5, reason: error.localizedDescription) }
+            if stage == "content" { retryContent(record, after: 5, reason: error.localizedDescription, cookieOverride: requestCookie) }
+            else { retryReserve(record, after: 5, reason: error.localizedDescription, cookieOverride: requestCookie) }
             return
         }
 
         let status = response?.statusCode ?? 0
         let code = responseErrorCode(data)
         if stage == "reserve" {
-            handleReserveResult(record, data: data, response: response, error: nil)
+            handleReserveResult(record, data: data, response: response, error: nil, requestCookie: requestCookie)
             return
         }
 
@@ -1257,27 +1356,31 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
         if status == 401 && code == "APP_AUTH_REQUIRED" {
-            if let failed = markFailedIfActive(id, error: code ?? "APP_AUTH_REQUIRED") { notify(failed) }
+            if let waiting = markAwaitingAuthIfActive(id) { notify(waiting) }
             return
         }
         if status == 401 {
-            retryReserve(record, after: retryDelay(response), reason: code)
+            // The server validates X-Upload-Token before app auth. A generic content 401
+            // therefore means this reservation capability is no longer usable. Clear it
+            // explicitly before asking for a fresh reservation; otherwise retryReserve's
+            // valid-capability guard would keep replaying the poisoned token forever.
+            restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED")
             return
         }
         if status == 409 && code == "UPLOAD_ALREADY_IN_PROGRESS" {
-            retryContent(record, after: max(20, retryDelay(response)), reason: code, consumeAttempt: false)
+            retryContent(record, after: max(20, retryDelay(response)), reason: code, consumeAttempt: false, cookieOverride: requestCookie)
             return
         }
         if status == 409 && code == "STORAGE_OBJECT_DELETE_IN_PROGRESS" {
-            retryContent(record, after: max(20, retryDelay(response)), reason: code, consumeAttempt: false)
+            retryContent(record, after: max(20, retryDelay(response)), reason: code, consumeAttempt: false, cookieOverride: requestCookie)
             return
         }
         if status == 409 && code == "STALE_UPLOAD_ATTEMPT" {
-            retryContent(record, after: max(5, retryDelay(response)), reason: code, consumeAttempt: false)
+            retryContent(record, after: max(5, retryDelay(response)), reason: code, consumeAttempt: false, cookieOverride: requestCookie)
             return
         }
         if shouldRetry(status: status, code: code) || status == 0 {
-            retryContent(record, after: retryDelay(response), reason: code)
+            retryContent(record, after: retryDelay(response), reason: code, cookieOverride: requestCookie)
             return
         }
         if let failed = markFailedIfActive(id, error: code ?? "STORAGE_UPLOAD_FAILED") { notify(failed) }

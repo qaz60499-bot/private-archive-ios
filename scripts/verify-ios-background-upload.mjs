@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs'
 
 const source = readFileSync(new URL('../ios/App/App/NativeBackgroundUpload.swift', import.meta.url), 'utf8')
+const appDelegateSource = readFileSync(new URL('../ios/App/App/AppDelegate.swift', import.meta.url), 'utf8')
 const bridgeSource = readFileSync(new URL('../src/web/lib/native-background-upload.ts', import.meta.url), 'utf8')
+const storeSource = readFileSync(new URL('../src/web/lib/offline/store.ts', import.meta.url), 'utf8')
 const processorSource = readFileSync(new URL('../src/web/lib/offline/processor.ts', import.meta.url), 'utf8')
 
 function assert(condition, message) {
@@ -17,7 +19,10 @@ function section(start, end) {
 
 assert(source.includes('URLSessionConfiguration.background(withIdentifier: Self.reserveSessionIdentifier)'), 'reserve handshake must use a background URLSession')
 assert(!source.includes('foregroundSession'), 'foreground reservation session must not return')
-assert(source.includes('identifier == Self.sessionIdentifier || identifier == Self.reserveSessionIdentifier'), 'AppDelegate background-event bridge must accept both sessions')
+assert(source.includes('identifier == Self.sessionIdentifier || identifier == Self.reserveSessionIdentifier'), 'native background-event bridge must accept both sessions')
+assert(appDelegateSource.includes('handleEventsForBackgroundURLSession identifier: String'), 'AppDelegate must receive iOS background URLSession wakeups')
+assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.handleBackgroundEvents'), 'AppDelegate must forward background URLSession wakeups to the upload manager')
+assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'AppDelegate must reconcile uploads on background transition')
 
 const interrupted = section('private func recoverInterruptedStaging()', 'private func recoverRetryableFailures()')
 assert(!interrupted.includes('removeItem(at: url)'), 'interrupted staging recovery must preserve partial cache')
@@ -36,7 +41,13 @@ assert(resume.includes('scheduleReserve(retrying, earliest: nil)'), 'manual retr
 const reserve = section('private func scheduleReserve(', 'private func handleReserveResult(')
 assert(reserve.includes('reserveSession.uploadTask'), 'reservation must be owned by the dedicated background session')
 assert(!reserve.includes('asyncAfter'), 'reservation retry must not depend on a suspended dispatch timer')
+assert(reserve.includes('cookieOverride ?? cookieHeader()'), 'reservation recovery must be able to reuse the persisted background-task cookie')
 assert(reserve.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'reserve scheduling must recheck active state before task resume')
+
+const reserveResult = section('private func handleReserveResult(', 'private func scheduleContent(')
+assert(reserveResult.includes('value.stage = "original"'), 'a successful reservation must persist content ownership before scheduling PUT')
+assert(reserveResult.includes('scheduleContent(reserved, earliest: nil, cookieOverride: requestCookie)'), 'reserve completion must reuse its original request cookie when creating content upload')
+assert(!reserveResult.includes('markFailedIfActive(record.id, error: code ?? "APP_AUTH_REQUIRED")'), 'temporary cold-launch auth gaps must not become terminal reserve failures')
 
 const reconcile = section('private func reconcileTasks()', 'func urlSession(_ session: URLSession, dataTask: URLSessionDataTask')
 assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks from stale reservations')
@@ -46,6 +57,12 @@ assert(reconcile.includes('contentTaskToken'), 'reconcile must enforce one persi
 assert(reconcile.includes('current.contentTaskToken == snapshotToken'), 'reconcile must reclaim an orphaned persisted content-task token when iOS lost the task')
 assert(reconcile.includes('Date().timeIntervalSince(snapshotUpdatedAt) >= 10'), 'orphan-token reclaim must not race a freshly created content task')
 assert(reconcile.includes('validContentIds'), 'reconcile must distinguish a valid content task from stale siblings')
+assert(!reconcile.includes('let staleSeconds ='), 'reconcile must not kill a valid background upload merely because iOS delayed progress callbacks')
+
+const retries = section('private func retryReserve(', 'private func complete(')
+assert(retries.includes('if record.remoteAssetId != nil, record.uploadToken != nil'), 'retryReserve must reuse an existing valid reservation instead of creating duplicates')
+assert(retries.includes('retryContent(reserved, after: delay'), 'existing reservation recovery must route back to content upload')
+assert(retries.includes('markAwaitingAuthIfActive'), 'cold-launch auth gaps must stay recoverable during retry')
 
 const completion = section('private func complete(', 'private func cleanupFiles(')
 assert(completion.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'completion must not overwrite paused/failed jobs')
@@ -54,6 +71,12 @@ assert(completion.includes('value.contentTaskToken = nil'), 'successful completi
 const finishJob = section('func finishJob(', 'func listJobs()')
 assert(finishJob.includes('if value.status == "failed" || value.status == "done"'), 'finishJob must not resurrect a canceled/completed job')
 assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'finishJob must preserve pause state while hashing/staging completes')
+assert(finishJob.includes('self.nativeUploadErrorCode(error) == 9'), 'finishJob must not turn a temporary auth gap into a failed staged original')
+
+const taskCompletion = section('func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)', 'func urlSessionDidFinishEvents')
+assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'background callbacks must recover using the cookie persisted on the URLSession task')
+assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response)'), 'expired content capability must explicitly clear and recreate reservation state')
+assert(!taskCompletion.includes('markFailedIfActive(id, error: code ?? "APP_AUTH_REQUIRED")'), 'APP_AUTH_REQUIRED must never be terminal in a cold background callback')
 
 const pauseAndCancel = section('func pauseJob(', 'func resumeJob(')
 assert(pauseAndCancel.includes('value.status != "done", value.status != "failed"'), 'pause must not overwrite a terminal state')
@@ -67,6 +90,10 @@ assert(source.includes('guard records[id] == nil, !fileManager.fileExists(atPath
 
 const enqueueCatch = bridgeSource.slice(bridgeSource.indexOf('export async function enqueueIosBackgroundUpload'), bridgeSource.indexOf('export async function syncIosBackgroundUploads'))
 assert(!enqueueCatch.includes('NativeBackgroundUpload.cancelJob'), 'automatic enqueue failures must not destroy native cache')
+assert(storeSource.includes("if (!opfsPath) await persistPayloadBytes(options.id, 'original', options.file)"), 'native iOS registration must persist a full Web-side recovery copy before staging')
+assert(bridgeSource.includes("if (job.status === 'done') await releaseLocalUploadPayload(job.id)"), 'Web-side recovery copy must survive until native upload really completes')
+assert(bridgeSource.includes('restageFromDurableFallback'), 'startup sync must be able to rebuild an interrupted native staging file from durable bytes')
+assert(bridgeSource.includes("native.status === 'failed' && native.stage === 'registered'"), 'startup sync must detect interrupted native staging rather than leaving it terminally failed')
 assert(bridgeSource.includes('missingNative.map((job) => resumeNativeBackgroundTransfer(job))'), 'Web startup sync must reconstruct missing native indexes from cached jobs')
 assert(processorSource.includes('Promise.allSettled(jobs.map((job) => resumeLocalUpload(job.id)))'), 'batch retry must continue after an individual recovery failure')
 

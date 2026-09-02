@@ -146,12 +146,22 @@ async function removeFromOpfs(path?: string): Promise<void> {
 export async function registerNativeLocalUpload(options: {
   id: string
   batchId: string
-  file: Pick<File, 'name' | 'type' | 'size' | 'lastModified'>
+  file: File
   mediaType: LocalUploadJob['mediaType']
   storageBackend?: StorageBackend
 }): Promise<LocalUploadJob> {
   if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
   const now = new Date().toISOString()
+  // Keep a second durable copy until the native background upload completes. The
+  // native bridge is fed from a WebView File in chunks; if iOS terminates the app in
+  // the middle of that staging copy, the partially-written native file alone cannot
+  // reconstruct the remaining bytes. On iOS OPFS is intentionally disabled, so Bot
+  // uploads (<=20 MiB) fall back to the IndexedDB payload store and can be restaged
+  // automatically on the next launch without asking the user to reselect the photo.
+  const opfsPath = await writeToOpfs(options.id, options.file)
+  if (!opfsPath && options.file.size > INDEXEDDB_PAYLOAD_FALLBACK_MAX_BYTES) {
+    throw new Error('本机可用持久化存储不足，无法安全保存待上传原件。')
+  }
   const job: LocalUploadJob = {
     id: options.id,
     schemaVersion: 2,
@@ -171,6 +181,7 @@ export async function registerNativeLocalUpload(options: {
     createdAt: now,
     updatedAt: now,
     nativeBackground: true,
+    opfsPath,
     metadata: {
       originalName: options.file.name,
       mimeType: options.file.type || 'application/octet-stream',
@@ -181,7 +192,16 @@ export async function registerNativeLocalUpload(options: {
       fileCreatedAt: options.file.lastModified ? new Date(options.file.lastModified).toISOString() : undefined,
     },
   }
-  await (await dbPromise).put('uploads', job)
+  try {
+    if (!opfsPath) await persistPayloadBytes(options.id, 'original', options.file)
+    await (await dbPromise).put('uploads', job)
+  } catch (error) {
+    await Promise.all([removeFromOpfs(opfsPath), removePayloads(options.id)])
+    if (error instanceof DOMException && ['QuotaExceededError', 'UnknownError'].includes(error.name)) {
+      throw new Error('本机可用存储空间不足，无法安全保存原件。请释放空间后重试。', { cause: error })
+    }
+    throw error
+  }
   return job
 }
 
