@@ -1,5 +1,5 @@
 import { registerPlugin, type PluginListenerHandle } from '@capacitor/core'
-import type { LocalUploadStage, LocalUploadStatus, MediaType } from '../types'
+import type { LocalUploadJob, LocalUploadStage, LocalUploadStatus, MediaType } from '../types'
 
 export interface NativeBackgroundUploadJob {
   id: string
@@ -33,7 +33,14 @@ interface NativeBackgroundUploadPlugin {
   endStagingProtection(): Promise<void>
   listJobs(): Promise<{ items: NativeBackgroundUploadJob[] }>
   pauseJob(options: { id: string }): Promise<void>
-  resumeJob(options: { id: string }): Promise<void>
+  resumeJob(options: {
+    id: string
+    fileName?: string
+    mimeType?: string
+    sizeBytes?: number
+    mediaType?: MediaType
+    contentHash?: string
+  }): Promise<void>
   cancelJob(options: { id: string }): Promise<void>
   removeJob(options: { id: string }): Promise<void>
   addListener(eventName: 'stateChanged', listener: (event: { job: NativeBackgroundUploadJob }) => void): Promise<PluginListenerHandle>
@@ -45,8 +52,15 @@ export async function pauseNativeBackgroundTransfer(id: string): Promise<void> {
   await NativeBackgroundUpload.pauseJob({ id })
 }
 
-export async function resumeNativeBackgroundTransfer(id: string): Promise<void> {
-  await NativeBackgroundUpload.resumeJob({ id })
+export async function resumeNativeBackgroundTransfer(job: LocalUploadJob): Promise<void> {
+  await NativeBackgroundUpload.resumeJob({
+    id: job.id,
+    fileName: job.fileName,
+    mimeType: job.mimeType,
+    sizeBytes: job.sizeBytes,
+    mediaType: job.mediaType,
+    contentHash: job.contentHash,
+  })
 }
 
 export async function cancelNativeBackgroundTransfer(id: string): Promise<void> {

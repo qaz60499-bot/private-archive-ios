@@ -274,7 +274,7 @@ export async function resumeLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
   if (job?.nativeBackground) {
     try {
-      await resumeNativeBackgroundTransfer(id)
+      await resumeNativeBackgroundTransfer(job)
     } catch (error) {
       await updateLocalUpload(id, {
         controlState: 'active', status: 'failed', nextAttemptAt: undefined,

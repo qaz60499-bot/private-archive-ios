@@ -1,8 +1,8 @@
 import { Capacitor } from '@capacitor/core'
 import type { MediaType, StorageBackend } from '../types'
 import { isNativeApp, nativePlatform } from './native-platform'
-import { NativeBackgroundUpload, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
-import { getLocalUpload, registerNativeLocalUpload, updateLocalUpload } from './offline/store'
+import { NativeBackgroundUpload, resumeNativeBackgroundTransfer, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
+import { getLocalUpload, listLocalUploads, registerNativeLocalUpload, updateLocalUpload } from './offline/store'
 
 const NATIVE_CHUNK_BYTES = 2 * 1024 * 1024
 let listenerReady = false
@@ -82,7 +82,10 @@ export async function enqueueIosBackgroundUpload(options: {
     const result = await NativeBackgroundUpload.finishJob({ id })
     await mirrorNativeJob(result.job)
   } catch (error) {
-    try { await NativeBackgroundUpload.cancelJob({ id }) } catch { /* keep the local failure visible */ }
+    // Never translate an automatic staging/reservation error into cancelJob: cancelJob
+    // intentionally destroys the durable native original. Preserve whatever native
+    // cache exists so retry/relaunch can recover it; only an explicit user cancel may
+    // release those bytes.
     await updateLocalUpload(id, { status: 'failed', prepareStatus: 'failed', error: error instanceof Error ? error.message : 'iOS 后台上传准备失败。' })
     throw error
   }
@@ -91,8 +94,20 @@ export async function enqueueIosBackgroundUpload(options: {
 export async function syncIosBackgroundUploads(): Promise<void> {
   if (!isNativeApp() || nativePlatform() !== 'ios') return
   try {
-    const result = await NativeBackgroundUpload.listJobs()
+    let result = await NativeBackgroundUpload.listJobs()
     await Promise.all(result.items.map(mirrorNativeJob))
+
+    // jobs.json is an index, not the source bytes. If that index was lost but the Web
+    // mirror still knows the job id/metadata, ask native to reconstruct the record from
+    // the same <job-id>.upload cache automatically instead of waiting for a manual tap.
+    const nativeIds = new Set(result.items.map((job) => job.id))
+    const missingNative = (await listLocalUploads()).filter((job) =>
+      job.nativeBackground && job.status !== 'done' && job.controlState !== 'canceled' && !nativeIds.has(job.id))
+    if (missingNative.length) {
+      await Promise.allSettled(missingNative.map((job) => resumeNativeBackgroundTransfer(job)))
+      result = await NativeBackgroundUpload.listJobs()
+      await Promise.all(result.items.map(mirrorNativeJob))
+    }
   } catch {
     // Older builds without the plugin keep using the foreground scheduler.
   }

@@ -31,6 +31,7 @@ struct NativeUploadRecord: Codable {
 final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate {
     static let shared = NativeBackgroundUploadManager()
     static let sessionIdentifier = "cd.cc.joye.photo.background-upload.v1"
+    static let reserveSessionIdentifier = "cd.cc.joye.photo.background-reserve.v2"
 
     private let apiBase = URL(string: "https://api.photo.joye.cc.cd")!
     private var fileManager: FileManager { FileManager.default }
@@ -44,8 +45,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }()
     private var records: [String: NativeUploadRecord] = [:]
     private var stagingHashers: [String: SHA256] = [:]
-    private var responseBuffers: [Int: Data] = [:]
-    private var backgroundCompletionHandler: (() -> Void)?
+    private var reserveTaskTokens: [String: String] = [:]
+    private var lastProgressAt: [String: Date] = [:]
+    private var responseBuffers: [String: Data] = [:]
+    private var backgroundCompletionHandlers: [String: () -> Void] = [:]
     private var foregroundWatchdogGeneration = 0
     private var stagingProtectionDepth = 0
     private var stagingBackgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -64,23 +67,24 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
     }()
 
-    // Reservation is a tiny JSON request whose response contains the asset id and
-    // upload token needed by the real background transfer. Keeping this handshake
-    // on the background URLSession can leave iOS waiting at the reservation boundary
-    // even though Cloudflare already created the pending asset. Use a normal session
-    // for the sub-second handshake, then hand only the original file to the durable
-    // background URLSession.
-    private lazy var foregroundSession: URLSession = {
-        let configuration = URLSessionConfiguration.default
+    // Keep reservation handshakes on a dedicated background session. This avoids
+    // queueing tiny /reserve requests behind large file transfers while still letting
+    // iOS finish the handshake after the app is suspended. The previous foreground
+    // session was the main reason a fully cached photo could remain stuck forever when
+    // the user switched apps before its reservation returned.
+    private lazy var reserveSession: URLSession = {
+        let configuration = URLSessionConfiguration.background(withIdentifier: Self.reserveSessionIdentifier)
+        configuration.sessionSendsLaunchEvents = true
+        configuration.isDiscretionary = false
         configuration.waitsForConnectivity = true
         configuration.allowsCellularAccess = true
+        configuration.httpMaximumConnectionsPerHost = 6
         configuration.httpCookieStorage = HTTPCookieStorage.shared
         configuration.httpShouldSetCookies = true
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 60
-        return URLSession(configuration: configuration)
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 15 * 60
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
     }()
-    private var reserveTasks: [String: URLSessionDataTask] = [:]
 
     private lazy var rootDirectory: URL = {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -98,6 +102,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         recoverInterruptedStaging()
         recoverRetryableFailures()
         _ = session
+        _ = reserveSession
         reconcileTasks()
     }
 
@@ -114,8 +119,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         rootDirectory.appendingPathComponent("\(id).upload")
     }
 
-    private func reserveBodyURL(_ id: String) -> URL {
-        rootDirectory.appendingPathComponent("\(id).reserve.json")
+    private func reserveBodyURL(_ id: String, token: String? = nil) -> URL {
+        if let token { return rootDirectory.appendingPathComponent("\(id).\(token).reserve.json") }
+        return rootDirectory.appendingPathComponent("\(id).reserve.json")
     }
 
     private func loadState() {
@@ -129,8 +135,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let temp = stateFile.appendingPathExtension("tmp")
         do {
             try data.write(to: temp, options: .atomic)
-            if fileManager.fileExists(atPath: stateFile.path) { try fileManager.removeItem(at: stateFile) }
-            try fileManager.moveItem(at: temp, to: stateFile)
+            if fileManager.fileExists(atPath: stateFile.path) {
+                _ = try fileManager.replaceItemAt(stateFile, withItemAt: temp)
+            } else {
+                try fileManager.moveItem(at: temp, to: stateFile)
+            }
         } catch {
             try? fileManager.removeItem(at: temp)
         }
@@ -155,12 +164,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 record.error = "检测到完整本机缓存，正在恢复上传。"
             } else {
                 // A partial WebView-to-native copy cannot be reconstructed after the
-                // original picker File handle is gone. Keep the record visible, but do
-                // not pretend the bytes can be resumed from an incomplete cache.
+                // original picker File handle is gone. Keep both the record and partial
+                // cache for diagnostics/recovery; only explicit cancel/delete or a
+                // successful upload is allowed to release cached bytes.
                 record.status = "failed"
                 record.stage = "registered"
-                record.error = "本机缓存尚未完整写入，请重新选择这个文件。"
-                try? fileManager.removeItem(at: url)
+                record.error = "本机缓存尚未完整写入，请重新选择这个文件。已保留现有缓存。"
             }
             record.updatedAt = timestamp
             records[id] = record
@@ -173,18 +182,20 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         var changed = false
         let timestamp = now()
         for (id, var record) in records where record.ready && record.status == "failed" {
-            guard fileManager.fileExists(atPath: originalURL(id).path) else { continue }
-            let reason = record.error ?? ""
-            let retryable = reason.contains("重试次数过多")
-                || reason.contains("UPLOAD_ALREADY_IN_PROGRESS")
-                || reason.contains("STORAGE_OBJECT_DELETE_IN_PROGRESS")
-                || reason.contains("STALE_UPLOAD_ATTEMPT")
-                || reason.contains("TELEGRAM_TIMEOUT")
-                || reason.contains("STORAGE_UPLOAD_FAILED")
-            guard retryable else { continue }
+            let url = originalURL(id)
+            guard fileManager.fileExists(atPath: url.path), (try? fileSize(url)) == record.sizeBytes else { continue }
+            // Any failed job with a complete durable original is recoverable. Do not
+            // whitelist error strings: server codes evolve, while the local file/hash
+            // is the source of truth. Start from a fresh reservation so expired or
+            // poisoned upload tokens cannot trap the job in the same failure forever.
+            if record.contentHash == nil { record.contentHash = try? sha256(url: url) }
             record.status = "retrying"
+            record.stage = "reserving"
+            record.progress = min(record.progress, 18)
             record.attempts = 0
-            record.error = "检测到上次未完成的后台上传，正在自动恢复。"
+            record.remoteAssetId = nil
+            record.uploadToken = nil
+            record.error = "检测到完整本机缓存，正在重新建立后台上传。"
             record.updatedAt = timestamp
             records[id] = record
             changed = true
@@ -193,11 +204,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func createJob(id: String, fileName: String, mimeType: String, sizeBytes: Int64, mediaType: String, lastModifiedMs: Double?) throws {
-        guard !id.isEmpty, sizeBytes >= 0, ["photo", "video", "file"].contains(mediaType) else {
+        guard UUID(uuidString: id) != nil, sizeBytes >= 0, ["photo", "video", "file"].contains(mediaType) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 1, userInfo: [NSLocalizedDescriptionKey: "INVALID_JOB"])
         }
         try stateQueue.sync {
-            try? fileManager.removeItem(at: originalURL(id))
+            guard records[id] == nil, !fileManager.fileExists(atPath: originalURL(id).path) else {
+                throw NSError(domain: "NativeBackgroundUpload", code: 14, userInfo: [NSLocalizedDescriptionKey: "JOB_ALREADY_HAS_LOCAL_CACHE"])
+            }
             guard fileManager.createFile(atPath: originalURL(id).path, contents: nil) else {
                 throw NSError(domain: "NativeBackgroundUpload", code: 2, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_CREATE_FAILED"])
             }
@@ -289,45 +302,95 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func pauseJob(id: String) {
-        session.getAllTasks { tasks in
-            tasks.filter { self.taskJobId($0) == id }.forEach { $0.suspend() }
-        }
-        stateQueue.sync { reserveTasks[id]?.suspend() }
+        performOnTasks(id: id, action: { $0.suspend() })
         if let record = mutate(id, { value in
             value.status = "paused"
             value.error = "已暂停，后台原件仍安全保存在本机。"
         }) { notify(record) }
     }
 
-    func resumeJob(id: String) throws {
-        // Refuse a misleading "retrying" state when the original never finished
-        // staging. A ready native job always owns a durable file that can survive an
-        // app update; an interrupted staging job must be reselected by the user.
-        guard let current = stateQueue.sync(execute: { records[id] }) else {
-            throw NSError(domain: "NativeBackgroundUpload", code: 5, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"])
+    func resumeJob(id: String, fileName: String?, mimeType: String?, sizeBytes: Int64?, mediaType: String?, contentHash: String?) throws {
+        guard UUID(uuidString: id) != nil else {
+            throw NSError(domain: "NativeBackgroundUpload", code: 1, userInfo: [NSLocalizedDescriptionKey: "INVALID_JOB"])
         }
-        guard current.ready, fileManager.fileExists(atPath: originalURL(id).path) else {
-            throw NSError(domain: "NativeBackgroundUpload", code: 13, userInfo: [NSLocalizedDescriptionKey: "本机原件未完整保存，请重新选择这个文件。"])
+        let url = originalURL(id)
+        var current = stateQueue.sync(execute: { records[id] })
+
+        // If the durable original survived but jobs.json did not, rebuild the native
+        // index from the Web/IndexedDB mirror. This turns "JOB_NOT_FOUND" into an actual
+        // cache recovery path instead of abandoning a photo that is still on disk.
+        if current == nil {
+            guard let fileName, let sizeBytes, let mediaType,
+                  sizeBytes >= 0, ["photo", "video", "file"].contains(mediaType),
+                  fileManager.fileExists(atPath: url.path), (try? fileSize(url)) == sizeBytes else {
+                throw NSError(domain: "NativeBackgroundUpload", code: 5, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND_OR_CACHE_INCOMPLETE"])
+            }
+            let timestamp = now()
+            let rebuilt = NativeUploadRecord(
+                id: id, fileName: fileName, mimeType: mimeType?.isEmpty == false ? mimeType! : "application/octet-stream",
+                sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: nil,
+                status: "failed", stage: "reserving", progress: 15, attempts: 0, error: "已从本机缓存重建上传记录。",
+                remoteAssetId: nil, uploadToken: nil, contentHash: contentHash ?? (try? sha256(url: url)), deduplicated: nil, ready: true,
+                createdAt: timestamp, updatedAt: timestamp
+            )
+            stateQueue.sync {
+                records[id] = rebuilt
+                saveStateLocked()
+            }
+            current = rebuilt
         }
 
-        // An explicit user retry starts a fresh automatic retry budget. Without this,
-        // a job that reached the 24-attempt guard could never be resumed from the UI.
+        guard var current, fileManager.fileExists(atPath: url.path) else {
+            throw NSError(domain: "NativeBackgroundUpload", code: 13, userInfo: [NSLocalizedDescriptionKey: "本机原件缓存不存在，请重新选择这个文件。"])
+        }
+        if !current.ready, (try? fileSize(url)) == current.sizeBytes {
+            current.contentHash = current.contentHash ?? (try? sha256(url: url))
+            current.ready = true
+            current.status = "failed"
+            current.stage = "reserving"
+            current.error = "检测到完整本机缓存，已恢复任务索引。"
+            stateQueue.sync {
+                records[id] = current
+                saveStateLocked()
+            }
+        }
+        guard current.ready, (try? fileSize(url)) == current.sizeBytes else {
+            throw NSError(domain: "NativeBackgroundUpload", code: 13, userInfo: [NSLocalizedDescriptionKey: "本机原件未完整保存，请重新选择这个文件。现有部分缓存不会自动删除。"])
+        }
+
+        if current.status == "failed" {
+            guard let retrying = mutate(id, { value in
+                // Manual retry means "recover this cached original", not "replay the
+                // same failed token". Force a fresh /reserve against the durable hash.
+                value.status = "retrying"
+                value.stage = "reserving"
+                value.progress = min(value.progress, 18)
+                value.attempts = 0
+                value.remoteAssetId = nil
+                value.uploadToken = nil
+                value.error = "正在从本机缓存重新建立上传。"
+            }) else { return }
+            notify(retrying)
+            stateQueue.sync { reserveTaskTokens.removeValue(forKey: id) }
+            performOnTasks(id: id, action: { $0.cancel() }) { _ in
+                do { try self.scheduleReserve(retrying, earliest: nil) }
+                catch {
+                    if let failed = self.mutate(id, { value in value.status = "failed"; value.error = error.localizedDescription }) {
+                        self.notify(failed)
+                    }
+                }
+            }
+            return
+        }
+
         if let record = mutate(id, { value in
             value.status = "retrying"
             value.attempts = 0
             value.error = nil
         }) { notify(record) }
-        if let reserveTask = stateQueue.sync(execute: { reserveTasks[id] }) {
-            reserveTask.resume()
-            return
-        }
-        session.getAllTasks { tasks in
-            let matches = tasks.filter { self.taskJobId($0) == id }
-            if !matches.isEmpty {
-                matches.forEach { $0.resume() }
-                return
-            }
-            guard let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready else { return }
+        performOnTasks(id: id, action: { $0.resume() }) { count in
+            guard count == 0,
+                  let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready else { return }
             if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
                 self.retryContent(record, after: 0, reason: nil)
             } else {
@@ -337,12 +400,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func cancelJob(id: String) {
-        session.getAllTasks { tasks in
-            tasks.filter { self.taskJobId($0) == id }.forEach { $0.cancel() }
-        }
+        performOnTasks(id: id, action: { $0.cancel() })
         stateQueue.sync {
             stagingHashers.removeValue(forKey: id)
-            reserveTasks.removeValue(forKey: id)?.cancel()
+            reserveTaskTokens.removeValue(forKey: id)
         }
         DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
         if let record = mutate(id, { value in
@@ -354,12 +415,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func removeJob(id: String) {
-        session.getAllTasks { tasks in
-            tasks.filter { self.taskJobId($0) == id }.forEach { $0.cancel() }
-        }
+        performOnTasks(id: id, action: { $0.cancel() })
         stateQueue.sync {
             stagingHashers.removeValue(forKey: id)
-            reserveTasks.removeValue(forKey: id)?.cancel()
+            reserveTaskTokens.removeValue(forKey: id)
             records.removeValue(forKey: id)
             saveStateLocked()
         }
@@ -368,15 +427,18 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func handleBackgroundEvents(identifier: String, completionHandler: @escaping () -> Void) -> Bool {
-        guard identifier == Self.sessionIdentifier else { return false }
-        stateQueue.async { self.backgroundCompletionHandler = completionHandler }
+        guard identifier == Self.sessionIdentifier || identifier == Self.reserveSessionIdentifier else { return false }
+        stateQueue.async { self.backgroundCompletionHandlers[identifier] = completionHandler }
         _ = session
+        _ = reserveSession
         reconcileTasks()
         return true
     }
 
     func resumePendingTransfers() {
         _ = session
+        _ = reserveSession
+        recoverRetryableFailures()
         reconcileTasks()
     }
 
@@ -385,6 +447,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             foregroundWatchdogGeneration += 1
             return foregroundWatchdogGeneration
         }
+        recoverRetryableFailures()
         reconcileTasks()
         scheduleForegroundRecoveryWatchdog(generation: generation)
     }
@@ -429,7 +492,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 
     private func endStagingProtectionIfIdleOnMain() {
         guard stagingProtectionDepth == 0, stagingBackgroundTask != .invalid else { return }
-        let hasPendingReserve = stateQueue.sync { !reserveTasks.isEmpty }
+        let hasPendingReserve = stateQueue.sync { !reserveTaskTokens.isEmpty }
         guard !hasPendingReserve else { return }
         let task = stagingBackgroundTask
         stagingBackgroundTask = .invalid
@@ -488,58 +551,49 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         guard record.ready, fileManager.fileExists(atPath: originalURL(record.id).path) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 8, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_MISSING"])
         }
-        if let earliest, earliest > Date() {
-            let delay = earliest.timeIntervalSinceNow
-            workerQueue.asyncAfter(deadline: .now() + max(0, delay)) { [weak self] in
-                guard let self,
-                      let current = self.stateQueue.sync(execute: { self.records[record.id] }),
-                      current.ready,
-                      current.status != "done",
-                      current.status != "failed",
-                      current.status != "paused" else { return }
-                do { try self.scheduleReserve(current, earliest: nil) }
-                catch {
-                    if let failed = self.mutate(record.id, { value in value.status = "failed"; value.error = error.localizedDescription }) {
-                        self.notify(failed)
-                    }
-                }
-            }
-            return
-        }
         guard let cookie = cookieHeader() else {
             throw NSError(domain: "NativeBackgroundUpload", code: 9, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
-        let payload = try reservePayload(record)
-        var request = baseRequest(url: apiBase.appendingPathComponent("api/assets/reserve"), method: "POST", cookie: cookie)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(String(payload.count), forHTTPHeaderField: "Content-Length")
-        request.httpBody = payload
-
-        let task = foregroundSession.dataTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
-            _ = self.stateQueue.sync { self.reserveTasks.removeValue(forKey: record.id) }
-            DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
-            guard let current = self.stateQueue.sync(execute: { self.records[record.id] }), current.ready else { return }
-            self.handleReserveResult(current, data: data ?? Data(), response: response as? HTTPURLResponse, error: error)
-        }
+        let reserveToken = UUID().uuidString
         let shouldStart = stateQueue.sync { () -> Bool in
-            guard reserveTasks[record.id] == nil else { return false }
-            reserveTasks[record.id] = task
+            guard reserveTaskTokens[record.id] == nil else { return false }
+            reserveTaskTokens[record.id] = reserveToken
             return true
         }
         guard shouldStart else { return }
-        let updated = mutate(record.id) { value in
-            value.status = value.attempts > 0 ? "retrying" : "uploading"
-            value.stage = "reserving"
-            value.progress = max(value.progress, 18)
-            value.attempts += 1
-            value.error = nil
+
+        do {
+            let payload = try reservePayload(record)
+            let bodyURL = reserveBodyURL(record.id, token: reserveToken)
+            try payload.write(to: bodyURL, options: .atomic)
+            var request = baseRequest(url: apiBase.appendingPathComponent("api/assets/reserve"), method: "POST", cookie: cookie)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(String(payload.count), forHTTPHeaderField: "Content-Length")
+            let task = reserveSession.uploadTask(with: request, fromFile: bodyURL)
+            task.taskDescription = "reserve|\(record.id)|\(reserveToken)"
+            task.earliestBeginDate = earliest
+            let delayed = earliest.map { $0 > Date() } ?? false
+            let updated = mutate(record.id) { value in
+                value.status = delayed || value.attempts > 0 ? "retrying" : "uploading"
+                value.stage = "reserving"
+                value.progress = max(value.progress, 18)
+                value.attempts += 1
+                value.error = delayed ? record.error : nil
+            }
+            if let updated { notify(updated) }
+            task.resume()
+        } catch {
+            stateQueue.sync {
+                if reserveTaskTokens[record.id] == reserveToken { reserveTaskTokens.removeValue(forKey: record.id) }
+            }
+            throw error
         }
-        if let updated { notify(updated) }
-        task.resume()
     }
 
     private func handleReserveResult(_ record: NativeUploadRecord, data: Data, response: HTTPURLResponse?, error: Error?) {
+        guard let current = stateQueue.sync(execute: { records[record.id] }),
+              current.ready, current.status != "done", current.status != "failed", current.status != "paused" else { return }
+        let record = current
         if let error {
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return }
@@ -766,79 +820,130 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     private func cleanupFiles(_ id: String) {
+        stateQueue.sync { lastProgressAt.removeValue(forKey: id) }
         try? fileManager.removeItem(at: originalURL(id))
         try? fileManager.removeItem(at: reserveBodyURL(id))
+        if let urls = try? fileManager.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: nil) {
+            for url in urls where url.lastPathComponent.hasPrefix("\(id).") && url.lastPathComponent.hasSuffix(".reserve.json") {
+                try? fileManager.removeItem(at: url)
+            }
+        }
     }
 
     private func taskJobId(_ task: URLSessionTask) -> String? {
         guard let description = task.taskDescription else { return nil }
-        let parts = description.split(separator: "|", maxSplits: 1).map(String.init)
-        return parts.count == 2 ? parts[1] : nil
+        let parts = description.split(separator: "|", maxSplits: 2).map(String.init)
+        return parts.count >= 2 ? parts[1] : nil
     }
 
     private func taskStage(_ task: URLSessionTask) -> String? {
-        task.taskDescription?.split(separator: "|", maxSplits: 1).first.map(String.init)
+        task.taskDescription?.split(separator: "|", maxSplits: 2).first.map(String.init)
+    }
+
+    private func taskToken(_ task: URLSessionTask) -> String? {
+        guard let description = task.taskDescription else { return nil }
+        let parts = description.split(separator: "|", maxSplits: 2).map(String.init)
+        return parts.count == 3 ? parts[2] : nil
+    }
+
+    private func contentTaskMatchesRecord(_ task: URLSessionTask, record: NativeUploadRecord) -> Bool {
+        guard record.ready,
+              record.status != "done", record.status != "failed", record.status != "paused",
+              record.stage == "original",
+              let assetId = record.remoteAssetId,
+              let uploadToken = record.uploadToken,
+              task.originalRequest?.url?.path.contains("/api/assets/\(assetId)/content") == true,
+              task.originalRequest?.value(forHTTPHeaderField: "X-Upload-Token") == uploadToken else { return false }
+        return true
+    }
+
+    private func taskBufferKey(_ session: URLSession, task: URLSessionTask) -> String {
+        "\(session.configuration.identifier ?? "unknown")|\(task.taskIdentifier)"
+    }
+
+    private func performOnTasks(id: String, action: @escaping (URLSessionTask) -> Void, completion: ((Int) -> Void)? = nil) {
+        session.getAllTasks { contentTasks in
+            self.reserveSession.getAllTasks { reserveTasks in
+                let matches = (contentTasks + reserveTasks).filter { self.taskJobId($0) == id }
+                matches.forEach(action)
+                if let completion { self.workerQueue.async { completion(matches.count) } }
+            }
+        }
     }
 
     private func reconcileTasks() {
-        session.getAllTasks { tasks in
-            // Older builds used the background session for the tiny /reserve request.
-            // A task from that implementation can survive an in-place app update and
-            // remain parked at 18%, which would make its job look active forever and
-            // prevent the new foreground reservation path from taking over. Cancel
-            // only those legacy reserve tasks; keep real content uploads attached.
-            let legacyReserveTasks = tasks.filter { self.taskStage($0) == "reserve" }
-            legacyReserveTasks.forEach { $0.cancel() }
+        reserveSession.getAllTasks { dedicatedReserveTasks in
+            self.session.getAllTasks { legacyAndContentTasks in
+                let legacyReserveTasks = legacyAndContentTasks.filter { self.taskStage($0) == "reserve" }
+                let reserveTasks = dedicatedReserveTasks + legacyReserveTasks
+                let contentTasks = legacyAndContentTasks.filter { self.taskStage($0) == "content" }
+                let recordsById = self.stateQueue.sync { self.records }
 
-            let contentTasks = tasks.filter { self.taskStage($0) == "content" }
-            let recordsById = self.stateQueue.sync { self.records }
-            var restartIds = Set<String>()
+                let activeReserveIds = Set(reserveTasks.compactMap { task -> String? in
+                    guard let id = self.taskJobId(task), let record = recordsById[id],
+                          record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { return nil }
+                    // A reserve task only belongs to jobs still waiting for a fresh
+                    // reservation. If state already advanced to content, retire the
+                    // stale handshake rather than letting it overwrite a newer token.
+                    if record.stage == "original", record.remoteAssetId != nil, record.uploadToken != nil {
+                        task.cancel()
+                        return nil
+                    }
+                    if task.state == .suspended { task.resume() }
+                    let token = self.taskToken(task) ?? "legacy:\(task.taskIdentifier)"
+                    self.stateQueue.sync {
+                        if self.reserveTaskTokens[id] == nil { self.reserveTaskTokens[id] = token }
+                    }
+                    return id
+                })
 
-            for task in contentTasks {
-                guard let id = self.taskJobId(task), let record = recordsById[id],
-                      record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { continue }
-                if task.state == .suspended { task.resume() }
-                if let earliest = task.earliestBeginDate, earliest > Date() {
-                    // This task is intentionally waiting for a server Retry-After or
-                    // transport backoff. Do not let the foreground stale-task watchdog
-                    // cancel a healthy system-scheduled retry before its lease expires.
-                    continue
+                var restartIds = Set<String>()
+                var restartReserveIds = Set<String>()
+                for task in contentTasks {
+                    guard let id = self.taskJobId(task), let record = recordsById[id],
+                          record.ready, record.status != "done", record.status != "failed", record.status != "paused" else { continue }
+                    if record.stage != "original" || record.remoteAssetId == nil || record.uploadToken == nil {
+                        restartReserveIds.insert(id)
+                        task.cancel()
+                        continue
+                    }
+                    if task.state == .suspended { task.resume() }
+                    if let earliest = task.earliestBeginDate, earliest > Date() { continue }
+
+                    let staleSeconds = max(120.0, min(360.0, Double(record.sizeBytes) / (128.0 * 1024.0) + 60.0))
+                    let lastProgress = self.stateQueue.sync { self.lastProgressAt[id] } ?? ISO8601DateFormatter().date(from: record.updatedAt)
+                    if record.stage == "original",
+                       let updated = lastProgress,
+                       Date().timeIntervalSince(updated) > staleSeconds {
+                        restartIds.insert(id)
+                        task.cancel()
+                    }
                 }
 
-                // A task can survive in URLSession as nominally running after the
-                // transport has stopped making progress. When the app is relaunched or
-                // returns to foreground, replace only tasks whose progress timestamp is
-                // stale for a size-aware window. The server-side attempt lease rejects
-                // a late completion from the old request.
-                let staleSeconds = max(90.0, min(240.0, Double(record.sizeBytes) / (128.0 * 1024.0) + 45.0))
-                if record.stage == "original",
-                   let updated = ISO8601DateFormatter().date(from: record.updatedAt),
-                   Date().timeIntervalSince(updated) > staleSeconds {
-                    restartIds.insert(id)
-                    task.cancel()
+                let activeContentIds = Set(contentTasks.compactMap { task -> String? in
+                    guard let id = self.taskJobId(task), !restartIds.contains(id), !restartReserveIds.contains(id) else { return nil }
+                    return id
+                })
+                let activeIds = activeReserveIds.union(activeContentIds)
+                let resumable = self.stateQueue.sync {
+                    self.records.values.filter {
+                        $0.ready && $0.status != "done" && $0.status != "failed" && $0.status != "paused" && !activeIds.contains($0.id)
+                    }
                 }
-            }
-
-            let activeIds = Set(contentTasks.compactMap { task -> String? in
-                guard let id = self.taskJobId(task), !restartIds.contains(id) else { return nil }
-                return id
-            })
-            let resumable = self.stateQueue.sync {
-                self.records.values.filter { $0.ready && $0.status != "done" && $0.status != "failed" && !activeIds.contains($0.id) }
-            }
-            for record in resumable {
-                if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
-                    let restarting = restartIds.contains(record.id)
-                    self.retryContent(record, after: restarting ? 1 : 0, reason: restarting ? "检测到后台上传停滞，正在重新连接。" : nil)
-                } else {
-                    self.retryReserve(record, after: 0, reason: nil)
+                for record in resumable {
+                    if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
+                        let restarting = restartIds.contains(record.id)
+                        self.retryContent(record, after: restarting ? 1 : 0, reason: restarting ? "检测到后台上传停滞，正在重新连接。" : nil)
+                    } else {
+                        self.retryReserve(record, after: 0, reason: nil)
+                    }
                 }
             }
         }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        responseBuffers[dataTask.taskIdentifier, default: Data()].append(data)
+        responseBuffers[taskBufferKey(session, task: dataTask), default: Data()].append(data)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
@@ -846,8 +951,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let ratio = min(1, max(0, Double(totalBytesSent) / Double(totalBytesExpectedToSend)))
         let nextProgress = 32 + ratio * 63
         let shouldPersist = stateQueue.sync { () -> Bool in
+            lastProgressAt[id] = Date()
             guard let current = records[id] else { return false }
-            return nextProgress >= 95 || nextProgress - current.progress >= 1
+            // Persist coarse transfer milestones instead of rewriting the entire
+            // jobs.json for every 1%. With 90 photos, 1% updates caused thousands of
+            // full-state rewrites and made the uploader itself compete with networking.
+            return nextProgress >= 95 || nextProgress - current.progress >= 5
         }
         guard shouldPersist else { return }
         if let record = mutate(id, { value in value.progress = max(value.progress, nextProgress) }) { notify(record) }
@@ -855,8 +964,26 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let id = taskJobId(task), let stage = taskStage(task) else { return }
-        let data = responseBuffers.removeValue(forKey: task.taskIdentifier) ?? Data()
+        let data = responseBuffers.removeValue(forKey: taskBufferKey(session, task: task)) ?? Data()
+        var reserveResultIsCurrent = true
+        if stage == "reserve" {
+            let token = taskToken(task)
+            reserveResultIsCurrent = stateQueue.sync { () -> Bool in
+                if let token {
+                    guard reserveTaskTokens[id] == token else { return false }
+                    reserveTaskTokens.removeValue(forKey: id)
+                    return true
+                }
+                guard reserveTaskTokens[id] == nil || reserveTaskTokens[id]?.hasPrefix("legacy:") == true else { return false }
+                reserveTaskTokens.removeValue(forKey: id)
+                return true
+            }
+            try? fileManager.removeItem(at: reserveBodyURL(id, token: token))
+            DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
+            guard reserveResultIsCurrent else { return }
+        }
         guard let record = stateQueue.sync(execute: { records[id] }) else { return }
+        if stage == "content", !contentTaskMatchesRecord(task, record: record) { return }
         let response = task.response as? HTTPURLResponse
 
         if let error {
@@ -870,9 +997,6 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let status = response?.statusCode ?? 0
         let code = responseErrorCode(data)
         if stage == "reserve" {
-            // Compatibility for reservation tasks created by older app builds. New
-            // builds perform this tiny handshake on foregroundSession and reserve the
-            // background URLSession exclusively for the original file transfer.
             handleReserveResult(record, data: data, response: response, error: nil)
             return
         }
@@ -909,11 +1033,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        let completion = stateQueue.sync { () -> (() -> Void)? in
-            let value = backgroundCompletionHandler
-            backgroundCompletionHandler = nil
-            return value
-        }
+        guard let identifier = session.configuration.identifier else { return }
+        let completion = stateQueue.sync { backgroundCompletionHandlers.removeValue(forKey: identifier) }
         DispatchQueue.main.async { completion?() }
     }
 }
@@ -1004,7 +1125,14 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func resumeJob(_ call: CAPPluginCall) {
         guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
         do {
-            try NativeBackgroundUploadManager.shared.resumeJob(id: id)
+            try NativeBackgroundUploadManager.shared.resumeJob(
+                id: id,
+                fileName: call.getString("fileName"),
+                mimeType: call.getString("mimeType"),
+                sizeBytes: call.getInt("sizeBytes").map { Int64($0) },
+                mediaType: call.getString("mediaType"),
+                contentHash: call.getString("contentHash")
+            )
             call.resolve()
         } catch {
             call.reject(error.localizedDescription)
