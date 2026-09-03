@@ -78,6 +78,11 @@ interface ArchiveContextValue {
 
 const ArchiveContext = createContext<ArchiveContextValue | null>(null)
 
+// Upload completion, reconnect, focus and visibility events already refresh immediately.
+// Keep only a lower-frequency safety poll for external Telegram / multi-device changes so
+// an idle visible archive does not continuously consume D1 row reads.
+const BACKGROUND_ARCHIVE_SYNC_INTERVAL_MS = 60_000
+
 function buildAssetParams(options: LoadOptions, cursor?: string | null): URLSearchParams {
   const params = new URLSearchParams({ limit: '36' })
   if (options.q) params.set('q', options.q)
@@ -418,7 +423,7 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
       if (trailingSync !== undefined) window.clearTimeout(trailingSync)
       // A batch can finish several uploads almost simultaneously. Refresh once after
       // the final commit instead of coalescing later commit events into an older in-flight
-      // list request (which can leave the timeline stale until the 20s background poll).
+      // list request (which can leave the timeline stale until the safety background poll).
       trailingSync = window.setTimeout(() => {
         trailingSync = undefined
         void syncLatest()
@@ -449,7 +454,7 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
     const syncIfVisible = () => {
       if (document.visibilityState === 'visible' && navigator.onLine && !loading && !loadingMore) void syncLatest()
     }
-    const interval = window.setInterval(syncIfVisible, 20_000)
+    const interval = window.setInterval(syncIfVisible, BACKGROUND_ARCHIVE_SYNC_INTERVAL_MS)
     window.addEventListener('focus', syncIfVisible)
     document.addEventListener('visibilitychange', syncIfVisible)
     return () => {
