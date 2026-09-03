@@ -1482,8 +1482,11 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     // PhotosUI object and picker lifecycle field confined to the main thread.
     private var photoPickerCall: CAPPluginCall?
     private var photoPickerBatchId: String?
-    private let photoImportQueue = DispatchQueue(label: "cd.cc.joye.photo.photo-import", qos: .userInitiated, attributes: .concurrent)
-    private let photoImportSlots = DispatchSemaphore(value: 3)
+    // Keep provider materialization bounded without parking dozens of GCD worker
+    // threads on a semaphore. Large selections previously queued one blocking task per
+    // photo (80 selections => 77 blocked workers), which can trigger thread pressure or
+    // jetsam on real devices. Two recursive lanes keep at most two provider reads active.
+    private let photoImportLaneCount = 2
 
     @objc override public func load() {
         _ = NativeBackgroundUploadManager.shared
@@ -1544,6 +1547,64 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         }
     }
 
+    private func startPhotoImportLane(
+        _ results: [PHPickerResult],
+        index: Int,
+        stride: Int,
+        batchId: String,
+        group: DispatchGroup
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard index < results.count else { return }
+
+        let provider = results[index].itemProvider
+        let jobId = UUID().uuidString
+        let typeIdentifier = provider.registeredTypeIdentifiers.first(where: {
+            guard let type = UTType($0) else { return false }
+            return type.conforms(to: .image)
+        }) ?? UTType.image.identifier
+
+        provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
+            if let url {
+                let type = UTType(typeIdentifier)
+                var fileName = provider.suggestedName ?? url.lastPathComponent
+                if (fileName as NSString).pathExtension.isEmpty, let ext = type?.preferredFilenameExtension {
+                    fileName += ".\(ext)"
+                }
+                let mimeType = type?.preferredMIMEType ?? "image/jpeg"
+                let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? nil
+                let lastModifiedMs = modified.map { $0.timeIntervalSince1970 * 1000 }
+
+                // loadFileRepresentation only guarantees this URL until its completion
+                // handler returns. importPickedPhoto performs the app-owned copy
+                // synchronously, then hashes/reserves asynchronously.
+                NativeBackgroundUploadManager.shared.importPickedPhoto(
+                    id: jobId, batchId: batchId, sourceURL: url, fileName: fileName,
+                    mimeType: mimeType, lastModifiedMs: lastModifiedMs
+                ) { result in
+                    if case .failure(let importError) = result {
+                        self.notifyPickerError(batchId: batchId, jobId: jobId, message: importError.localizedDescription)
+                    }
+                    group.leave()
+                }
+            } else {
+                self.notifyPickerError(
+                    batchId: batchId,
+                    jobId: jobId,
+                    message: error?.localizedDescription ?? "无法读取所选照片。"
+                )
+                group.leave()
+            }
+
+            // Start the next item in this lane only after the temporary provider URL
+            // has either been copied or rejected. This keeps provider concurrency
+            // strictly bounded without blocking any dispatch worker thread.
+            DispatchQueue.main.async {
+                self.startPhotoImportLane(results, index: index + stride, stride: stride, batchId: batchId, group: group)
+            }
+        }
+    }
+
     public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
         // PHPickerViewControllerDelegate is a MainActor protocol. Keep the retained
         // CAPPluginCall and picker state on that actor as well.
@@ -1558,62 +1619,10 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
 
         NativeBackgroundUploadManager.shared.beginStagingProtection()
         let group = DispatchGroup()
-        for result in results {
-            let provider = result.itemProvider
-            let jobId = UUID().uuidString
-            let typeIdentifier = provider.registeredTypeIdentifiers.first(where: {
-                guard let type = UTType($0) else { return false }
-                return type.conforms(to: .image)
-            }) ?? UTType.image.identifier
-            group.enter()
-
-            // Unlimited picker selection must not become unlimited simultaneous file
-            // materialization. Bound provider work to three in-flight originals so a
-            // large photo batch cannot spike memory/file-provider pressure and get the
-            // app jetsammed while preserving the user's full selection.
-            photoImportQueue.async { [weak self] in
-                guard let self else { group.leave(); return }
-                let slot = self.photoImportSlots
-                slot.wait()
-                provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self] url, error in
-                    guard let self else {
-                        slot.signal()
-                        group.leave()
-                        return
-                    }
-                    guard let url else {
-                        self.notifyPickerError(
-                            batchId: batchId,
-                            jobId: jobId,
-                            message: error?.localizedDescription ?? "无法读取所选照片。"
-                        )
-                        slot.signal()
-                        group.leave()
-                        return
-                    }
-                    let type = UTType(typeIdentifier)
-                    var fileName = provider.suggestedName ?? url.lastPathComponent
-                    if (fileName as NSString).pathExtension.isEmpty, let ext = type?.preferredFilenameExtension {
-                        fileName += ".\(ext)"
-                    }
-                    let mimeType = type?.preferredMIMEType ?? "image/jpeg"
-                    let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? nil
-                    let lastModifiedMs = modified.map { $0.timeIntervalSince1970 * 1000 }
-                    NativeBackgroundUploadManager.shared.importPickedPhoto(
-                        id: jobId, batchId: batchId, sourceURL: url, fileName: fileName,
-                        mimeType: mimeType, lastModifiedMs: lastModifiedMs
-                    ) { result in
-                        if case .failure(let importError) = result {
-                            self.notifyPickerError(batchId: batchId, jobId: jobId, message: importError.localizedDescription)
-                        }
-                        group.leave()
-                    }
-                    // The temporary provider URL has been copied synchronously by
-                    // importPickedPhoto before it returns, so another provider may now
-                    // materialize while hashing/reservation completes on workerQueue.
-                    slot.signal()
-                }
-            }
+        for _ in results { group.enter() }
+        let lanes = min(photoImportLaneCount, results.count)
+        for lane in 0..<lanes {
+            startPhotoImportLane(results, index: lane, stride: lanes, batchId: batchId, group: group)
         }
         group.notify(queue: .main) {
             NativeBackgroundUploadManager.shared.endStagingProtection()

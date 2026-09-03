@@ -1,4 +1,4 @@
-import { Capacitor } from '@capacitor/core'
+import { Capacitor, type PluginListenerHandle } from '@capacitor/core'
 import type { LocalUploadJob, MediaType, StorageBackend } from '../types'
 import { isNativeApp, nativePlatform } from './native-platform'
 import { NativeBackgroundUpload, resumeNativeBackgroundTransfer, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
@@ -14,6 +14,7 @@ import {
 
 const NATIVE_CHUNK_BYTES = 2 * 1024 * 1024
 let listenerReady = false
+let listenerInitialization: Promise<boolean> | null = null
 
 export function canUseIosBackgroundUpload(storageBackend: StorageBackend): boolean {
   return storageBackend === 'telegram_bot'
@@ -122,6 +123,11 @@ async function stageNativeOriginal(options: {
 
 export async function pickIosBackgroundPhotos(batchId: string): Promise<{ batchId: string; count: number }> {
   if (!canUseIosBackgroundUpload('telegram_bot')) throw new Error('NATIVE_BACKGROUND_UPLOAD_UNAVAILABLE')
+  // Startup recovery can be expensive when old native jobs exist. The previous code
+  // attached listeners only after that recovery finished, so a user could open the
+  // picker first and lose every create/finish event for the new batch. Make listener
+  // readiness a hard precondition of opening the native picker.
+  if (!await ensureIosBackgroundUploadListeners()) throw new Error('NATIVE_BACKGROUND_UPLOAD_LISTENER_UNAVAILABLE')
   return NativeBackgroundUpload.pickPhotos({ batchId })
 }
 
@@ -216,17 +222,43 @@ export async function syncIosBackgroundUploads(): Promise<void> {
   }
 }
 
+async function ensureIosBackgroundUploadListeners(): Promise<boolean> {
+  if (listenerReady) return true
+  if (listenerInitialization) return listenerInitialization
+
+  const attempt = (async () => {
+    let stateHandle: PluginListenerHandle | null = null
+    let pickerHandle: PluginListenerHandle | null = null
+    try {
+      stateHandle = await NativeBackgroundUpload.addListener('stateChanged', ({ job }) => { void mirrorNativeJob(job) })
+      pickerHandle = await NativeBackgroundUpload.addListener('pickerError', ({ batchId, jobId, message }) => {
+        globalThis.dispatchEvent(new CustomEvent('private-archive:native-picker-error', { detail: { batchId, jobId, message } }))
+      })
+      listenerReady = true
+      return true
+    } catch {
+      // A cold bridge can reject one listener while the plugin instance is still being
+      // registered. Roll back a partial subscription so the next foreground/picker
+      // attempt can retry without accumulating duplicate stateChanged callbacks.
+      if (stateHandle) await stateHandle.remove().catch(() => undefined)
+      if (pickerHandle) await pickerHandle.remove().catch(() => undefined)
+      listenerReady = false
+      return false
+    }
+  })()
+
+  listenerInitialization = attempt
+  try {
+    return await attempt
+  } finally {
+    if (listenerInitialization === attempt) listenerInitialization = null
+  }
+}
+
 export async function initializeIosBackgroundUploadSync(): Promise<void> {
   if (!isNativeApp() || nativePlatform() !== 'ios') return
+  // Subscribe before recovery. Recovery itself can resume native work and emit state;
+  // listeners installed afterwards necessarily miss those events.
+  await ensureIosBackgroundUploadListeners()
   await syncIosBackgroundUploads()
-  if (listenerReady) return
-  listenerReady = true
-  try {
-    await NativeBackgroundUpload.addListener('stateChanged', ({ job }) => { void mirrorNativeJob(job) })
-    await NativeBackgroundUpload.addListener('pickerError', ({ batchId, jobId, message }) => {
-      globalThis.dispatchEvent(new CustomEvent('private-archive:native-picker-error', { detail: { batchId, jobId, message } }))
-    })
-  } catch {
-    listenerReady = false
-  }
 }
