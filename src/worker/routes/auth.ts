@@ -2,17 +2,10 @@ import { Hono } from 'hono'
 import type { Env } from '../env'
 import {
   appUsersInitialized,
-  clearLoginFailures,
-  createAppSession,
   createAppUser,
-  deleteAppSession,
   getAppUserById,
   getAppUserByUsername,
   listAppUsers,
-  pruneAppAuth,
-  recentAccountLoginFailures,
-  recentLoginFailures,
-  recordLoginAttempt,
   toPublicAppUser,
   updateAppUser,
   type AppUserRow,
@@ -26,6 +19,15 @@ import {
 } from '../db/app-user-access-repository'
 import { APP_SESSION_COOKIE, APP_SESSION_TTL_SECONDS, createAppSessionToken, hashAppPassword, verifyAppPassword } from '../lib/app-auth'
 import { appendCookieDomain, nativeAppCookieDomain } from '../lib/app-session-cookie'
+import {
+  clearLoginFailuresRuntime,
+  createAppSessionRuntime,
+  deleteAppSessionRuntime,
+  pruneAuthRuntime,
+  recentAccountLoginFailuresRuntime,
+  recentLoginFailuresRuntime,
+  recordLoginAttemptRuntime,
+} from '../lib/auth-runtime'
 import { readCookieValue } from '../lib/cookies'
 import { isDesktopApiRequest, requireAccess, requireAccessOwner, resolveRequestAppUser } from '../lib/security'
 
@@ -131,6 +133,12 @@ function authBodyErrorStatus(code: string): 400 | 413 | 500 {
   return code.endsWith('_INVALID') ? 400 : 500
 }
 
+async function verifyLoginPassword(env: Env, password: string, encodedHash: string): Promise<boolean> {
+  const verifier = env.PASSWORD_VERIFIER
+  if (!verifier) return verifyAppPassword(password, encodedHash)
+  return verifier.getByName('app-login-password-verifier').verify(password, encodedHash)
+}
+
 async function requireCurrentOwner(context: Parameters<typeof resolveRequestAppUser>[0]) {
   const user = await resolveRequestAppUser(context)
   return user?.role === 'OWNER' && user.status === 'ACTIVE' ? user : null
@@ -163,7 +171,7 @@ function parseAccessGrants(value: unknown): AppUserGrant[] | null {
 }
 
 authRoutes.get('/status', requireAccess, async (context) => {
-  await pruneAppAuth(context.env.DB)
+  await pruneAuthRuntime(context.env)
   const initialized = await appUsersInitialized(context.env.DB)
   const user = await resolveRequestAppUser(context)
   return context.json({
@@ -187,7 +195,7 @@ authRoutes.post('/bootstrap', requireAccessOwner, async (context) => {
     const passwordHash = await hashAppPassword(password)
     const user = await createAppUser(context.env.DB, { username, displayName, passwordHash, role: 'OWNER' })
     const token = createAppSessionToken()
-    await createAppSession(context.env.DB, user.id, token)
+    await createAppSessionRuntime(context.env, user.id, token, user.password_hash)
     context.header('Set-Cookie', sessionCookie(token, secureCookie(context.req.url), requestCookieDomain(context)))
     return context.json({ user: await publicUserWithAccess(context.env.DB, user) }, 201)
   } catch (error) {
@@ -200,44 +208,55 @@ authRoutes.post('/bootstrap', requireAccessOwner, async (context) => {
 
 authRoutes.post('/login', requireAccess, async (context) => {
   const ip = clientIp(context.req.raw.headers, context.req.url)
+  let stage = 'prune'
   try {
-    await pruneAppAuth(context.env.DB)
+    await pruneAuthRuntime(context.env)
+    stage = 'initialized'
     if (!(await appUsersInitialized(context.env.DB))) return context.json({ error: 'APP_NOT_INITIALIZED' }, 409)
-    if (await recentLoginFailures(context.env.DB, ip) >= 8) {
+    stage = 'ip-rate-limit'
+    if (await recentLoginFailuresRuntime(context.env, ip) >= 8) {
       context.header('Retry-After', '900')
       return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429)
     }
+    stage = 'request-body'
     const body = await jsonBody(context)
     const username = validateUsername(body.username)
     const password = validatePassword(body.password)
-    if (await recentAccountLoginFailures(context.env.DB, username) >= 20) {
+    stage = 'account-rate-limit'
+    if (await recentAccountLoginFailuresRuntime(context.env, username) >= 20) {
       context.header('Retry-After', '900')
       return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429)
     }
+    stage = 'load-user'
     const user = await getAppUserByUsername(context.env.DB, username)
-    const passwordMatches = await verifyAppPassword(password, user?.password_hash ?? DUMMY_PASSWORD_HASH)
+    stage = 'verify-password'
+    const passwordMatches = await verifyLoginPassword(context.env, password, user?.password_hash ?? DUMMY_PASSWORD_HASH)
     const ok = Boolean(user && user.status === 'ACTIVE' && passwordMatches)
-    await recordLoginAttempt(context.env.DB, ip, username, ok)
+    stage = 'record-attempt'
+    await recordLoginAttemptRuntime(context.env, ip, username, ok)
     if (!ok || !user) return context.json({ error: 'LOGIN_INVALID' }, 401)
-    await clearLoginFailures(context.env.DB, ip, username)
+    stage = 'clear-failures'
+    await clearLoginFailuresRuntime(context.env, ip, username)
     // Do not synchronously rehash legacy passwords during login. A stronger PBKDF2
     // migration can exceed the Worker request CPU budget after verification has
     // already succeeded, which turns a valid password into LOGIN_FAILED and leaves
     // no session. Explicit password changes still use the current stronger hash.
+    stage = 'create-session'
     const token = createAppSessionToken()
-    await createAppSession(context.env.DB, user.id, token)
+    await createAppSessionRuntime(context.env, user.id, token, user.password_hash)
     context.header('Set-Cookie', sessionCookie(token, secureCookie(context.req.url), requestCookieDomain(context)))
     return context.json({ user: await publicUserWithAccess(context.env.DB, user) })
   } catch (error) {
     const code = error instanceof Error ? error.message : 'LOGIN_FAILED'
     const status = authBodyErrorStatus(code)
+    if (status === 500) console.error('App login failed', { stage, code })
     return context.json({ error: status === 500 ? 'LOGIN_FAILED' : code }, status)
   }
 })
 
 authRoutes.post('/logout', requireAccess, async (context) => {
   const token = rawSessionToken(context.req.header('Cookie'))
-  if (token) await deleteAppSession(context.env.DB, token)
+  if (token) await deleteAppSessionRuntime(context.env, token)
   context.header('Set-Cookie', clearSessionCookie(secureCookie(context.req.url), requestCookieDomain(context)))
   return context.json({ ok: true })
 })

@@ -2,6 +2,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { api, ApiError } from '../lib/api'
 import { setLocalUploadPrincipal } from '../lib/offline/store'
+import { wakeUploadScheduler } from '../lib/offline/processor'
+import { syncIosBackgroundUploads } from '../lib/native-background-upload'
 import { clearSensitivePrivateCaches } from '../lib/private-cache'
 import { clearNativeMediaCache } from '../lib/native-media'
 import type { AppAccount } from '../types'
@@ -50,6 +52,16 @@ function rememberAccount(account: AppAccount): KnownAccount[] {
   return next
 }
 
+function activateUploadPrincipal(account: AppAccount | null): void {
+  setLocalUploadPrincipal(account?.id ?? null, { adoptLegacy: account?.role === 'OWNER' })
+  if (!account) return
+  // Startup can restore the Web auth cookie after the native URLSession and Web
+  // scheduler have already made their first pass. Reconcile immediately when the
+  // principal becomes valid instead of waiting for another online/foreground event.
+  void syncIosBackgroundUploads()
+  void wakeUploadScheduler('auth-restored')
+}
+
 function friendlyAuthError(error: unknown): string {
   const code = error instanceof ApiError ? error.code : error instanceof Error ? error.message : ''
   switch (code) {
@@ -81,14 +93,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const status = await api.authStatus()
       setInitialized(status.initialized)
       setUser(status.user)
-      setLocalUploadPrincipal(status.user?.id ?? null, { adoptLegacy: status.user?.role === 'OWNER' })
+      activateUploadPrincipal(status.user)
       setAccessError(false)
       if (status.user) setKnownAccounts(rememberAccount(status.user))
     } catch (caught) {
       if (caught instanceof ApiError && caught.code === 'ACCESS_SIGN_IN_REQUIRED') {
         setAccessError(true)
         setUser(null)
-        setLocalUploadPrincipal(null)
+        activateUploadPrincipal(null)
       } else {
         setError(friendlyAuthError(caught))
       }
@@ -103,7 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!active) return
       setInitialized(status.initialized)
       setUser(status.user)
-      setLocalUploadPrincipal(status.user?.id ?? null, { adoptLegacy: status.user?.role === 'OWNER' })
+      activateUploadPrincipal(status.user)
       setAccessError(false)
       setError(null)
       if (status.user) setKnownAccounts(rememberAccount(status.user))
@@ -112,7 +124,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (caught instanceof ApiError && caught.code === 'ACCESS_SIGN_IN_REQUIRED') {
         setAccessError(true)
         setUser(null)
-        setLocalUploadPrincipal(null)
+        activateUploadPrincipal(null)
       } else {
         setError(friendlyAuthError(caught))
       }
@@ -124,7 +136,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const onAuthRequired = () => {
       setUser(null)
-      setLocalUploadPrincipal(null)
+      activateUploadPrincipal(null)
       void clearSensitivePrivateCaches().catch(() => undefined)
       clearNativeMediaCache()
       setError('登录会话已过期，请重新登录。')
@@ -139,7 +151,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const result = await api.bootstrapAccount(username, displayName, password)
       setInitialized(true)
       setUser(result.user)
-      setLocalUploadPrincipal(result.user.id, { adoptLegacy: result.user.role === 'OWNER' })
+      activateUploadPrincipal(result.user)
       setKnownAccounts(rememberAccount(result.user))
     } catch (caught) {
       setError(friendlyAuthError(caught))
@@ -155,7 +167,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       clearNativeMediaCache()
       setInitialized(true)
       setUser(result.user)
-      setLocalUploadPrincipal(result.user.id, { adoptLegacy: result.user.role === 'OWNER' })
+      activateUploadPrincipal(result.user)
       setAccessError(false)
       setKnownAccounts(rememberAccount(result.user))
     } catch (caught) {
@@ -169,7 +181,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await clearSensitivePrivateCaches().catch(() => 0)
     clearNativeMediaCache()
     setUser(null)
-    setLocalUploadPrincipal(null)
+    activateUploadPrincipal(null)
     setError(null)
   }, [])
 

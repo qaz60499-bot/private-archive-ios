@@ -16,6 +16,7 @@ export type ArchiveGlyphName =
   | 'settings'
   | 'search'
   | 'upload'
+  | 'more'
 
 const corePaths: Record<ArchiveGlyphName, ReactNode> = {
   archive: <><path d="M10 10.5h12v11H10z" /><path d="M8.5 7.5h15M13 14h6M16 14v4" /></>,
@@ -35,6 +36,7 @@ const corePaths: Record<ArchiveGlyphName, ReactNode> = {
   settings: <><path d="M16 8.5 19.5 10l3.2 3.5-.7 4.6-3 3.4-4.6.7-3.9-2.5-1.2-4.5 1.8-4.2Z" /><circle cx="16" cy="15.5" r="3.3" /><path d="m19.5 10-1.7 3M22 18.1l-3.5-.8M14.4 22.2l.1-3.5M10.5 19.7l2.3-2.5M11.1 11l3 2" /></>,
   search: <><circle cx="14" cy="14" r="6" /><path d="m18.5 18.5 5 5M11 14h6M14 11v6" /></>,
   upload: <><path d="M8.5 20v3.5h15V20M16 20V7.5M11.5 12l4.5-4.5 4.5 4.5" /></>,
+  more: <><circle cx="10" cy="16" r="1.35" /><circle cx="16" cy="16" r="1.35" /><circle cx="22" cy="16" r="1.35" /><path d="M8.5 21.5h15" /></>,
 }
 
 export function ArchiveGlyph({ name, className = '' }: { name: ArchiveGlyphName; className?: string }) {

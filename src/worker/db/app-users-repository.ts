@@ -113,8 +113,18 @@ export async function updateAppUser(db: D1Database, id: string, input: {
   if (!assignments.length) return getAppUserById(db, id)
   assignments.push('updated_at = ?')
   values.push(new Date().toISOString(), id, PERSONAL_WORKSPACE_ID)
-  await db.prepare(`UPDATE app_users SET ${assignments.join(', ')} WHERE id = ? AND workspace_id = ?`).bind(...values).run()
-  if (input.status === 'DISABLED' || input.passwordHash !== undefined) await deleteAppSessionsForUser(db, id)
+  const update = db.prepare(`UPDATE app_users SET ${assignments.join(', ')} WHERE id = ? AND workspace_id = ?`).bind(...values)
+  if (input.status === 'DISABLED' || input.passwordHash !== undefined) {
+    // Password/status changes and legacy D1-session invalidation are one transaction.
+    // A quota/network failure must not commit a new credential while leaving old
+    // database sessions valid (or report failure after the credential already changed).
+    await db.batch([
+      update,
+      db.prepare('DELETE FROM app_sessions WHERE user_id = ?').bind(id),
+    ])
+  } else {
+    await update.run()
+  }
   return getAppUserById(db, id)
 }
 
@@ -135,15 +145,16 @@ export async function createAppSession(db: D1Database, userId: string, rawToken:
 export async function resolveAppSession(db: D1Database, rawToken: string): Promise<AppUserRow | null> {
   const tokenHash = await hashAppSessionToken(rawToken)
   const now = new Date().toISOString()
-  const row = await db.prepare(`SELECT users.id, users.workspace_id, users.username, users.display_name,
+  // Legacy D1 sessions are intentionally read-only. Updating last_seen_at on every
+  // authenticated request made session validation depend on the D1 daily write
+  // quota, so a quota exhaustion could log out every client. New sessions live in
+  // the auth Durable Object; D1 sessions remain readable until they expire.
+  return db.prepare(`SELECT users.id, users.workspace_id, users.username, users.display_name,
       users.password_hash, users.role, users.status, users.last_login_at, users.created_at, users.updated_at
     FROM app_sessions sessions JOIN app_users users ON users.id = sessions.user_id
     WHERE sessions.token_hash = ? AND sessions.workspace_id = ? AND sessions.expires_at > ?
       AND users.status = 'ACTIVE' LIMIT 1`)
     .bind(tokenHash, PERSONAL_WORKSPACE_ID, now).first<AppUserRow>()
-  if (!row) return null
-  await db.prepare('UPDATE app_sessions SET last_seen_at = ? WHERE token_hash = ?').bind(now, tokenHash).run()
-  return row
 }
 
 export async function deleteAppSession(db: D1Database, rawToken: string): Promise<void> {

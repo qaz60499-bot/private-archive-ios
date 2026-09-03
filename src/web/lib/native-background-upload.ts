@@ -73,7 +73,10 @@ async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
   // Keep it until the native URLSession has actually completed; only then release the
   // duplicate bytes. This makes force-quit recovery independent of a transient picker
   // File handle while avoiding permanent double storage.
-  if (job.status === 'done') await releaseLocalUploadPayload(job.id)
+  if (job.status === 'done') {
+    await releaseLocalUploadPayload(job.id)
+    globalThis.dispatchEvent(new Event('private-archive:upload-committed'))
+  }
   globalThis.dispatchEvent(new CustomEvent('private-archive:native-upload-state', { detail: { batchId: job.batchId ?? local.batchId, jobId: job.id } }))
 }
 

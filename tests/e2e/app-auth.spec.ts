@@ -122,11 +122,23 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
     const response = await page.request.post('/api/assets/reserve', {
       data: {
         originalName: `${label}.jpg`, mimeType: 'image/jpeg', sizeBytes: bytes.byteLength, mediaType: 'photo',
-        contentHash: createHash('sha256').update(bytes).digest('hex'),
+        contentHash: createHash('sha256').update(bytes).digest('hex'), storageBackend: 'telegram_bot',
       },
     })
     expect(response.status()).toBe(201)
-    scopedAssets.push((await response.json() as { assetId: string }).assetId)
+    const reservation = await response.json() as { assetId: string; uploadToken: string }
+    const content = await page.request.put(`/api/assets/${reservation.assetId}/content`, {
+      data: bytes,
+      headers: {
+        'Content-Type': 'image/jpeg',
+        'Content-Length': String(bytes.byteLength),
+        'X-Upload-Token': reservation.uploadToken,
+      },
+    })
+    const contentStatus = content.status()
+    const contentBody = await content.json().catch(() => ({}))
+    expect(contentStatus, JSON.stringify(contentBody)).toBe(201)
+    scopedAssets.push(reservation.assetId)
   }
 
   const scopedMember = createdMembers[1]
@@ -158,7 +170,7 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
   })
   expect(downloadGrant.ok()).toBeTruthy()
   expect((await scopedApi.get(`/api/assets/${scopedAssets[1]}/media`)).status()).toBe(403)
-  expect((await scopedApi.get(`/api/assets/${scopedAssets[0]}/media`)).status()).toBe(404)
+  expect((await scopedApi.get(`/api/assets/${scopedAssets[0]}/media`)).status()).toBe(200)
   await scopedApi.dispose()
 
   for (const path of ['/api/auth/users', '/api/telegram/sources', '/api/access/shares', '/api/recovery/integrity']) {

@@ -181,7 +181,20 @@ assetsRoutes.post('/reserve', async (context) => {
           }, 409)
         }
         const token = createUploadToken()
-        await createUploadJobForAsset(context.env.DB, { assetId: existing.id, jobId: crypto.randomUUID(), token, tokenExpiresAt })
+        const rotated = await createUploadJobForAsset(context.env.DB, {
+          assetId: existing.id,
+          jobId: crypto.randomUUID(),
+          token,
+          tokenExpiresAt,
+          expectedUpdatedAt: latestJob?.updated_at,
+        })
+        if (!rotated) {
+          context.header('Retry-After', '1')
+          return context.json({
+            error: 'DUPLICATE_UPLOAD_IN_PROGRESS', assetId: existing.id, duplicate: false, resumed: true,
+            storageBackend: input.storageBackend, sizeTier, maxUploadBytes,
+          }, 409)
+        }
         return context.json({ assetId: existing.id, uploadToken: token, duplicate: false, resumed: true, storageBackend: input.storageBackend, sizeTier, maxUploadBytes }, 200)
       }
       context.header('Retry-After', '1')

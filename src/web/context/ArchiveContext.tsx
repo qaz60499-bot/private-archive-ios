@@ -113,6 +113,7 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
   const currentImportBatchRef = useRef<string | null>(null)
   const dismissedImportBatchesRef = useRef<Set<string>>(new Set())
   const nativePickerMissingJobsRef = useRef<Map<string, Set<string>>>(new Map())
+  const nativePickerInFlightRef = useRef<Promise<{ batchId: string; count: number } | undefined> | null>(null)
   const [lastOptions, setLastOptions] = useState<LoadOptions>({})
   const [hasLoadedMore, setHasLoadedMore] = useState(false)
   const prefetchedNextRef = useRef<{ cursor: string; result: Awaited<ReturnType<typeof api.listAssets>> } | null>(null)
@@ -262,40 +263,52 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
-  const runNativePhotoImport = useCallback(async () => {
-    const batchId = crypto.randomUUID()
-    currentImportBatchRef.current = batchId
-    dismissedImportBatchesRef.current.delete(batchId)
-    nativePickerMissingJobsRef.current.delete(batchId)
-    setUploadOpen(false)
-    setImportStatus({ batchId, active: true, total: 0, queued: 0, processed: 0, phase: 'registering', error: null })
-    try {
-      const result = await pickIosBackgroundPhotos(batchId)
-      if (!result.count) {
-        if (currentImportBatchRef.current === batchId) currentImportBatchRef.current = null
-        setImportStatus((current) => current?.batchId === batchId ? null : current)
+  const runNativePhotoImport = useCallback(() => {
+    // A fast double tap must represent one picker/batch, not two competing UI batches.
+    // Swift also rejects a second picker, but deduplicating here prevents the rejected
+    // call from overwriting currentImportBatchRef while the first picker is still live.
+    if (nativePickerInFlightRef.current) return nativePickerInFlightRef.current
+
+    const promise = (async () => {
+      const batchId = crypto.randomUUID()
+      currentImportBatchRef.current = batchId
+      dismissedImportBatchesRef.current.delete(batchId)
+      nativePickerMissingJobsRef.current.delete(batchId)
+      setUploadOpen(false)
+      setImportStatus({ batchId, active: true, total: 0, queued: 0, processed: 0, phase: 'registering', error: null })
+      try {
+        const result = await pickIosBackgroundPhotos(batchId)
+        if (!result.count) {
+          if (currentImportBatchRef.current === batchId) currentImportBatchRef.current = null
+          setImportStatus((current) => current?.batchId === batchId ? null : current)
+          return result
+        }
+        const jobs = await getLocalUploadsByBatch(batchId)
+        const processed = Math.min(result.count, jobs.length)
+        const complete = processed >= result.count
+        setImportStatus((current) => current?.batchId === batchId ? {
+          batchId,
+          active: !complete,
+          total: result.count,
+          queued: jobs.length,
+          processed,
+          phase: complete ? 'complete' : 'registering',
+          error: current.error,
+        } : current)
         return result
+      } catch (caught) {
+        setImportStatus((current) => current?.batchId === batchId ? {
+          batchId, active: false, total: current.total, queued: current.queued, processed: current.processed,
+          phase: 'complete', error: caught instanceof Error ? caught.message : '无法打开系统照片选择器。',
+        } : current)
+        return undefined
       }
-      const jobs = await getLocalUploadsByBatch(batchId)
-      const processed = Math.min(result.count, jobs.length)
-      const complete = processed >= result.count
-      setImportStatus((current) => current?.batchId === batchId ? {
-        batchId,
-        active: !complete,
-        total: result.count,
-        queued: jobs.length,
-        processed,
-        phase: complete ? 'complete' : 'registering',
-        error: current.error,
-      } : current)
-      return result
-    } catch (caught) {
-      setImportStatus((current) => current?.batchId === batchId ? {
-        batchId, active: false, total: current.total, queued: current.queued, processed: current.processed,
-        phase: 'complete', error: caught instanceof Error ? caught.message : '无法打开系统照片选择器。',
-      } : current)
-      return undefined
-    }
+    })()
+    nativePickerInFlightRef.current = promise
+    void promise.finally(() => {
+      if (nativePickerInFlightRef.current === promise) nativePickerInFlightRef.current = null
+    })
+    return promise
   }, [])
 
   const runImport = useCallback(async (files: FileList | File[], options?: { mobile?: boolean; storageBackend?: StorageBackend }) => {
@@ -398,6 +411,25 @@ export function ArchiveProvider({ children }: { children: ReactNode }) {
       window.removeEventListener('private-archive:native-picker-error', onNativePickerError)
     }
   }, [])
+
+  useEffect(() => {
+    let trailingSync: number | undefined
+    const onUploadCommitted = () => {
+      if (trailingSync !== undefined) window.clearTimeout(trailingSync)
+      // A batch can finish several uploads almost simultaneously. Refresh once after
+      // the final commit instead of coalescing later commit events into an older in-flight
+      // list request (which can leave the timeline stale until the 20s background poll).
+      trailingSync = window.setTimeout(() => {
+        trailingSync = undefined
+        void syncLatest()
+      }, 350)
+    }
+    window.addEventListener('private-archive:upload-committed', onUploadCommitted)
+    return () => {
+      if (trailingSync !== undefined) window.clearTimeout(trailingSync)
+      window.removeEventListener('private-archive:upload-committed', onUploadCommitted)
+    }
+  }, [syncLatest])
 
   useEffect(() => {
     const onOnline = () => {

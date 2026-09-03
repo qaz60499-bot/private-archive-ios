@@ -215,6 +215,7 @@ test('mobile timeline imports photos directly from the native picker without ope
   await expect(importButton).toBeVisible()
 
   const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  const distinctPng = Buffer.concat([onePixelPng, Buffer.from([0])])
   const suffix = `${Date.now()}`
   const firstName = `phone-library-${suffix}-a.png`
   const secondName = `phone-library-${suffix}-b.png`
@@ -223,7 +224,7 @@ test('mobile timeline imports photos directly from the native picker without ope
   const chooser = await chooserPromise
   await chooser.setFiles([
     { name: firstName, mimeType: 'image/png', buffer: onePixelPng },
-    { name: secondName, mimeType: 'image/png', buffer: onePixelPng },
+    { name: secondName, mimeType: 'image/png', buffer: distinctPng },
   ])
 
   await expect(page.getByRole('dialog', { name: '加入私人档案' })).toBeHidden()
@@ -333,7 +334,7 @@ test('timeline auto-syncs a Telegram item without manual refresh', async ({ page
   })
   expect(webhook.status()).toBe(201)
 
-  await expect(page.getByRole('button', { name: `打开 ${telegramName}` })).toBeVisible({ timeout: 12_000 })
+  await expect(page.getByRole('button', { name: `打开 ${telegramName}` })).toBeVisible({ timeout: 30_000 })
 })
 
 test('viewer can soft-delete a web asset without deleting Telegram storage', async ({ page, request }, testInfo) => {

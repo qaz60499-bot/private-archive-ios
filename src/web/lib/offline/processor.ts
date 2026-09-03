@@ -7,7 +7,7 @@ import {
 } from './store'
 import type { LocalUploadJob } from '../../types'
 import { calculateRetryDelay, friendlyUploadError, getUploadSchedulerLimits as policyLimits } from './scheduler-policy'
-import { cancelNativeBackgroundTransfer, pauseNativeBackgroundTransfer, resumeNativeBackgroundTransfer } from '../native-background-upload-plugin'
+import { cancelNativeBackgroundTransfer, pauseNativeBackgroundTransfer, removeNativeBackgroundTransfer, resumeNativeBackgroundTransfer } from '../native-background-upload-plugin'
 
 export { calculateRetryDelay, friendlyUploadError } from './scheduler-policy'
 
@@ -35,9 +35,61 @@ function notify(): void {
   subscribers.forEach((listener) => listener())
 }
 
+function notifyArchiveCommitted(): void {
+  if (typeof globalThis.dispatchEvent !== 'function' || typeof Event !== 'function') return
+  globalThis.dispatchEvent(new Event('private-archive:upload-committed'))
+}
+
 function isTransient(error: unknown): boolean {
   return error instanceof ApiError && ['NETWORK_OFFLINE', 'ACCESS_OR_NETWORK_FAILED', 'REQUEST_TIMEOUT', 'DUPLICATE_UPLOAD_IN_PROGRESS', 'UPLOAD_ALREADY_IN_PROGRESS'].includes(error.code)
     || error instanceof ApiError && [429, 502, 503, 504].includes(error.status)
+}
+
+async function reconcileCanceledReservation(job: LocalUploadJob): Promise<void> {
+  const assetId = job.remoteAssetId
+  if (!assetId || !navigator.onLine) return
+  try {
+    const cleanup = await api.discardUnstoredAssets([assetId])
+    if (cleanup.discarded > 0) {
+      if (job.nativeBackground) await removeNativeBackgroundTransfer(job.id).catch(() => undefined)
+      await updateLocalUpload(job.id, {
+        remoteAssetId: undefined, uploadToken: undefined,
+        error: '已取消，服务器未完成的预约也已清理。',
+      })
+      return
+    }
+
+    try {
+      const { asset } = await api.getAsset(assetId)
+      if (asset.status === 'trashed') {
+        if (job.nativeBackground) await removeNativeBackgroundTransfer(job.id).catch(() => undefined)
+        await updateLocalUpload(job.id, { remoteAssetId: undefined, uploadToken: undefined })
+        return
+      }
+      if (!['pending_upload', 'failed'].includes(asset.status)) {
+        // The server won the race before cancellation reached the transport. Reflect
+        // the durable truth instead of leaving UI/local cache saying "canceled" while
+        // D1/Telegram contain a successfully stored original.
+        if (job.nativeBackground) await removeNativeBackgroundTransfer(job.id).catch(() => undefined)
+        await updateLocalUpload(job.id, {
+          controlState: 'active', status: 'done', stage: 'completed', progress: 100,
+          uploadToken: undefined, error: '上传在取消完成前已由服务器保存。',
+        })
+        await releaseLocalUploadPayload(job.id)
+        notifyArchiveCommitted()
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        if (job.nativeBackground) await removeNativeBackgroundTransfer(job.id).catch(() => undefined)
+        await updateLocalUpload(job.id, { remoteAssetId: undefined, uploadToken: undefined })
+        return
+      }
+      throw error
+    }
+  } catch {
+    // Keep remoteAssetId on the canceled local record. Startup/online scheduler passes
+    // will retry reconciliation without needing the original bytes.
+  }
 }
 
 async function prepareLocalUpload(job: LocalUploadJob): Promise<void> {
@@ -115,6 +167,7 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
           remoteAssetId: reservation.assetId, uploadToken: undefined, error: undefined,
         })
         await releaseLocalUploadPayload(id)
+        notifyArchiveCommitted()
         return 'duplicate'
       }
       if (!reservation.uploadToken) throw new Error('上传服务没有返回凭证。')
@@ -177,6 +230,7 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
 
     await updateLocalUpload(id, { status: 'done', stage: 'completed', progress: 100, error: undefined, uploadToken: undefined, nextAttemptAt: undefined })
     await releaseLocalUploadPayload(id)
+    notifyArchiveCommitted()
     return true
   } catch (error) {
     const latest = await getLocalUpload(id)
@@ -212,6 +266,8 @@ function due(job: LocalUploadJob): boolean {
 async function runSchedulerPass(): Promise<void> {
   if (!navigator.onLine) return
   const jobs = await listLocalUploads()
+  const canceledReservations = jobs.filter((job) => job.controlState === 'canceled' && Boolean(job.remoteAssetId)).slice(0, 8)
+  if (canceledReservations.length) await Promise.allSettled(canceledReservations.map(reconcileCanceledReservation))
   const limits = getUploadSchedulerLimits()
   const eligible = jobs.filter((job) => !job.nativeBackground && job.controlState === 'active' && !['done', 'failed'].includes(job.status) && due(job))
   const prepareSlots = Math.max(0, limits.prepare - activePrepare.size)
@@ -294,12 +350,19 @@ export async function resumeLocalUpload(id: string): Promise<void> {
 
 export async function cancelLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
-  if (job?.nativeBackground) await cancelNativeBackgroundTransfer(id)
-  await updateLocalUpload(id, { controlState: 'canceled', status: 'failed', error: '已取消，本机临时原件已释放。', nextAttemptAt: undefined })
   activePrepare.get(id)?.abort()
   activeUpload.get(id)?.abort()
+  if (job?.nativeBackground) await cancelNativeBackgroundTransfer(id)
+  const canceled = await updateLocalUpload(id, {
+    controlState: 'canceled', status: 'failed', error: '已取消，本机临时原件已释放。', nextAttemptAt: undefined,
+  })
   await releaseLocalUploadPayload(id)
+  if (canceled?.remoteAssetId) await reconcileCanceledReservation(canceled)
   notify()
+  // One delayed pass closes the narrow race where the Worker commits immediately
+  // after the first reconciliation read. Later startup/online passes remain the
+  // durable fallback without creating a tight retry loop.
+  globalThis.setTimeout(() => void wakeUploadScheduler('cancel-reconcile'), 2_000)
 }
 
 export async function pauseUploadBatch(batchId: string): Promise<void> {

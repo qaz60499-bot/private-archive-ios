@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Ellipsis, LogOut, Plus, Repeat2, UserRound } from 'lucide-react'
+import { LogOut, Repeat2, UserRound } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useArchive } from '../context/ArchiveContext'
@@ -103,9 +103,9 @@ function MobileBottomNav() {
         </div> : null}
         <nav className="mobile-bottom-nav" aria-label="移动端导航">
           {primary.slice(0, 2).map(([path, label, glyph]) => <NavLink key={label} to={path} end={path === '/'}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}
-          <button type="button" className="mobile-upload" onClick={() => setUploadOpen(true)} aria-label="上传媒体"><Plus aria-hidden="true" /></button>
+          <button type="button" className="mobile-upload" onClick={() => setUploadOpen(true)} aria-label="上传媒体"><ArchiveGlyph name="upload" /></button>
           {primary.slice(2).map(([path, label, glyph]) => <NavLink key={label} to={path}><ArchiveGlyph name={glyph} /><span>{label}</span></NavLink>)}
-          <button type="button" className={moreOpen ? 'mobile-more-trigger active' : 'mobile-more-trigger'} onClick={() => setMoreOpen((value) => !value)} aria-expanded={moreOpen}><Ellipsis aria-hidden="true" /><span>更多</span></button>
+          <button type="button" className={moreOpen ? 'mobile-more-trigger active' : 'mobile-more-trigger'} onClick={() => setMoreOpen((value) => !value)} aria-expanded={moreOpen}><ArchiveGlyph name="more" /><span>更多</span></button>
         </nav>
       </div>
     </>

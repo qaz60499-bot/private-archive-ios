@@ -12,9 +12,14 @@ let currentChild = null
 let shuttingDown = false
 let lockAcquired = false
 
-const specs = readdirSync(testDir)
+const discoveredSpecs = readdirSync(testDir)
   .filter((name) => name.endsWith('.spec.ts'))
   .sort()
+const requestedSpecs = process.argv.slice(2).map((value) => value.replaceAll('\\', '/').split('/').at(-1)).filter(Boolean)
+const specs = requestedSpecs.length ? requestedSpecs : discoveredSpecs
+for (const spec of specs) {
+  if (!discoveredSpecs.includes(spec)) throw new Error(`E2E_SPEC_NOT_FOUND ${spec}`)
+}
 
 const require = createRequire(import.meta.url)
 const playwrightCli = require.resolve('@playwright/test/cli')
@@ -137,16 +142,33 @@ function acquireLock() {
   lockAcquired = true
 }
 
-function runSpec(spec) {
+function isTransientWorkerStartupFailure(output, code) {
+  // Windows occasionally fails to initialize a freshly spawned Node/Workerd process
+  // after many isolated spec runs. These NTSTATUS values are process/runtime crashes,
+  // not Playwright assertion failures. Business failures normally exit with code 1.
+  const windowsRuntimeCrash = process.platform === 'win32' && [3221225794, 3221226505].includes(code)
+  return windowsRuntimeCrash || /Process from config\.webServer was not able to start|bad port|EADDRINUSE/i.test(output)
+}
+
+function runSpecAttempt(spec) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [playwrightCli, 'test', spec], {
       cwd: projectRoot,
-      env: { ...process.env, PLAYWRIGHT_REUSE_SERVER: '0', PLAYWRIGHT_AUTH_E2E: spec.endsWith('/app-auth.spec.ts') ? '1' : '0' },
-      stdio: 'inherit',
+      env: { ...process.env, PLAYWRIGHT_REUSE_SERVER: '0', PLAYWRIGHT_AUTH_E2E: (spec.endsWith('/app-auth.spec.ts') || spec.endsWith('/auth-runtime-do.spec.ts')) ? '1' : '0' },
+      stdio: ['inherit', 'pipe', 'pipe'],
       shell: false,
       detached: false,
     })
     currentChild = child
+    let output = ''
+    const capture = (stream, destination) => {
+      stream?.on('data', (chunk) => {
+        destination.write(chunk)
+        output = (output + chunk.toString()).slice(-64 * 1024)
+      })
+    }
+    capture(child.stdout, process.stdout)
+    capture(child.stderr, process.stderr)
 
     child.once('error', (error) => {
       currentChild = null
@@ -161,11 +183,28 @@ function runSpec(spec) {
         rejectPromise(error)
         return
       }
-      if (signal) return rejectPromise(new Error(`E2E_CHILD_SIGNAL ${signal}`))
-      if (code !== 0) return rejectPromise(new Error(`E2E_CHILD_EXIT ${code ?? 1}`))
-      resolvePromise()
+      if (signal) return rejectPromise(new Error(`E2E_CHILD_SIGNAL ${signal} spec=${spec}`))
+      resolvePromise({ code: code ?? 1, output })
     })
   })
+}
+
+async function runSpec(spec) {
+  const maxAttempts = 3
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const result = await runSpecAttempt(spec)
+    if (result.code === 0) {
+      if (process.platform === 'win32') await sleep(750)
+      return
+    }
+    if (attempt < maxAttempts && isTransientWorkerStartupFailure(result.output, result.code)) {
+      const delayMs = attempt === 1 ? 3_000 : 7_000
+      console.warn(`[e2e:fresh-retry] transient Worker startup failure code=${result.code}; retrying ${spec} with fresh state after ${delayMs}ms`)
+      await sleep(delayMs)
+      continue
+    }
+    throw new Error(`E2E_CHILD_EXIT ${result.code} spec=${spec}`)
+  }
 }
 
 function shutdown(signal) {

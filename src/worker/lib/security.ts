@@ -1,7 +1,8 @@
 import type { Context, Next } from 'hono'
 import type { Env } from '../env'
 import type { AppUserRow } from '../db/app-users-repository'
-import { getActiveAppOwner, resolveAppSession } from '../db/app-users-repository'
+import { getActiveAppOwner } from '../db/app-users-repository'
+import { resolveAppSessionRuntime } from './auth-runtime'
 import { APP_SESSION_COOKIE } from './app-auth'
 import { verifyAccessJwt } from './access-jwt'
 import { constantTimeEqual } from './crypto'
@@ -129,7 +130,7 @@ export async function resolveRequestAppUser(context: WorkerContext): Promise<App
     }
   }
   if (rawToken) {
-    const sessionUser = await resolveAppSession(context.env.DB, rawToken)
+    const sessionUser = await resolveAppSessionRuntime(context.env, rawToken)
     if (sessionUser) return sessionUser
   }
   // Hosted Web is a private owner-only upload portal behind Cloudflare Access.

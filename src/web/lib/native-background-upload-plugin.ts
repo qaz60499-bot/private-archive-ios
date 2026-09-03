@@ -70,3 +70,7 @@ export async function resumeNativeBackgroundTransfer(job: LocalUploadJob): Promi
 export async function cancelNativeBackgroundTransfer(id: string): Promise<void> {
   await NativeBackgroundUpload.cancelJob({ id })
 }
+
+export async function removeNativeBackgroundTransfer(id: string): Promise<void> {
+  await NativeBackgroundUpload.removeJob({ id })
+}

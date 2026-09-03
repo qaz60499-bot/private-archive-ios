@@ -24,6 +24,14 @@ binding = "ASSETS"
 not_found_handling = "single-page-application"
 run_worker_first = true
 
+[[durable_objects.bindings]]
+name = "PASSWORD_VERIFIER"
+class_name = "PasswordVerifier"
+
+[[migrations]]
+tag = "v1-password-verifier"
+new_sqlite_classes = ["PasswordVerifier"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "private-archive-db"

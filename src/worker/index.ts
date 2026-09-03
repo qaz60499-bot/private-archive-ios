@@ -13,6 +13,8 @@ import type { AnalysisMessage, Env } from './env'
 import { applyBrowserSecurityHeaders } from './lib/browser-security'
 import { restrictHostedUploadApiScope } from './lib/security'
 
+export { PasswordVerifier } from './durable/password-verifier'
+
 const app = new Hono<{ Bindings: Env }>()
 
 app.use('*', async (context, next) => {

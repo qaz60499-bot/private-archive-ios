@@ -164,16 +164,50 @@ export async function getLatestUploadJobState(db: D1Database, assetId: string): 
     .bind(assetId).first<{ status: string; expires_at: string; updated_at: string }>()
 }
 
-export async function createUploadJobForAsset(db: D1Database, params: { assetId: string; jobId: string; token: string; tokenExpiresAt: string }): Promise<void> {
+export async function createUploadJobForAsset(db: D1Database, params: {
+  assetId: string
+  jobId: string
+  token: string
+  tokenExpiresAt: string
+  expectedUpdatedAt?: string
+}): Promise<boolean> {
   const now = new Date().toISOString()
   const tokenHash = await hashToken(params.token)
+
+  if (params.expectedUpdatedAt) {
+    // Keep capability rotation and the asset's resumable state in one D1 transaction.
+    // If the CAS loses a race, the second statement is guarded by the newly generated
+    // token hash/timestamp and therefore cannot mutate the asset independently.
+    const [rotated] = await db.batch([
+      db.prepare(`UPDATE upload_jobs
+        SET upload_token_hash = ?, status = 'waiting', last_error = NULL, expires_at = ?, updated_at = ?
+        WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+          AND updated_at = ? AND status != 'done'`)
+        .bind(tokenHash, params.tokenExpiresAt, now, params.assetId, params.expectedUpdatedAt),
+      db.prepare(`UPDATE assets SET status = 'pending_upload', updated_at = ?
+        WHERE id = ? AND storage_file_id IS NULL AND status != 'pending_upload'
+          AND EXISTS (
+            SELECT 1 FROM upload_jobs
+            WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+              AND upload_token_hash = ? AND updated_at = ? AND status = 'waiting'
+          )`)
+        .bind(now, params.assetId, params.assetId, tokenHash, now),
+    ])
+    return rotated.meta.changes > 0
+  }
+
+  // New retry rows are still needed for legacy/non-CAS callers, but the job and asset
+  // transition must commit or roll back together so UI state never advertises a retry
+  // without a matching server capability (or vice versa).
   await db.batch([
-    db.prepare(`UPDATE assets SET status = CASE WHEN storage_file_id IS NULL THEN 'pending_upload' ELSE status END, updated_at = ? WHERE id = ?`)
-      .bind(now, params.assetId),
     db.prepare(`INSERT INTO upload_jobs (id, asset_id, upload_token_hash, status, expires_at, created_at, updated_at)
       VALUES (?, ?, ?, 'waiting', ?, ?, ?)`)
       .bind(params.jobId, params.assetId, tokenHash, params.tokenExpiresAt, now, now),
+    db.prepare(`UPDATE assets SET status = 'pending_upload', updated_at = ?
+      WHERE id = ? AND storage_file_id IS NULL AND status != 'pending_upload'`)
+      .bind(now, params.assetId),
   ])
+  return true
 }
 
 export async function claimUploadStarted(db: D1Database, assetId: string, token: string, staleAfterMs?: number): Promise<number | null> {
@@ -211,7 +245,9 @@ export async function markStored(db: D1Database, assetId: string, stored: Stored
     }
   }
   const objectId = `obj-${assetId}`
-  const source = await db.prepare(`SELECT source_id, storage_backend FROM assets WHERE id = ? AND workspace_id = ?`).bind(assetId, PERSONAL_WORKSPACE_ID).first<{ source_id: string; storage_backend: AssetRow['storage_backend'] }>()
+  const source = await db.prepare(`SELECT source_id, storage_backend FROM assets
+    WHERE id = ? AND workspace_id = ? AND status != 'trashed'`)
+    .bind(assetId, PERSONAL_WORKSPACE_ID).first<{ source_id: string; storage_backend: AssetRow['storage_backend'] }>()
   if (!source) return { attached: false, discardStoredMessage: true }
   if (source.storage_backend !== stored.backend) return { attached: false, discardStoredMessage: true }
   const existing = await getStorageObjectStateByFileUniqueId(db, stored.fileUniqueId, source.source_id, stored.backend)
@@ -278,7 +314,9 @@ export async function markStored(db: D1Database, assetId: string, stored: Stored
     ).run()
   if (attached.meta.changes === 0) return { attached: false, discardStoredMessage: true }
 
-  await db.prepare(`UPDATE upload_jobs SET status = 'done', updated_at = ? WHERE asset_id = ?`).bind(now, assetId).run()
+  await db.prepare(`UPDATE upload_jobs SET status = 'done', updated_at = ?
+    WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)`)
+    .bind(now, assetId).run()
   return { attached: true, discardStoredMessage }
 }
 
@@ -290,12 +328,13 @@ export async function markUploadFailed(db: D1Database, assetId: string, error: s
         AND status = 'uploading' AND attempts = ?`)
       .bind(error.slice(0, 320), now, assetId, expectedAttempt).run()
     if (job.meta.changes === 0) return false
-    await db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ?`).bind(now, assetId).run()
+    await db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ? AND status != 'trashed'`).bind(now, assetId).run()
     return true
   }
   await db.batch([
-    db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ?`).bind(now, assetId),
-    db.prepare(`UPDATE upload_jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE asset_id = ?`)
+    db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ? AND status != 'trashed'`).bind(now, assetId),
+    db.prepare(`UPDATE upload_jobs SET status = 'failed', last_error = ?, updated_at = ?
+      WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)`)
       .bind(error.slice(0, 320), now, assetId),
   ])
   return true
@@ -819,6 +858,11 @@ export async function listUploadJobs(db: D1Database): Promise<Array<Record<strin
     upload_jobs.last_error, upload_jobs.expires_at, upload_jobs.created_at, upload_jobs.updated_at,
     assets.original_name, assets.size_bytes, assets.media_type
     FROM upload_jobs JOIN assets ON assets.id = upload_jobs.asset_id
+    WHERE upload_jobs.id = (
+      SELECT latest.id FROM upload_jobs latest
+      WHERE latest.asset_id = upload_jobs.asset_id
+      ORDER BY latest.created_at DESC LIMIT 1
+    )
     ORDER BY upload_jobs.updated_at DESC LIMIT 100`).all<Record<string, unknown>>()
   return result.results
 }

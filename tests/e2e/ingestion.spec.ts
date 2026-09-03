@@ -44,7 +44,7 @@ test('concurrent reserve for the same content does not rotate the active upload 
   expect(follower).toBeDefined()
   expect([200, 409]).toContain(follower!.status())
   if (follower!.status() === 409) {
-    expect(follower!.headers()['retry-after']).toBe('1')
+    expect(follower!.headers()['retry-after']).toBe('20')
     await expect(follower!.json()).resolves.toMatchObject({ error: 'UPLOAD_ALREADY_IN_PROGRESS' })
   }
 
@@ -62,6 +62,105 @@ test('concurrent reserve for the same content does not rotate the active upload 
   const duplicateBody = await duplicate.json() as { assetId: string; duplicate: boolean; duplicateOfAssetId: string; reusedStorage: boolean }
   expect(duplicateBody.assetId).not.toBe(reservation.assetId)
   expect(duplicateBody).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
+})
+
+test('stale iOS reservation rotates the existing upload job instead of creating duplicates', async ({ request }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'stale reservation contract only needs one browser project')
+
+  const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
+  const file = Buffer.from(`ios-stale-reserve-${suffix}`)
+  const contentHash = createHash('sha256').update(file).digest('hex')
+  const metadata = {
+    originalName: `ios-stale-${suffix}.jpg`, mimeType: 'image/jpeg', sizeBytes: file.byteLength,
+    mediaType: 'photo', contentHash, storageBackend: 'telegram_bot', importOrigin: 'ios-background',
+  }
+
+  const first = await request.post('/api/assets/reserve', { data: metadata })
+  expect(first.status()).toBe(201)
+  const firstReservation = await first.json() as { assetId: string; uploadToken: string }
+
+  const activeRetry = await request.post('/api/assets/reserve', { data: metadata })
+  expect(activeRetry.status()).toBe(409)
+  await expect(activeRetry.json()).resolves.toMatchObject({
+    error: 'DUPLICATE_UPLOAD_IN_PROGRESS', assetId: firstReservation.assetId,
+  })
+
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 15_500))
+
+  const resumed = await request.post('/api/assets/reserve', { data: metadata })
+  expect(resumed.status()).toBe(200)
+  const resumedReservation = await resumed.json() as { assetId: string; uploadToken: string; resumed: boolean }
+  expect(resumedReservation).toMatchObject({ assetId: firstReservation.assetId, resumed: true })
+  expect(resumedReservation.uploadToken).not.toBe(firstReservation.uploadToken)
+
+  const jobsResponse = await request.get('/api/upload-jobs')
+  expect(jobsResponse.status()).toBe(200)
+  const jobs = await jobsResponse.json() as { items: Array<{ asset_id: string; status: string }> }
+  const resumedJobs = jobs.items.filter((item) => item.asset_id === firstReservation.assetId)
+  expect(resumedJobs).toHaveLength(1)
+  expect(resumedJobs[0]?.status).toBe('waiting')
+
+  const pendingAsset = await request.get(`/api/assets/${firstReservation.assetId}`)
+  expect(pendingAsset.status()).toBe(200)
+  await expect(pendingAsset.json()).resolves.toMatchObject({ asset: { id: firstReservation.assetId, status: 'pending_upload' } })
+
+  const staleTokenUpload = await request.put(`/api/assets/${firstReservation.assetId}/content`, {
+    data: file,
+    headers: {
+      'Content-Type': 'image/jpeg', 'Content-Length': String(file.byteLength), 'X-Upload-Token': firstReservation.uploadToken,
+    },
+  })
+  expect(staleTokenUpload.status()).toBe(401)
+
+  const resumedUpload = await request.put(`/api/assets/${firstReservation.assetId}/content`, {
+    data: file,
+    headers: {
+      'Content-Type': 'image/jpeg', 'Content-Length': String(file.byteLength), 'X-Upload-Token': resumedReservation.uploadToken,
+    },
+  })
+  expect(resumedUpload.status()).toBe(201)
+})
+
+test('content commit racing cancel cleanup converges to one durable server state', async ({ request }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'cancel race only needs one browser project')
+
+  const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
+  const file = Buffer.from(`cancel-race-${suffix}`)
+  const contentHash = createHash('sha256').update(file).digest('hex')
+  const reserve = await request.post('/api/assets/reserve', { data: {
+    originalName: `cancel-race-${suffix}.txt`, mimeType: 'text/plain', sizeBytes: file.byteLength,
+    mediaType: 'file', contentHash, storageBackend: 'telegram_bot', importOrigin: 'ios-background',
+  } })
+  expect(reserve.status()).toBe(201)
+  const reservation = await reserve.json() as { assetId: string; uploadToken: string }
+
+  const [upload, discard] = await Promise.all([
+    request.put(`/api/assets/${reservation.assetId}/content`, {
+      data: file,
+      headers: {
+        'Content-Type': 'text/plain', 'Content-Length': String(file.byteLength), 'X-Upload-Token': reservation.uploadToken,
+      },
+    }),
+    request.post('/api/assets/bulk-discard-unstored', { data: { ids: [reservation.assetId] } }),
+  ])
+  expect(discard.status()).toBe(200)
+  const discardBody = await discard.json() as { discarded: number }
+  expect([0, 1]).toContain(discardBody.discarded)
+
+  const finalResponse = await request.get(`/api/assets/${reservation.assetId}`)
+  expect(finalResponse.status()).toBe(200)
+  const finalBody = await finalResponse.json() as { asset: { status: string } }
+  if (discardBody.discarded === 1) {
+    expect(finalBody.asset.status).toBe('trashed')
+    expect(upload.status()).not.toBe(201)
+  } else if (upload.status() === 201) {
+    expect(finalBody.asset.status).not.toBe('trashed')
+    expect(['stored', 'queued', 'analyzing', 'ready', 'limited']).toContain(finalBody.asset.status)
+  } else {
+    // A lost upload race is still safe only if the reservation remains explicitly
+    // recoverable; it may never silently become a stored-but-canceled asset.
+    expect(['pending_upload', 'failed', 'trashed']).toContain(finalBody.asset.status)
+  }
 })
 
 test('batch cleanup discards only unstored reservations', async ({ request }, testInfo) => {

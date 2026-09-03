@@ -28,6 +28,10 @@ struct NativeUploadRecord: Codable {
     var contentHash: String?
     var deduplicated: Bool?
     var contentTaskToken: String?
+    // Monotonic desired-control generation. Async URLSession task enumeration must
+    // verify this before applying pause/resume so an older callback cannot override
+    // a newer user action.
+    var controlGeneration: Int? = nil
     var ready: Bool
     var createdAt: String
     var updatedAt: String
@@ -372,18 +376,20 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func pauseJob(id: String) {
-        let paused = stateQueue.sync { () -> NativeUploadRecord? in
+        let transition = stateQueue.sync { () -> (NativeUploadRecord, Int)? in
             guard var value = records[id], value.status != "done", value.status != "failed" else { return nil }
+            let generation = (value.controlGeneration ?? 0) + 1
+            value.controlGeneration = generation
             value.status = "paused"
             value.error = "已暂停，后台原件仍安全保存在本机。"
             value.updatedAt = now()
             records[id] = value
             saveStateLocked()
-            return value
+            return (value, generation)
         }
-        guard let paused else { return }
+        guard let (paused, generation) = transition else { return }
         notify(paused)
-        performOnTasks(id: id, action: { $0.suspend() })
+        performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "paused", action: { $0.suspend() })
     }
 
     func resumeJob(id: String, fileName: String?, mimeType: String?, sizeBytes: Int64?, mediaType: String?, contentHash: String?) throws {
@@ -439,6 +445,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             guard let retrying = mutate(id, { value in
                 // Manual retry means "recover this cached original", not "replay the
                 // same failed token". Force a fresh /reserve against the durable hash.
+                value.controlGeneration = (value.controlGeneration ?? 0) + 1
                 value.status = "retrying"
                 value.stage = "reserving"
                 value.progress = min(value.progress, 18)
@@ -448,10 +455,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 value.contentTaskToken = nil
                 value.error = "正在从本机缓存重新建立上传。"
             }) else { return }
+            let generation = retrying.controlGeneration ?? 0
             notify(retrying)
             stateQueue.sync { reserveTaskTokens.removeValue(forKey: id) }
-            performOnTasks(id: id, action: { $0.cancel() }) { _ in
-                do { try self.scheduleReserve(retrying, earliest: nil) }
+            performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "retrying", action: { $0.cancel() }) { _ in
+                guard let current = self.stateQueue.sync(execute: { self.records[id] }),
+                      (current.controlGeneration ?? 0) == generation, current.status == "retrying" else { return }
+                do { try self.scheduleReserve(current, earliest: nil) }
                 catch {
                     if let failed = self.markFailedIfActive(id, error: error.localizedDescription) { self.notify(failed) }
                 }
@@ -459,14 +469,18 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
 
-        if let record = mutate(id, { value in
+        guard let resumed = mutate(id, { value in
+            value.controlGeneration = (value.controlGeneration ?? 0) + 1
             value.status = "retrying"
             value.attempts = 0
             value.error = nil
-        }) { notify(record) }
-        performOnTasks(id: id, action: { $0.resume() }) { count in
+        }) else { return }
+        let generation = resumed.controlGeneration ?? 0
+        notify(resumed)
+        performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "retrying", action: { $0.resume() }) { count in
             guard count == 0,
-                  let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready else { return }
+                  let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready,
+                  (record.controlGeneration ?? 0) == generation, record.status == "retrying" else { return }
             if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
                 self.retryContent(record, after: 0, reason: nil)
             } else {
@@ -1134,12 +1148,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         "\(session.configuration.identifier ?? "unknown")|\(task.taskIdentifier)"
     }
 
-    private func performOnTasks(id: String, action: @escaping (URLSessionTask) -> Void, completion: ((Int) -> Void)? = nil) {
+    private func performOnTasks(
+        id: String,
+        expectedControlGeneration: Int? = nil,
+        expectedStatus: String? = nil,
+        action: @escaping (URLSessionTask) -> Void,
+        completion: ((Int) -> Void)? = nil
+    ) {
         session.getAllTasks { contentTasks in
             self.reserveSession.getAllTasks { reserveTasks in
                 let matches = (contentTasks + reserveTasks).filter { self.taskJobId($0) == id }
-                matches.forEach(action)
-                if let completion { self.workerQueue.async { completion(matches.count) } }
+                let stillCurrent = self.stateQueue.sync { () -> Bool in
+                    guard let expectedControlGeneration else { return true }
+                    guard let record = self.records[id], (record.controlGeneration ?? 0) == expectedControlGeneration else { return false }
+                    return expectedStatus == nil || record.status == expectedStatus
+                }
+                if stillCurrent { matches.forEach(action) }
+                if let completion { self.workerQueue.async { completion(stillCurrent ? matches.count : 0) } }
             }
         }
     }

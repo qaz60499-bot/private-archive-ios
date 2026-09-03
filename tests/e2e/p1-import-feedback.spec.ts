@@ -30,7 +30,7 @@ test('choosing files shows immediate app-level import feedback that survives she
   await openUpload(page)
   const chooserPromise = page.waitForEvent('filechooser')
   const trigger = testInfo.project.name === 'mobile'
-    ? page.getByRole('button', { name: '选择照片、视频或文件' })
+    ? page.getByRole('button', { name: '选择文件', exact: true })
     : page.getByRole('button', { name: '选择照片、视频或文件' })
   await trigger.click()
   const chooser = await chooserPromise

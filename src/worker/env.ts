@@ -1,3 +1,5 @@
+import type { PasswordVerifier } from './durable/password-verifier'
+
 export interface AnalysisMessage {
   assetId: string
   previewFileId?: string
@@ -12,6 +14,7 @@ export interface Env {
   DB: D1Database
   PREVIEW_CACHE?: KVNamespace
   ANALYSIS_QUEUE: Queue<AnalysisMessage>
+  PASSWORD_VERIFIER?: DurableObjectNamespace<PasswordVerifier>
   AI?: AiBinding
   ASSETS: Fetcher
   MOCK_TELEGRAM?: string
