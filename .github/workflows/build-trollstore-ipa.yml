@@ -74,12 +74,13 @@ jobs:
           trap cleanup EXIT
           sleep 1
           SIMCTL_CHILD_PRIVATE_ARCHIVE_PICKER_SMOKE=1 xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
-          sleep 7
+          sleep 15
           kill "$LOG_PID" 2>/dev/null || true
           wait "$LOG_PID" 2>/dev/null || true
           cat "$LOG_FILE"
           grep -q 'PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED' "$LOG_FILE"
           grep -q 'PRIVATE_ARCHIVE_PICKER_SMOKE_DISMISSED' "$LOG_FILE"
+          grep -q 'PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=80 recoverable=80' "$LOG_FILE"
           if grep -E 'Terminating app due to uncaught exception|Main Thread Checker|EXC_BAD_ACCESS|Fatal error' "$LOG_FILE"; then
             echo 'iOS picker runtime smoke detected a native crash/thread violation' >&2
             exit 1

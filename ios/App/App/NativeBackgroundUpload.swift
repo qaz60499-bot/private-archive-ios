@@ -1548,16 +1548,16 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     }
 
     private func startPhotoImportLane(
-        _ results: [PHPickerResult],
+        _ providers: [NSItemProvider],
         index: Int,
         stride: Int,
         batchId: String,
         group: DispatchGroup
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard index < results.count else { return }
+        guard index < providers.count else { return }
 
-        let provider = results[index].itemProvider
+        let provider = providers[index]
         let jobId = UUID().uuidString
         let typeIdentifier = provider.registeredTypeIdentifiers.first(where: {
             guard let type = UTType($0) else { return false }
@@ -1600,7 +1600,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
             // has either been copied or rejected. This keeps provider concurrency
             // strictly bounded without blocking any dispatch worker thread.
             DispatchQueue.main.async {
-                self.startPhotoImportLane(results, index: index + stride, stride: stride, batchId: batchId, group: group)
+                self.startPhotoImportLane(providers, index: index + stride, stride: stride, batchId: batchId, group: group)
             }
         }
     }
@@ -1619,10 +1619,11 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
 
         NativeBackgroundUploadManager.shared.beginStagingProtection()
         let group = DispatchGroup()
-        for _ in results { group.enter() }
-        let lanes = min(photoImportLaneCount, results.count)
+        let providers = results.map(\.itemProvider)
+        for _ in providers { group.enter() }
+        let lanes = min(photoImportLaneCount, providers.count)
         for lane in 0..<lanes {
-            startPhotoImportLane(results, index: lane, stride: lanes, batchId: batchId, group: group)
+            startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, group: group)
         }
         group.notify(queue: .main) {
             NativeBackgroundUploadManager.shared.endStagingProtection()
@@ -1643,9 +1644,64 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     picker.dismiss(animated: false) {
                         NSLog("PRIVATE_ARCHIVE_PICKER_SMOKE_DISMISSED")
+                        self.runBulkPhotoImportRuntimeSmoke(count: 80)
                     }
                 }
             }
+        }
+    }
+
+    private func runBulkPhotoImportRuntimeSmoke(count: Int) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let batchId = UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrivateArchiveBulkImportSmoke-\(batchId)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_FAILED create-directory=%@", error.localizedDescription)
+            return
+        }
+
+        var providers: [NSItemProvider] = []
+        providers.reserveCapacity(count)
+        for index in 0..<count {
+            let url = directory.appendingPathComponent(String(format: "stress-%03d.jpg", index))
+            // A small JPEG-shaped payload is enough to exercise NSItemProvider file
+            // materialization, app-owned copying, hashing, native state persistence and
+            // auth-gated reservation without consuming large simulator memory.
+            var bytes = Data([0xff, 0xd8, 0xff, 0xe0])
+            bytes.append(Data(repeating: UInt8(index & 0xff), count: 64 * 1024))
+            bytes.append(contentsOf: [0xff, 0xd9])
+            do {
+                try bytes.write(to: url, options: .atomic)
+            } catch {
+                NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_FAILED write=%@", error.localizedDescription)
+                try? FileManager.default.removeItem(at: directory)
+                return
+            }
+            let provider = NSItemProvider()
+            provider.suggestedName = url.lastPathComponent
+            provider.registerFileRepresentation(forTypeIdentifier: UTType.jpeg.identifier, fileOptions: [], visibility: .all) { completion in
+                completion(url, false, nil)
+                return nil
+            }
+            providers.append(provider)
+        }
+
+        NativeBackgroundUploadManager.shared.beginStagingProtection()
+        let group = DispatchGroup()
+        for _ in providers { group.enter() }
+        let lanes = min(photoImportLaneCount, providers.count)
+        for lane in 0..<lanes {
+            startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, group: group)
+        }
+        group.notify(queue: .main) {
+            let jobs = NativeBackgroundUploadManager.shared.listJobs().filter { $0.batchId == batchId }
+            let recoverable = jobs.filter { $0.ready && $0.status != "failed" }.count
+            NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=%d recoverable=%d", jobs.count, recoverable)
+            for job in jobs { NativeBackgroundUploadManager.shared.removeJob(id: job.id) }
+            try? FileManager.default.removeItem(at: directory)
         }
     }
 #endif
