@@ -90,4 +90,9 @@ app.onError((error, context) => {
 export default {
   fetch: app.fetch,
   queue: (batch: MessageBatch<AnalysisMessage>, env: Env) => consumeAnalysisQueue(batch, env),
+  // A legacy Cloudflare Cron Trigger still targets this Worker every minute even
+  // though scheduled maintenance was removed from the product. Keep the event
+  // explicitly handled and side-effect free: in particular, do not touch D1 here,
+  // because background auth/session cleanup must not consume row-write quota.
+  scheduled: () => undefined,
 } satisfies ExportedHandler<Env, AnalysisMessage>
