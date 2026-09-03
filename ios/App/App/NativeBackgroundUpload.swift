@@ -79,7 +79,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     // batch at once caused iOS to defer the whole group for minutes even though the
     // configuration allowed only three host connections. Records remain durably queued
     // on disk; only this many file tasks are handed to the background daemon at once.
-    private let maxScheduledContentTasks = 3
+    private let maxActiveUploadPipelines = 3
 
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
@@ -381,7 +381,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     value.progress = max(value.progress, 15)
                     let shouldSchedule = value.status != "paused"
                     if shouldSchedule {
-                        value.status = "uploading"
+                        // Hashing/staging is complete, but do not advertise a network
+                        // upload until this record actually owns one of the bounded
+                        // reserve/content pipeline slots.
+                        value.status = "waiting"
                         value.stage = "reserving"
                         value.error = nil
                     }
@@ -829,6 +832,16 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return request
     }
 
+    private func activeUploadPipelineCountLocked(excluding id: String? = nil) -> Int {
+        var activeIds = Set(reserveTasks.keys)
+        for candidate in records.values where candidate.contentTaskToken != nil
+            && candidate.status != "done" && candidate.status != "failed" && candidate.status != "paused" {
+            activeIds.insert(candidate.id)
+        }
+        if let id { activeIds.remove(id) }
+        return activeIds.count
+    }
+
     private func scheduleReserve(_ record: NativeUploadRecord, earliest: Date?, cookieOverride: String? = nil) throws {
         guard record.ready, fileManager.fileExists(atPath: originalURL(record.id).path) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 8, userInfo: [NSLocalizedDescriptionKey: "LOCAL_FILE_MISSING"])
@@ -872,7 +885,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             DispatchQueue.main.async { self.endStagingProtectionIfIdleOnMain() }
             guard isCurrent,
                   let current = self.stateQueue.sync(execute: { self.records[record.id] }),
-                  current.ready, current.status != "done", current.status != "failed", current.status != "paused" else { return }
+                  current.ready, current.status != "done", current.status != "failed", current.status != "paused" else {
+                if isCurrent { self.reconcileTasks() }
+                return
+            }
+            defer { self.reconcileTasks() }
             self.handleReserveResult(
                 current,
                 data: data ?? Data(),
@@ -882,12 +899,25 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             )
         }
 
+        var queued: NativeUploadRecord?
         let updated = stateQueue.sync { () -> NativeUploadRecord? in
             guard reserveTasks[record.id] == nil,
                   var value = records[record.id],
                   value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused",
                   !(value.stage == "original" && value.remoteAssetId != nil && value.uploadToken != nil) else { return nil }
+            guard activeUploadPipelineCountLocked(excluding: record.id) < maxActiveUploadPipelines else {
+                if value.status != "waiting" || value.stage != "reserving" || value.error != nil {
+                    value.status = "waiting"
+                    value.stage = "reserving"
+                    value.error = nil
+                    value.updatedAt = now()
+                    records[record.id] = value
+                    saveStateLocked()
+                    queued = value
+                }
+                return nil
+            }
             reserveTasks[record.id] = task
             value.status = value.attempts > 0 ? "retrying" : "uploading"
             value.stage = "reserving"
@@ -901,6 +931,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
         guard let updated else {
             task.cancel()
+            if let queued { notify(queued) }
             return
         }
         notify(updated)
@@ -1007,19 +1038,26 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         request.setValue(String(record.sizeBytes), forHTTPHeaderField: "Content-Length")
         let contentTaskToken = UUID().uuidString
         let delayed = earliest.map { $0 > Date() } ?? false
+        var queued: NativeUploadRecord?
         let updated = stateQueue.sync { () -> NativeUploadRecord? in
-            let scheduledCount = records.values.reduce(into: 0) { count, candidate in
-                if candidate.contentTaskToken != nil,
-                   candidate.status != "done", candidate.status != "failed", candidate.status != "paused" {
-                    count += 1
-                }
-            }
-            guard scheduledCount < maxScheduledContentTasks,
-                  var value = records[record.id],
+            guard var value = records[record.id],
                   value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused",
                   value.remoteAssetId == assetId, value.uploadToken == token,
                   value.contentTaskToken == nil else { return nil }
+            guard activeUploadPipelineCountLocked(excluding: record.id) < maxActiveUploadPipelines else {
+                if value.status != "waiting" || value.stage != "original" || value.error != nil {
+                    value.status = "waiting"
+                    value.stage = "original"
+                    value.progress = max(value.progress, 28)
+                    value.error = nil
+                    value.updatedAt = now()
+                    records[record.id] = value
+                    saveStateLocked()
+                    queued = value
+                }
+                return nil
+            }
             value.contentTaskToken = contentTaskToken
             value.status = delayed ? "retrying" : "uploading"
             value.stage = "original"
@@ -1031,8 +1069,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return value
         }
         // No slot is not an error. The record already owns a durable reservation and
-        // stays in the local queue; the next content completion/reconcile fills the slot.
-        guard let updated else { return }
+        // stays in the local queue; the next reserve/content completion fills the slot.
+        guard let updated else {
+            if let queued { notify(queued) }
+            return
+        }
         let task = contentUploadSession().uploadTask(with: request, fromFile: originalURL(record.id))
         task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
         task.earliestBeginDate = earliest
@@ -1444,14 +1485,36 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 let resumable = self.stateQueue.sync {
                     self.records.values.filter {
                         $0.ready && $0.status != "done" && $0.status != "failed" && $0.status != "paused" && !activeIds.contains($0.id)
-                    }
+                    }.sorted { $0.createdAt < $1.createdAt }
                 }
                 for record in resumable {
                     if record.remoteAssetId != nil, record.uploadToken != nil, record.stage == "original" {
-                        let restarting = restartIds.contains(record.id)
-                        self.retryContent(record, after: restarting ? 1 : 0, reason: restarting ? "检测到后台上传停滞，正在重新连接。" : nil)
+                        if restartIds.contains(record.id) {
+                            self.retryContent(record, after: 1, reason: "检测到后台上传停滞，正在重新连接。")
+                        } else {
+                            // A record that simply waited for a bounded pipeline slot is
+                            // not a retry and must not consume attempt/backoff budget.
+                            do { try self.scheduleContent(record, earliest: nil) }
+                            catch {
+                                if self.nativeUploadErrorCode(error) == 11 {
+                                    if let waiting = self.markAwaitingAuthIfActive(record.id) { self.notify(waiting) }
+                                } else if let failed = self.markFailedIfActive(record.id, error: error.localizedDescription) {
+                                    self.notify(failed)
+                                }
+                            }
+                        }
                     } else {
-                        self.retryReserve(record, after: 0, reason: nil)
+                        // Likewise, jobs that have only finished local hashing remain a
+                        // FIFO queue until a pipeline slot opens; do not apply retry
+                        // backoff to work that has never made a network attempt.
+                        do { try self.scheduleReserve(record, earliest: nil) }
+                        catch {
+                            if self.nativeUploadErrorCode(error) == 9 {
+                                if let waiting = self.markAwaitingAuthIfActive(record.id) { self.notify(waiting) }
+                            } else if let failed = self.markFailedIfActive(record.id, error: error.localizedDescription) {
+                                self.notify(failed)
+                            }
+                        }
                     }
                 }
                 self.finishReconcileTasks()

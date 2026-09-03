@@ -20,7 +20,7 @@ describe('upload batch summaries', () => {
             : index === 11 ? { prepareStatus: 'preparing', stage: 'preparing' }
               : {}))
     expect(summarizeUploadBatches(jobs)[0]).toMatchObject({
-      total: 20, completed: 8, failed: 1, paused: 1, canceled: 1, preparing: 1, deduplicated: 1, progress: 45,
+      total: 20, completed: 8, failed: 1, paused: 1, canceled: 1, preparing: 1, dedupChecked: 8, deduplicated: 1, progress: 45,
     })
   })
 

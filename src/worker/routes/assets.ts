@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import {
   bulkDiscardUnstoredAssets, bulkPatchAssetFlags, bulkRestoreAssets, bulkSoftDeleteAssets, claimStorageObjectForPurge, claimUploadStarted, clearPreviewStored,
-  createPendingAsset, createUploadJobForAsset, deleteLogicalAsset, getActiveAssetByContentHash,
+  createPendingAsset, createUploadJobForAsset, deleteLogicalAsset, getActiveAssetByContentHash, getActiveStoredPhotoByCaptureIdentity,
   getAsset, getLatestUploadJobState, getTagsForAsset, listAssets, markAssetViewed, markPreviewStored, markPurgeFailure, repairAssetFromActiveStorageObject,
   markQueued, markReadyWithoutAnalysis, markStorageObjectDeleted, markStorageObjectDeleteFailed, markStored, markUploadFailed, patchAsset, restoreAsset,
   setManualTags, setManualTagsForAssets, softDeleteAsset, verifyUploadToken,
@@ -207,6 +207,33 @@ assetsRoutes.post('/reserve', async (context) => {
 
     const existing = reservationInput.contentHash ? await getActiveAssetByContentHash(context.env.DB, reservationInput.contentHash, sourceId, input.storageBackend) : null
     if (existing && await canReuseExisting(existing)) return reserveExisting(existing)
+
+    // The native picker now preserves HEIC originals, while older builds sometimes
+    // materialized the same iPhone photo as JPEG. Those bytes have different SHA-256
+    // values even though they represent the same capture. Use a conservative second
+    // identity only when the client supplied real EXIF capture time plus dimensions.
+    if (input.mediaType === 'photo' && input.takenAt && input.width && input.height) {
+      const captureDuplicate = await getActiveStoredPhotoByCaptureIdentity(context.env.DB, {
+        originalName: input.originalName,
+        takenAt: input.takenAt,
+        width: input.width,
+        height: input.height,
+        sourceId,
+        storageBackend: input.storageBackend,
+      })
+      if (captureDuplicate && await canReuseExisting(captureDuplicate)) {
+        return context.json({
+          assetId: captureDuplicate.id,
+          duplicate: true,
+          duplicateOfAssetId: captureDuplicate.id,
+          duplicateKind: 'capture',
+          reusedStorage: true,
+          storageBackend: input.storageBackend,
+          sizeTier,
+          maxUploadBytes,
+        }, 200)
+      }
+    }
 
     const id = crypto.randomUUID()
     const token = createUploadToken()

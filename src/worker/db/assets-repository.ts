@@ -82,6 +82,45 @@ export async function getActiveAssetByContentHash(db: D1Database, contentHash: s
     .bind(PERSONAL_WORKSPACE_ID, sourceId, storageBackend, contentHash).first<AssetRow>()
 }
 
+function normalizedFileStem(fileName: string): string {
+  const trimmed = fileName.trim().toLowerCase()
+  const dot = trimmed.lastIndexOf('.')
+  return dot > 0 ? trimmed.slice(0, dot) : trimmed
+}
+
+export async function getActiveStoredPhotoByCaptureIdentity(db: D1Database, input: {
+  originalName: string
+  takenAt: string
+  width: number
+  height: number
+  sourceId?: string
+  storageBackend?: AssetRow['storage_backend']
+}): Promise<AssetRow | null> {
+  const stem = normalizedFileStem(input.originalName)
+  if (!stem || !Number.isFinite(input.width) || !Number.isFinite(input.height) || input.width <= 0 || input.height <= 0) return null
+  return db.prepare(`SELECT ${ASSET_COLUMNS} FROM ${ASSET_FROM}
+    WHERE assets.workspace_id = ? AND assets.source_id = ?
+      AND COALESCE(storage_objects.storage_backend, assets.storage_backend) = ?
+      AND assets.media_type = 'photo' AND assets.status != 'trashed'
+      AND COALESCE(storage_objects.storage_file_id, assets.storage_file_id) IS NOT NULL
+      AND (assets.storage_object_id IS NULL OR storage_objects.delete_state = 'active')
+      AND lower(CASE WHEN instr(assets.original_name, '.') > 0
+        THEN substr(assets.original_name, 1, length(assets.original_name) - length(substr(assets.original_name, instr(assets.original_name, '.'))))
+        ELSE assets.original_name END) = ?
+      AND assets.taken_at = ? AND assets.width = ? AND assets.height = ?
+    ORDER BY CASE WHEN lower(assets.mime_type) IN ('image/heic', 'image/heif') THEN 0 ELSE 1 END,
+      assets.created_at DESC LIMIT 1`)
+    .bind(
+      PERSONAL_WORKSPACE_ID,
+      input.sourceId ?? 'telegram-legacy',
+      input.storageBackend ?? 'telegram_bot',
+      stem,
+      input.takenAt,
+      input.width,
+      input.height,
+    ).first<AssetRow>()
+}
+
 export interface StorageObjectState {
   id: string
   deleteState: 'active' | 'deleting' | 'delete_failed' | 'deleted'

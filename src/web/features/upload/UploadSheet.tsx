@@ -46,7 +46,7 @@ function BatchSection({ batch, compact, reload }: { batch: UploadBatchSummary; c
   const unfinished = batch.total - batch.completed - batch.canceled
   return <section className="upload-batch" aria-labelledby={`batch-${batch.id}`}>
     <header>
-      <div><strong id={`batch-${batch.id}`}>批次 · {new Date(batch.createdAt).toLocaleString('zh-CN')}</strong><span>{batch.completed}/{batch.total} 完成{batch.deduplicated ? ` · ${batch.deduplicated} 项精确重复` : ''}{batch.failed ? ` · ${batch.failed} 项失败` : ''}</span></div>
+      <div><strong id={`batch-${batch.id}`}>批次 · {new Date(batch.createdAt).toLocaleString('zh-CN')}</strong><span>{batch.completed}/{batch.total} 完成 · 去重已检查 {batch.dedupChecked}/{batch.total} · {batch.deduplicated} 项重复{batch.failed ? ` · ${batch.failed} 项失败` : ''}</span></div>
       <span className="batch-progress-label">{batch.progress}%</span>
     </header>
     <div className="progress batch-progress"><i style={{ width: `${batch.progress}%` }} /></div>

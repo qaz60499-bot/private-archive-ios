@@ -11,6 +11,7 @@ export interface UploadBatchSummary {
   paused: number
   failed: number
   canceled: number
+  dedupChecked: number
   deduplicated: number
   progress: number
   jobs: LocalUploadJob[]
@@ -33,6 +34,7 @@ export function summarizeUploadBatches(jobs: LocalUploadJob[]): UploadBatchSumma
       paused: items.filter((job) => job.controlState === 'paused').length,
       failed: items.filter((job) => job.status === 'failed' && job.controlState !== 'canceled').length,
       canceled,
+      dedupChecked: items.filter((job) => ['original', 'completed'].includes(job.stage)).length,
       deduplicated: items.filter((job) => job.deduplicated).length,
       progress: items.length ? Math.round(((completed + canceled) / items.length) * 100) : 0,
       jobs: [...items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),

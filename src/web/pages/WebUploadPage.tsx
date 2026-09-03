@@ -81,7 +81,7 @@ function WebUploadQueue() {
       const unfinished = batch.total - batch.completed - batch.canceled
       return <section className="web-queue-batch" key={batch.id} aria-labelledby={`web-batch-${batch.id}`}>
         <header className="web-queue-batch-head">
-          <div><strong id={`web-batch-${batch.id}`}>上传批次</strong><span>{new Date(batch.createdAt).toLocaleString('zh-CN')} · {batch.completed}/{batch.total} 完成{batch.failed ? ` · ${batch.failed} 失败` : ''}{batch.deduplicated ? ` · ${batch.deduplicated} 去重` : ''}</span></div>
+          <div><strong id={`web-batch-${batch.id}`}>上传批次</strong><span>{new Date(batch.createdAt).toLocaleString('zh-CN')} · {batch.completed}/{batch.total} 完成 · 去重已检查 {batch.dedupChecked}/{batch.total} · {batch.deduplicated} 项重复{batch.failed ? ` · ${batch.failed} 失败` : ''}</span></div>
           <b>{batch.progress}%</b>
         </header>
         <div className="web-queue-progress"><i style={{ width: `${batch.progress}%` }} /></div>

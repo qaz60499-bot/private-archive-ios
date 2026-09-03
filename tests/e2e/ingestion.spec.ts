@@ -64,6 +64,50 @@ test('concurrent reserve for the same content does not rotate the active upload 
   expect(duplicateBody).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
 })
 
+test('same photo capture deduplicates across JPEG and HEIC representations', async ({ request }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'capture-identity dedup only needs one browser project')
+
+  const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
+  const takenAt = '2024-02-19T09:26:46.000Z'
+  const jpeg = Buffer.from(`jpeg-representation-${suffix}`)
+  const heic = Buffer.from(`heic-representation-${suffix}-different-bytes`)
+  const common = {
+    mediaType: 'photo', width: 4032, height: 3024, takenAt, storageBackend: 'telegram_bot',
+  }
+  const first = await request.post('/api/assets/reserve', {
+    data: {
+      ...common,
+      originalName: `IMG_${suffix}.jpeg`, mimeType: 'image/jpeg', sizeBytes: jpeg.byteLength,
+      contentHash: createHash('sha256').update(jpeg).digest('hex'),
+    },
+  })
+  expect(first.status()).toBe(201)
+  const firstReservation = await first.json() as { assetId: string; uploadToken: string }
+  const stored = await request.put(`/api/assets/${firstReservation.assetId}/content`, {
+    data: jpeg,
+    headers: {
+      'Content-Type': 'image/jpeg', 'Content-Length': String(jpeg.byteLength), 'X-Upload-Token': firstReservation.uploadToken,
+    },
+  })
+  expect(stored.status()).toBe(201)
+
+  const duplicate = await request.post('/api/assets/reserve', {
+    data: {
+      ...common,
+      originalName: `IMG_${suffix}.heic`, mimeType: 'image/heic', sizeBytes: heic.byteLength,
+      contentHash: createHash('sha256').update(heic).digest('hex'),
+    },
+  })
+  expect(duplicate.status()).toBe(200)
+  await expect(duplicate.json()).resolves.toMatchObject({
+    assetId: firstReservation.assetId,
+    duplicate: true,
+    duplicateOfAssetId: firstReservation.assetId,
+    duplicateKind: 'capture',
+    reusedStorage: true,
+  })
+})
+
 test('stale iOS reservation rotates the existing upload job instead of creating duplicates', async ({ request }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'stale reservation contract only needs one browser project')
 
