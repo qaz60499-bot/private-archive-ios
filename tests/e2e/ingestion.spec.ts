@@ -58,9 +58,9 @@ test('concurrent reserve for the same content does not rotate the active upload 
   await expect(idempotentContent.json()).resolves.toMatchObject({ alreadyStored: true })
 
   const duplicate = await request.post('/api/assets/reserve', { data: { ...metadata, originalName: `logical-copy-${suffix}.pdf` } })
-  expect(duplicate.status()).toBe(201)
+  expect(duplicate.status()).toBe(200)
   const duplicateBody = await duplicate.json() as { assetId: string; duplicate: boolean; duplicateOfAssetId: string; reusedStorage: boolean }
-  expect(duplicateBody.assetId).not.toBe(reservation.assetId)
+  expect(duplicateBody.assetId).toBe(reservation.assetId)
   expect(duplicateBody).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
 })
 
@@ -270,9 +270,9 @@ test('web upload and Telegram webhook converge into archive records', async ({ r
       storageBackend: 'telegram_bot',
     },
   })
-  expect(duplicateReserve.status()).toBe(201)
+  expect(duplicateReserve.status()).toBe(200)
   const duplicateAsset = await duplicateReserve.json() as { assetId: string; duplicate: boolean; duplicateOfAssetId: string; reusedStorage: boolean }
-  expect(duplicateAsset.assetId).not.toBe(reservation.assetId)
+  expect(duplicateAsset.assetId).toBe(reservation.assetId)
   expect(duplicateAsset).toMatchObject({ duplicate: true, duplicateOfAssetId: reservation.assetId, reusedStorage: true })
 
   const messageId = 100_000 + Math.floor(Math.random() * 800_000)

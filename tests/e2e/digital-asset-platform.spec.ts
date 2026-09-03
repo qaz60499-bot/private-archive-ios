@@ -79,8 +79,8 @@ test('Files classification, metadata, tags, archive and compound search share on
   expect(result.items.some((item) => item.id === uploaded.assetId)).toBeTruthy()
 })
 
-test('physical dedup preserves independent logical assets and shared-object purge safety', async ({ request }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop', 'storage reference safety only needs one browser project')
+test('exact dedup is a no-op for archive cardinality and returns the canonical asset', async ({ request }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'dedup cardinality only needs one browser project')
   const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
   const bytes = Buffer.from(`shared-storage-${suffix}`)
   const first = await uploadFile(request, { name: `first-${suffix}.pdf`, mime: 'application/pdf', bytes })
@@ -94,21 +94,19 @@ test('physical dedup preserves independent logical assets and shared-object purg
       storageBackend: 'telegram_bot',
     },
   })
-  expect(duplicate.status()).toBe(201)
+  expect(duplicate.status()).toBe(200)
   const second = await duplicate.json() as { assetId: string; duplicate: boolean; duplicateOfAssetId: string; reusedStorage: boolean }
-  expect(second.assetId).not.toBe(first.assetId)
+  expect(second.assetId).toBe(first.assetId)
   expect(second).toMatchObject({ duplicate: true, duplicateOfAssetId: first.assetId, reusedStorage: true })
 
-  expect((await request.delete(`/api/assets/${first.assetId}`)).ok()).toBeTruthy()
-  const firstPurge = await request.delete(`/api/assets/${first.assetId}/purge`)
-  expect(firstPurge.ok()).toBeTruthy()
-  await expect(firstPurge.json()).resolves.toMatchObject({ telegramDeleted: false, sharedObjectPreserved: true })
-  expect((await request.get(`/api/assets/${second.assetId}`)).ok()).toBeTruthy()
-
-  expect((await request.delete(`/api/assets/${second.assetId}`)).ok()).toBeTruthy()
-  const secondPurge = await request.delete(`/api/assets/${second.assetId}/purge`)
-  expect(secondPurge.ok()).toBeTruthy()
-  await expect(secondPurge.json()).resolves.toMatchObject({ sharedObjectPreserved: false })
+  const repeated = await request.post('/api/assets/reserve', {
+    data: {
+      originalName: `third-${suffix}.pdf`, mimeType: 'application/pdf', sizeBytes: bytes.byteLength,
+      mediaType: 'file', contentHash: first.contentHash, storageBackend: 'telegram_bot',
+    },
+  })
+  expect(repeated.status()).toBe(200)
+  await expect(repeated.json()).resolves.toMatchObject({ assetId: first.assetId, duplicate: true, duplicateOfAssetId: first.assetId })
 })
 
 test('user-group receipts are bound to the configured storage chat and purge finalize cannot skip prepare', async ({ request }, testInfo) => {

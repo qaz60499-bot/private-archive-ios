@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import {
   bulkDiscardUnstoredAssets, bulkPatchAssetFlags, bulkRestoreAssets, bulkSoftDeleteAssets, claimStorageObjectForPurge, claimUploadStarted, clearPreviewStored,
-  createDeduplicatedLogicalAsset, createPendingAsset, createUploadJobForAsset, deleteLogicalAsset, getActiveAssetByContentHash,
+  createPendingAsset, createUploadJobForAsset, deleteLogicalAsset, getActiveAssetByContentHash,
   getAsset, getLatestUploadJobState, getTagsForAsset, listAssets, markAssetViewed, markPreviewStored, markPurgeFailure, repairAssetFromActiveStorageObject,
   markQueued, markReadyWithoutAnalysis, markStorageObjectDeleted, markStorageObjectDeleteFailed, markStored, markUploadFailed, patchAsset, restoreAsset,
   setManualTags, setManualTagsForAssets, softDeleteAsset, verifyUploadToken,
@@ -154,14 +154,15 @@ assetsRoutes.post('/reserve', async (context) => {
       if (existing.storage_file_id) {
         if (!existing.storage_object_id) throw new Error('DEDUP_STORAGE_OBJECT_MISSING')
         if (existing.size_bytes !== input.sizeBytes) return context.json({ error: 'CONTENT_HASH_SIZE_MISMATCH' }, 409)
-        const logicalId = crypto.randomUUID()
-        await createDeduplicatedLogicalAsset(context.env.DB, { id: logicalId, existing, input: reservationInput, takenAt, uploadedAt })
-        await logActivity(context.env.DB, { action: 'UPLOAD', assetId: logicalId, detail: { reusedStorage: true, duplicateOfAssetId: existing.id } })
-        scheduleUsageRefresh(context)
+        // Exact duplicates are a no-op for this personal archive. Reusing Telegram
+        // storage while creating another logical asset caused PHOTO/upload counters to
+        // grow every time the same camera roll was selected again. Return the canonical
+        // asset directly so the native/Web queue can finish as deduplicated without
+        // changing archive cardinality or analysis/tag state.
         return context.json({
-          assetId: logicalId, duplicate: true, duplicateOfAssetId: existing.id, reusedStorage: true,
+          assetId: existing.id, duplicate: true, duplicateOfAssetId: existing.id, reusedStorage: true,
           storageBackend: input.storageBackend, sizeTier, maxUploadBytes,
-        }, 201)
+        }, 200)
       }
       if (existing.source === 'web') {
         const latestJob = await getLatestUploadJobState(context.env.DB, existing.id)
