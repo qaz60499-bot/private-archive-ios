@@ -108,6 +108,24 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return URLSession(configuration: configuration)
     }()
 
+#if DEBUG
+    // iOS Simulator's background-transfer daemon rejects loopback HTTP uploads even
+    // though a normal in-app URLSession can reach the same localhost server. The CI
+    // protocol smoke therefore swaps only the transport for localhost while preserving
+    // the production request builder, task identity, delegate completion, retries and
+    // reserve -> content state transition. Release builds cannot compile this override.
+    private lazy var protocolSmokeContentSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.allowsCellularAccess = true
+        configuration.httpCookieStorage = HTTPCookieStorage.shared
+        configuration.httpShouldSetCookies = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 60
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
+    }()
+#endif
+
     // Reconnect the old reserve background session only to cancel tasks left behind by
     // an in-place upgrade. No new request is ever scheduled on this session.
     private lazy var legacyReserveSession: URLSession = {
@@ -957,6 +975,17 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if let failed = markFailedIfActive(record.id, error: code ?? "RESERVATION_FAILED") { notify(failed) }
     }
 
+    private func contentUploadSession() -> URLSession {
+#if DEBUG
+        if ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1",
+           let host = apiBase.host,
+           host == "127.0.0.1" || host == "localhost" {
+            return protocolSmokeContentSession
+        }
+#endif
+        return session
+    }
+
     private func scheduleContent(_ record: NativeUploadRecord, earliest: Date?, cookieOverride: String? = nil) throws {
         guard let assetId = record.remoteAssetId, let token = record.uploadToken else {
             throw NSError(domain: "NativeBackgroundUpload", code: 10, userInfo: [NSLocalizedDescriptionKey: "UPLOAD_RESERVATION_MISSING"])
@@ -972,7 +1001,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         request.setValue(record.mimeType, forHTTPHeaderField: "Content-Type")
         request.setValue(String(record.sizeBytes), forHTTPHeaderField: "Content-Length")
         let contentTaskToken = UUID().uuidString
-        let task = session.uploadTask(with: request, fromFile: originalURL(record.id))
+        let task = contentUploadSession().uploadTask(with: request, fromFile: originalURL(record.id))
         task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
         task.earliestBeginDate = earliest
         let delayed = earliest.map { $0 > Date() } ?? false

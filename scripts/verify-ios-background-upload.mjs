@@ -28,6 +28,7 @@ assert(appDelegateSource.includes('handleEventsForBackgroundURLSession identifie
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.handleBackgroundEvents'), 'AppDelegate must forward background URLSession wakeups to the upload manager')
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'AppDelegate must reconcile uploads on background transition')
 assert(source.includes('PRIVATE_ARCHIVE_API_BASE_OVERRIDE') && source.includes('PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED'), 'Debug build must include the simulator reserve-to-content protocol smoke')
+assert(source.includes('private lazy var protocolSmokeContentSession: URLSession'), 'Debug protocol smoke must have a localhost-capable delegated content transport')
 assert(appDelegateSource.includes('runNativeProtocolRuntimeSmoke()'), 'Debug app launch must invoke the native protocol smoke when requested')
 
 const interrupted = section('private func recoverInterruptedStaging()', 'private func recoverRetryableFailures()')
@@ -57,7 +58,7 @@ assert(nativePicker.includes('registerFileRepresentation(forTypeIdentifier: UTTy
 assert(!nativePicker.includes('DispatchSemaphore') && !nativePicker.includes('slot.wait()'), 'native picker must not park one GCD worker per selected photo')
 assert(nativePicker.includes('private func notifyPickerError') && nativePicker.includes('self.notifyListeners("pickerError"'), 'picker failures must use the main-thread notification helper')
 assert(source.includes('PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED'), 'Debug simulator runtime smoke must exercise real PhotosUI presentation')
-assert(source.includes('Data(repeating: 0x5a, count: 256 * 1024)'), 'native protocol smoke must send a deterministic file body through the real background content session')
+assert(source.includes('Data(repeating: 0x5a, count: 256 * 1024)'), 'native protocol smoke must send a deterministic file body through the real content state machine')
 
 const resume = section('func resumeJob(', 'func cancelJob(')
 assert(resume.includes('已从本机缓存重建上传记录'), 'manual retry must reconstruct a missing native index from durable cache')
@@ -74,10 +75,16 @@ assert(reserve.includes('reserveTasks[record.id] === task'), 'reservation callba
 assert(reserve.includes('cookieOverride ?? cookieHeader()'), 'reservation recovery must be able to reuse the request cookie')
 assert(reserve.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'reserve scheduling must recheck active state before task resume')
 
-const reserveResult = section('private func handleReserveResult(', 'private func scheduleContent(')
+const reserveResult = section('private func handleReserveResult(', 'private func contentUploadSession()')
 assert(reserveResult.includes('value.stage = "original"'), 'a successful reservation must persist content ownership before scheduling PUT')
 assert(reserveResult.includes('scheduleContent(reserved, earliest: nil, cookieOverride: requestCookie)'), 'reserve completion must reuse its original request cookie when creating content upload')
 assert(!reserveResult.includes('markFailedIfActive(record.id, error: code ?? "APP_AUTH_REQUIRED")'), 'temporary cold-launch auth gaps must not become terminal reserve failures')
+
+const contentTransport = section('private func contentUploadSession()', 'private func scheduleContent(')
+assert(contentTransport.includes('#if DEBUG') && contentTransport.includes('PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE') && contentTransport.includes('return protocolSmokeContentSession'), 'only the Debug localhost protocol smoke may substitute the content transport')
+assert(contentTransport.includes('#endif') && contentTransport.includes('return session'), 'normal and Release content uploads must stay on the durable background URLSession')
+const contentSchedule = section('private func scheduleContent(', 'private func reservePayload(')
+assert(contentSchedule.includes('contentUploadSession().uploadTask(with: request, fromFile: originalURL(record.id))'), 'content scheduling must use the selected transport while preserving the same request/file task path')
 
 const reconcile = section('private func reconcileTasks()', 'func urlSession(_ session: URLSession, dataTask: URLSessionDataTask')
 assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks for a different asset path')
