@@ -287,36 +287,41 @@ export async function markStored(db: D1Database, assetId: string, stored: Stored
   }
 
   const preserveAssetStorageColumns = discardStoredMessage || source.source_id !== 'telegram-legacy'
-  const attached = await db.prepare(`UPDATE assets SET
-      storage_backend = ?, telegram_media_id = ?, import_origin = ?,
-      storage_chat_id = CASE WHEN ? THEN storage_chat_id ELSE ? END,
-      storage_message_id = CASE WHEN ? THEN storage_message_id ELSE ? END,
-      storage_file_id = CASE WHEN ? THEN storage_file_id ELSE ? END,
-      storage_file_unique_id = CASE WHEN ? THEN storage_file_unique_id ELSE ? END,
-      telegram_url = CASE WHEN ? THEN telegram_url ELSE ? END,
-      storage_object_id = ?,
-      preview_message_id = CASE WHEN ? OR preview_file_id IS NOT NULL OR ? IS NULL THEN preview_message_id ELSE ? END,
-      preview_file_id = CASE WHEN ? THEN preview_file_id ELSE COALESCE(preview_file_id, ?) END,
-      status = 'stored', updated_at = ?
-    WHERE id = ? AND workspace_id = ?
-      AND EXISTS (SELECT 1 FROM storage_objects WHERE id = ? AND workspace_id = ? AND delete_state = 'active')`)
-    .bind(
-      stored.backend, stored.mediaId ?? null, stored.importOrigin ?? 'web',
-      preserveAssetStorageColumns, stored.chatId,
-      preserveAssetStorageColumns, stored.messageId,
-      preserveAssetStorageColumns, stored.fileId,
-      preserveAssetStorageColumns, stored.fileUniqueId,
-      preserveAssetStorageColumns, stored.telegramUrl,
-      targetObjectId,
-      preserveAssetStorageColumns, stored.previewFileId ?? null, stored.messageId,
-      preserveAssetStorageColumns, stored.previewFileId ?? null,
-      now, assetId, PERSONAL_WORKSPACE_ID, targetObjectId, PERSONAL_WORKSPACE_ID,
-    ).run()
+  const [attached] = await db.batch([
+    db.prepare(`UPDATE assets SET
+        storage_backend = ?, telegram_media_id = ?, import_origin = ?,
+        storage_chat_id = CASE WHEN ? THEN storage_chat_id ELSE ? END,
+        storage_message_id = CASE WHEN ? THEN storage_message_id ELSE ? END,
+        storage_file_id = CASE WHEN ? THEN storage_file_id ELSE ? END,
+        storage_file_unique_id = CASE WHEN ? THEN storage_file_unique_id ELSE ? END,
+        telegram_url = CASE WHEN ? THEN telegram_url ELSE ? END,
+        storage_object_id = ?,
+        preview_message_id = CASE WHEN ? OR preview_file_id IS NOT NULL OR ? IS NULL THEN preview_message_id ELSE ? END,
+        preview_file_id = CASE WHEN ? THEN preview_file_id ELSE COALESCE(preview_file_id, ?) END,
+        status = 'stored', updated_at = ?
+      WHERE id = ? AND workspace_id = ?
+        AND EXISTS (SELECT 1 FROM storage_objects WHERE id = ? AND workspace_id = ? AND delete_state = 'active')`)
+      .bind(
+        stored.backend, stored.mediaId ?? null, stored.importOrigin ?? 'web',
+        preserveAssetStorageColumns, stored.chatId,
+        preserveAssetStorageColumns, stored.messageId,
+        preserveAssetStorageColumns, stored.fileId,
+        preserveAssetStorageColumns, stored.fileUniqueId,
+        preserveAssetStorageColumns, stored.telegramUrl,
+        targetObjectId,
+        preserveAssetStorageColumns, stored.previewFileId ?? null, stored.messageId,
+        preserveAssetStorageColumns, stored.previewFileId ?? null,
+        now, assetId, PERSONAL_WORKSPACE_ID, targetObjectId, PERSONAL_WORKSPACE_ID,
+      ),
+    db.prepare(`UPDATE upload_jobs SET status = 'done', last_error = NULL, updated_at = ?
+      WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+        AND EXISTS (
+          SELECT 1 FROM assets
+          WHERE id = ? AND workspace_id = ? AND status = 'stored' AND storage_object_id = ?
+        )`)
+      .bind(now, assetId, assetId, PERSONAL_WORKSPACE_ID, targetObjectId),
+  ])
   if (attached.meta.changes === 0) return { attached: false, discardStoredMessage: true }
-
-  await db.prepare(`UPDATE upload_jobs SET status = 'done', updated_at = ?
-    WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)`)
-    .bind(now, assetId).run()
   return { attached: true, discardStoredMessage }
 }
 

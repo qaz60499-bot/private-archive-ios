@@ -85,6 +85,10 @@ assert(contentTransport.includes('#if DEBUG') && contentTransport.includes('PRIV
 assert(contentTransport.includes('#endif') && contentTransport.includes('return session'), 'normal and Release content uploads must stay on the durable background URLSession')
 const contentSchedule = section('private func scheduleContent(', 'private func reservePayload(')
 assert(contentSchedule.includes('contentUploadSession().uploadTask(with: request, fromFile: originalURL(record.id))'), 'content scheduling must use the selected transport while preserving the same request/file task path')
+assert(source.includes('private let maxScheduledContentTasks = 3'), 'native background uploads must keep a shallow durable transfer window instead of flooding iOS with the whole batch')
+assert(contentSchedule.includes('scheduledCount < maxScheduledContentTasks'), 'content scheduling must enforce the bounded background-transfer window before creating a task')
+assert(contentSchedule.includes('task.priority = URLSessionTask.highPriority'), 'active native content uploads should request high URLSession priority')
+assert(contentSchedule.indexOf('guard let updated else { return }') < contentSchedule.indexOf('contentUploadSession().uploadTask'), 'no-slot records must stay durably queued without creating extra background tasks')
 
 const reconcile = section('private func reconcileTasks()', 'func urlSession(_ session: URLSession, dataTask: URLSessionDataTask')
 assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks for a different asset path')
@@ -121,6 +125,7 @@ const taskCompletion = section('func urlSession(_ session: URLSession, task: URL
 assert(taskCompletion.includes('New reservations complete through foregroundSession') && taskCompletion.includes('if stage == "reserve"'), 'delegate callbacks from legacy reserve tasks must be ignored rather than rotating current tokens')
 assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'content callbacks should reuse an available persisted cookie for recovery')
 assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED", cookieOverride: requestCookie)'), 'expired content capability must explicitly clear and recreate reservation state using the persisted task cookie')
+assert(taskCompletion.includes('if shouldRefillContentWindow { reconcileTasks() }'), 'every terminal content callback must refill the bounded transfer window')
 assert(!taskCompletion.includes('markFailedIfActive(id, error: code ?? "APP_AUTH_REQUIRED")'), 'APP_AUTH_REQUIRED must never be terminal in a cold background callback')
 
 const pauseAndCancel = section('func pauseJob(', 'func resumeJob(')

@@ -75,6 +75,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private var reconcilePending = false
     private var stagingProtectionDepth = 0
     private var stagingBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+    // Keep the system background-transfer queue shallow. Submitting an entire 80-photo
+    // batch at once caused iOS to defer the whole group for minutes even though the
+    // configuration allowed only three host connections. Records remain durably queued
+    // on disk; only this many file tasks are handed to the background daemon at once.
+    private let maxScheduledContentTasks = 3
 
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
@@ -1001,12 +1006,16 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         request.setValue(record.mimeType, forHTTPHeaderField: "Content-Type")
         request.setValue(String(record.sizeBytes), forHTTPHeaderField: "Content-Length")
         let contentTaskToken = UUID().uuidString
-        let task = contentUploadSession().uploadTask(with: request, fromFile: originalURL(record.id))
-        task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
-        task.earliestBeginDate = earliest
         let delayed = earliest.map { $0 > Date() } ?? false
         let updated = stateQueue.sync { () -> NativeUploadRecord? in
-            guard var value = records[record.id],
+            let scheduledCount = records.values.reduce(into: 0) { count, candidate in
+                if candidate.contentTaskToken != nil,
+                   candidate.status != "done", candidate.status != "failed", candidate.status != "paused" {
+                    count += 1
+                }
+            }
+            guard scheduledCount < maxScheduledContentTasks,
+                  var value = records[record.id],
                   value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused",
                   value.remoteAssetId == assetId, value.uploadToken == token,
@@ -1021,10 +1030,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             saveStateLocked()
             return value
         }
-        guard let updated else {
-            task.cancel()
-            return
-        }
+        // No slot is not an error. The record already owns a durable reservation and
+        // stays in the local queue; the next content completion/reconcile fills the slot.
+        guard let updated else { return }
+        let task = contentUploadSession().uploadTask(with: request, fromFile: originalURL(record.id))
+        task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
+        task.earliestBeginDate = earliest
+        task.priority = URLSessionTask.highPriority
         notify(updated)
         task.resume()
     }
@@ -1508,6 +1520,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             guard record != nil else { return }
         }
         guard let record else { return }
+        let shouldRefillContentWindow = stage == "content"
+        // Whichever terminal path this task takes, immediately refill the bounded
+        // background-transfer window from the durable local queue.
+        defer {
+            if shouldRefillContentWindow { reconcileTasks() }
+        }
         let response = task.response as? HTTPURLResponse
         // A background task can wake a cold process before the WebView has restored the
         // shared app-session cookie. Reuse the exact Cookie header captured when iOS
