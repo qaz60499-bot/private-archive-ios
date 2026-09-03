@@ -4,7 +4,6 @@ import Capacitor
 import CryptoKit
 import ImageIO
 import AVFoundation
-import Photos
 import PhotosUI
 import UniformTypeIdentifiers
 
@@ -1479,8 +1478,12 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     ]
 
     private var observer: NSObjectProtocol?
+    // Capacitor invokes plugin methods on its background bridge queue. Keep every
+    // PhotosUI object and picker lifecycle field confined to the main thread.
     private var photoPickerCall: CAPPluginCall?
     private var photoPickerBatchId: String?
+    private let photoImportQueue = DispatchQueue(label: "cd.cc.joye.photo.photo-import", qos: .userInitiated, attributes: .concurrent)
+    private let photoImportSlots = DispatchSemaphore(value: 3)
 
     @objc override public func load() {
         _ = NativeBackgroundUploadManager.shared
@@ -1494,31 +1497,56 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 
-    @objc func pickPhotos(_ call: CAPPluginCall) {
-        guard photoPickerCall == nil else { return call.reject("PHOTO_PICKER_ALREADY_OPEN") }
-        guard let batchId = call.getString("batchId"), UUID(uuidString: batchId) != nil else {
-            return call.reject("INVALID_BATCH")
-        }
-        var configuration = PHPickerConfiguration(photoLibrary: PHPhotoLibrary.shared())
+    private func makePhotoPicker() -> PHPickerViewController {
+        dispatchPrecondition(condition: .onQueue(.main))
+        // PHPicker provides user-selected assets without requiring direct PhotoKit
+        // library enumeration. Avoid PHPhotoLibrary.shared() here so opening the picker
+        // stays inside the system privacy boundary and does not add a second permission path.
+        var configuration = PHPickerConfiguration()
         configuration.filter = .images
         configuration.selectionLimit = 0
         configuration.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: configuration)
         picker.delegate = self
-        photoPickerCall = call
-        photoPickerBatchId = batchId
-        DispatchQueue.main.async {
-            guard let viewController = self.bridge?.viewController else {
-                self.photoPickerCall = nil
-                self.photoPickerBatchId = nil
-                call.reject("PHOTO_PICKER_UNAVAILABLE")
-                return
+        return picker
+    }
+
+    private func notifyPickerError(batchId: String, jobId: String?, message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var data: [String: Any] = ["batchId": batchId, "message": message]
+            if let jobId { data["jobId"] = jobId }
+            self.notifyListeners("pickerError", data: data, retainUntilConsumed: true)
+        }
+    }
+
+    @objc func pickPhotos(_ call: CAPPluginCall) {
+        guard let batchId = call.getString("batchId"), UUID(uuidString: batchId) != nil else {
+            return call.reject("INVALID_BATCH")
+        }
+
+        // Capacitor's iOS bridge deliberately performs plugin selectors on a background
+        // dispatch queue. PHPickerViewController and its delegate/configuration are
+        // MainActor APIs, so constructing them before this hop can terminate the app on
+        // a real device even though xcodebuild/analyze succeeds.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return call.reject("PHOTO_PICKER_UNAVAILABLE") }
+            guard self.photoPickerCall == nil else { return call.reject("PHOTO_PICKER_ALREADY_OPEN") }
+            guard let viewController = self.bridge?.viewController,
+                  viewController.presentedViewController == nil else {
+                return call.reject("PHOTO_PICKER_PRESENTATION_BUSY")
             }
+
+            let picker = self.makePhotoPicker()
+            self.photoPickerCall = call
+            self.photoPickerBatchId = batchId
             viewController.present(picker, animated: true)
         }
     }
 
     public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        // PHPickerViewControllerDelegate is a MainActor protocol. Keep the retained
+        // CAPPluginCall and picker state on that actor as well.
         let call = photoPickerCall
         let batchId = photoPickerBatchId
         photoPickerCall = nil
@@ -1538,36 +1566,52 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
                 return type.conforms(to: .image)
             }) ?? UTType.image.identifier
             group.enter()
-            provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
-                guard let url else {
-                    self.notifyListeners("pickerError", data: [
-                        "batchId": batchId,
-                        "jobId": jobId,
-                        "message": error?.localizedDescription ?? "无法读取所选照片。"
-                    ], retainUntilConsumed: true)
-                    group.leave()
-                    return
-                }
-                let type = UTType(typeIdentifier)
-                var fileName = provider.suggestedName ?? url.lastPathComponent
-                if (fileName as NSString).pathExtension.isEmpty, let ext = type?.preferredFilenameExtension {
-                    fileName += ".\(ext)"
-                }
-                let mimeType = type?.preferredMIMEType ?? "image/jpeg"
-                let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? nil
-                let lastModifiedMs = modified.map { $0.timeIntervalSince1970 * 1000 }
-                NativeBackgroundUploadManager.shared.importPickedPhoto(
-                    id: jobId, batchId: batchId, sourceURL: url, fileName: fileName,
-                    mimeType: mimeType, lastModifiedMs: lastModifiedMs
-                ) { result in
-                    if case .failure(let importError) = result {
-                        self.notifyListeners("pickerError", data: [
-                            "batchId": batchId,
-                            "jobId": jobId,
-                            "message": importError.localizedDescription
-                        ], retainUntilConsumed: true)
+
+            // Unlimited picker selection must not become unlimited simultaneous file
+            // materialization. Bound provider work to three in-flight originals so a
+            // large photo batch cannot spike memory/file-provider pressure and get the
+            // app jetsammed while preserving the user's full selection.
+            photoImportQueue.async { [weak self] in
+                guard let self else { group.leave(); return }
+                let slot = self.photoImportSlots
+                slot.wait()
+                provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self] url, error in
+                    guard let self else {
+                        slot.signal()
+                        group.leave()
+                        return
                     }
-                    group.leave()
+                    guard let url else {
+                        self.notifyPickerError(
+                            batchId: batchId,
+                            jobId: jobId,
+                            message: error?.localizedDescription ?? "无法读取所选照片。"
+                        )
+                        slot.signal()
+                        group.leave()
+                        return
+                    }
+                    let type = UTType(typeIdentifier)
+                    var fileName = provider.suggestedName ?? url.lastPathComponent
+                    if (fileName as NSString).pathExtension.isEmpty, let ext = type?.preferredFilenameExtension {
+                        fileName += ".\(ext)"
+                    }
+                    let mimeType = type?.preferredMIMEType ?? "image/jpeg"
+                    let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? nil
+                    let lastModifiedMs = modified.map { $0.timeIntervalSince1970 * 1000 }
+                    NativeBackgroundUploadManager.shared.importPickedPhoto(
+                        id: jobId, batchId: batchId, sourceURL: url, fileName: fileName,
+                        mimeType: mimeType, lastModifiedMs: lastModifiedMs
+                    ) { result in
+                        if case .failure(let importError) = result {
+                            self.notifyPickerError(batchId: batchId, jobId: jobId, message: importError.localizedDescription)
+                        }
+                        group.leave()
+                    }
+                    // The temporary provider URL has been copied synchronously by
+                    // importPickedPhoto before it returns, so another provider may now
+                    // materialize while hashing/reservation completes on workerQueue.
+                    slot.signal()
                 }
             }
         }
@@ -1575,6 +1619,27 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
             NativeBackgroundUploadManager.shared.endStagingProtection()
         }
     }
+
+#if DEBUG
+    func runPhotoPickerRuntimeSmoke() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let viewController = self.bridge?.viewController,
+                  viewController.presentedViewController == nil else {
+                NSLog("PRIVATE_ARCHIVE_PICKER_SMOKE_UNAVAILABLE")
+                return
+            }
+            let picker = self.makePhotoPicker()
+            viewController.present(picker, animated: false) {
+                NSLog("PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    picker.dismiss(animated: false) {
+                        NSLog("PRIVATE_ARCHIVE_PICKER_SMOKE_DISMISSED")
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     @objc func createJob(_ call: CAPPluginCall) {
         guard let id = call.getString("id"), let fileName = call.getString("fileName"),
@@ -1666,6 +1731,15 @@ class PrivateArchiveBridgeViewController: CAPBridgeViewController {
         // made the JS bridge report “NativeBackgroundUpload plugin is not implemented
         // on ios”. Instance registration is the supported runtime path for this local,
         // app-owned plugin and works regardless of automatic package-plugin discovery.
-        bridge?.registerPluginInstance(NativeBackgroundUploadPlugin())
+        let nativeUploadPlugin = NativeBackgroundUploadPlugin()
+        bridge?.registerPluginInstance(nativeUploadPlugin)
+#if DEBUG
+        // CI launches the simulator with this environment variable to exercise the
+        // real PhotosUI construction/presentation path. It is compiled out of Release
+        // builds and shares the same makePhotoPicker() implementation used by JS calls.
+        if ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_PICKER_SMOKE"] == "1" {
+            nativeUploadPlugin.runPhotoPickerRuntimeSmoke()
+        }
+#endif
     }
 }
