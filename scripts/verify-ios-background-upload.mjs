@@ -20,12 +20,15 @@ function section(start, end) {
   return source.slice(from, to)
 }
 
-assert(source.includes('URLSessionConfiguration.background(withIdentifier: Self.reserveSessionIdentifier)'), 'reserve handshake must use a background URLSession')
-assert(!source.includes('foregroundSession'), 'foreground reservation session must not return')
-assert(source.includes('identifier == Self.sessionIdentifier || identifier == Self.reserveSessionIdentifier'), 'native background-event bridge must accept both sessions')
+assert(source.includes('private lazy var foregroundSession: URLSession') && source.includes('URLSessionConfiguration.default'), 'reserve handshake must use the proven foreground URLSession boundary')
+assert(source.includes('URLSessionConfiguration.background(withIdentifier: Self.legacyReserveSessionIdentifier)'), 'upgrades must reconnect the broken legacy reserve session for cleanup')
+assert(!source.includes('reserveSession.uploadTask'), 'new reservation handshakes must never use a background upload task')
+assert(source.includes('identifier == Self.sessionIdentifier || identifier == Self.legacyReserveSessionIdentifier'), 'native background-event bridge must drain both content and legacy reserve sessions')
 assert(appDelegateSource.includes('handleEventsForBackgroundURLSession identifier: String'), 'AppDelegate must receive iOS background URLSession wakeups')
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.handleBackgroundEvents'), 'AppDelegate must forward background URLSession wakeups to the upload manager')
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'AppDelegate must reconcile uploads on background transition')
+assert(source.includes('PRIVATE_ARCHIVE_API_BASE_OVERRIDE') && source.includes('PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED'), 'Debug build must include the simulator reserve-to-content protocol smoke')
+assert(appDelegateSource.includes('runNativeProtocolRuntimeSmoke()'), 'Debug app launch must invoke the native protocol smoke when requested')
 
 const interrupted = section('private func recoverInterruptedStaging()', 'private func recoverRetryableFailures()')
 assert(!interrupted.includes('removeItem(at: url)'), 'interrupted staging recovery must preserve partial cache')
@@ -54,6 +57,7 @@ assert(nativePicker.includes('registerFileRepresentation(forTypeIdentifier: UTTy
 assert(!nativePicker.includes('DispatchSemaphore') && !nativePicker.includes('slot.wait()'), 'native picker must not park one GCD worker per selected photo')
 assert(nativePicker.includes('private func notifyPickerError') && nativePicker.includes('self.notifyListeners("pickerError"'), 'picker failures must use the main-thread notification helper')
 assert(source.includes('PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED'), 'Debug simulator runtime smoke must exercise real PhotosUI presentation')
+assert(source.includes('Data(repeating: 0x5a, count: 256 * 1024)'), 'native protocol smoke must send a deterministic file body through the real background content session')
 
 const resume = section('func resumeJob(', 'func cancelJob(')
 assert(resume.includes('已从本机缓存重建上传记录'), 'manual retry must reconstruct a missing native index from durable cache')
@@ -64,9 +68,10 @@ assert(resume.includes('(record.controlGeneration ?? 0) == generation'), 'resume
 assert(resume.includes('scheduleReserve(current, earliest: nil)') || resume.includes('scheduleReserve(retrying, earliest: nil)'), 'manual retry must restart from cached bytes')
 
 const reserve = section('private func scheduleReserve(', 'private func handleReserveResult(')
-assert(reserve.includes('reserveSession.uploadTask'), 'reservation must be owned by the dedicated background session')
-assert(!reserve.includes('asyncAfter'), 'reservation retry must not depend on a suspended dispatch timer')
-assert(reserve.includes('cookieOverride ?? cookieHeader()'), 'reservation recovery must be able to reuse the persisted background-task cookie')
+assert(reserve.includes('foregroundSession.dataTask(with: request)'), 'reservation must use a normal data task so the response/token is handled in one process callback')
+assert(reserve.includes('request.httpBody = payload'), 'foreground reservation must send its bounded JSON body directly')
+assert(reserve.includes('reserveTasks[record.id] === task'), 'reservation callback must reject only an actually superseded foreground task')
+assert(reserve.includes('cookieOverride ?? cookieHeader()'), 'reservation recovery must be able to reuse the request cookie')
 assert(reserve.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'reserve scheduling must recheck active state before task resume')
 
 const reserveResult = section('private func handleReserveResult(', 'private func scheduleContent(')
@@ -75,14 +80,19 @@ assert(reserveResult.includes('scheduleContent(reserved, earliest: nil, cookieOv
 assert(!reserveResult.includes('markFailedIfActive(record.id, error: code ?? "APP_AUTH_REQUIRED")'), 'temporary cold-launch auth gaps must not become terminal reserve failures')
 
 const reconcile = section('private func reconcileTasks()', 'func urlSession(_ session: URLSession, dataTask: URLSessionDataTask')
-assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks from stale reservations')
+assert(reconcile.includes('contentRequestMatchesRecord(task, record: current)'), 'reconcile must reject content tasks for a different asset path')
 assert(reconcile.includes('reconcileInFlight'), 'reconciliation must be serialized')
-assert(reconcile.indexOf('let recordsById = stateQueue.sync { records }') < reconcile.indexOf('reserveSession.getAllTasks'), 'record snapshot must precede URLSession task snapshots')
+assert(reconcile.indexOf('let recordsById = stateQueue.sync { records }') < reconcile.indexOf('legacyReserveSession.getAllTasks'), 'record snapshot must precede URLSession task snapshots')
+assert(reconcile.includes('legacyReserveTasks.forEach { $0.cancel() }'), 'upgrade reconciliation must retire every old background reserve task')
+assert(reconcile.includes('Set(self.reserveTasks.keys)'), 'foreground reservation tasks must participate in active-job ownership')
 assert(reconcile.includes('contentTaskToken'), 'reconcile must enforce one persisted content-task owner per job')
 assert(reconcile.includes('current.contentTaskToken == snapshotToken'), 'reconcile must reclaim an orphaned persisted content-task token when iOS lost the task')
 assert(reconcile.includes('Date().timeIntervalSince(snapshotUpdatedAt) >= 10'), 'orphan-token reclaim must not race a freshly created content task')
 assert(reconcile.includes('validContentIds'), 'reconcile must distinguish a valid content task from stale siblings')
 assert(!reconcile.includes('let staleSeconds ='), 'reconcile must not kill a valid background upload merely because iOS delayed progress callbacks')
+const contentMatcher = section('private func contentRequestMatchesRecord(', 'private func contentTaskIdentity(')
+assert(contentMatcher.includes('task.originalRequest?.url?.path == "/api/assets/\\(assetId)/content"'), 'content ownership must bind to the exact reserved asset path')
+assert(!contentMatcher.includes('value(forHTTPHeaderField: "X-Upload-Token")'), 'background task identity must not depend on reading a normalized custom header back from originalRequest')
 
 const retries = section('private func retryReserve(', 'private func complete(')
 assert(retries.includes('if record.remoteAssetId != nil, record.uploadToken != nil'), 'retryReserve must reuse an existing valid reservation instead of creating duplicates')
@@ -101,7 +111,8 @@ assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'fin
 assert(finishJob.includes('self.nativeUploadErrorCode(error) == 9'), 'finishJob must not turn a temporary auth gap into a failed staged original')
 
 const taskCompletion = section('func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)', 'func urlSessionDidFinishEvents')
-assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'background callbacks must recover using the cookie persisted on the URLSession task')
+assert(taskCompletion.includes('New reservations complete through foregroundSession') && taskCompletion.includes('if stage == "reserve"'), 'delegate callbacks from legacy reserve tasks must be ignored rather than rotating current tokens')
+assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'content callbacks should reuse an available persisted cookie for recovery')
 assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED", cookieOverride: requestCookie)'), 'expired content capability must explicitly clear and recreate reservation state using the persisted task cookie')
 assert(!taskCompletion.includes('markFailedIfActive(id, error: code ?? "APP_AUTH_REQUIRED")'), 'APP_AUTH_REQUIRED must never be terminal in a cold background callback')
 

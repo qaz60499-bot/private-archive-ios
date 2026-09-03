@@ -10,6 +10,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // Recreate the background URLSession early so iOS can reconnect pending
         // transfers after suspending or terminating the app process.
         _ = NativeBackgroundUploadManager.shared
+#if DEBUG
+        NativeBackgroundUploadManager.shared.runNativeProtocolRuntimeSmoke()
+#endif
         return true
     }
 

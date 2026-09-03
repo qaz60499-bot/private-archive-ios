@@ -41,7 +41,7 @@ jobs:
           xcodebuild -version
           xcodebuild -list -project ios/App/App.xcodeproj
 
-      - name: Run iOS Simulator photo picker runtime smoke
+      - name: Run iOS Simulator picker, bulk import, and upload protocol smoke
         run: |
           set -euo pipefail
           UDID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; items=[d for runtime,devices in data.items() if "iOS" in runtime for d in devices if d.get("isAvailable") and d.get("name", "").startswith("iPhone")]; assert items, "no available iPhone simulator"; print(items[0]["udid"])')"
@@ -64,9 +64,12 @@ jobs:
           test -d "$APP_PATH"
           xcrun simctl install "$UDID" "$APP_PATH"
           LOG_FILE="$RUNNER_TEMP/private-archive-picker-smoke.log"
+          SERVER_LOG="$RUNNER_TEMP/private-archive-protocol-server.log"
+          SERVER_PID=""
           xcrun simctl spawn "$UDID" log stream --style compact --level debug --predicate 'process == "App"' > "$LOG_FILE" 2>&1 &
           LOG_PID=$!
           cleanup() {
+            if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
             kill "$LOG_PID" 2>/dev/null || true
             xcrun simctl terminate "$UDID" cd.cc.joye.photo 2>/dev/null || true
             xcrun simctl shutdown "$UDID" 2>/dev/null || true
@@ -75,14 +78,35 @@ jobs:
           sleep 1
           SIMCTL_CHILD_PRIVATE_ARCHIVE_PICKER_SMOKE=1 xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
           sleep 15
-          kill "$LOG_PID" 2>/dev/null || true
-          wait "$LOG_PID" 2>/dev/null || true
-          cat "$LOG_FILE"
           grep -q 'PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED' "$LOG_FILE"
           grep -q 'PRIVATE_ARCHIVE_PICKER_SMOKE_DISMISSED' "$LOG_FILE"
           grep -q 'PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=80 recoverable=80' "$LOG_FILE"
-          if grep -E 'Terminating app due to uncaught exception|Main Thread Checker|EXC_BAD_ACCESS|Fatal error' "$LOG_FILE"; then
-            echo 'iOS picker runtime smoke detected a native crash/thread violation' >&2
+
+          xcrun simctl terminate "$UDID" cd.cc.joye.photo 2>/dev/null || true
+          node scripts/ios-upload-protocol-smoke-server.mjs > "$SERVER_LOG" 2>&1 &
+          SERVER_PID=$!
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:18765/health >/dev/null; then break; fi
+            if [ "$attempt" -eq 20 ]; then cat "$SERVER_LOG"; exit 1; fi
+            sleep 0.25
+          done
+          SIMCTL_CHILD_PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE=1 \
+          SIMCTL_CHILD_PRIVATE_ARCHIVE_API_BASE_OVERRIDE=http://127.0.0.1:18765 \
+            xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
+          sleep 22
+
+          kill "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" 2>/dev/null || true
+          SERVER_PID=""
+          kill "$LOG_PID" 2>/dev/null || true
+          wait "$LOG_PID" 2>/dev/null || true
+          cat "$SERVER_LOG"
+          cat "$LOG_FILE"
+          grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_RESERVE_OK' "$SERVER_LOG"
+          grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_CONTENT_OK bytes=262144' "$SERVER_LOG"
+          grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED' "$LOG_FILE"
+          if grep -E 'PRIVATE_ARCHIVE_(PROTOCOL|BULK_IMPORT)_SMOKE_FAILED|Terminating app due to uncaught exception|Main Thread Checker|EXC_BAD_ACCESS|Fatal error' "$LOG_FILE"; then
+            echo 'iOS runtime smoke detected an upload/picker failure or native crash' >&2
             exit 1
           fi
 

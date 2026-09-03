@@ -30,6 +30,11 @@
 	<string>用于从系统照片图库选择照片和视频上传到你的 Private Archive。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>用于将你从 Private Archive 保存的照片和视频写入系统照片图库。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>WKAppBoundDomains</key>
 	<array>
 		<string>api.photo.joye.cc.cd</string>
