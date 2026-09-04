@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { KeyRound, LoaderCircle, LockKeyhole, ShieldCheck, UserRound } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { reauthenticateAccess } from '../lib/access-session'
@@ -6,19 +6,30 @@ import { reauthenticateAccess } from '../lib/access-session'
 export function AuthGate({ children }: { children: ReactNode }) {
   const auth = useAuth()
   const localDesktop = typeof window !== 'undefined' && (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost')
-  const [username, setUsername] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [password, setPassword] = useState('')
+  const usernameInput = useRef<HTMLInputElement>(null)
+  const passwordInput = useRef<HTMLInputElement>(null)
+  const [selectedUsername, setSelectedUsername] = useState(() => auth.knownAccounts[0]?.username ?? '')
   const [submitting, setSubmitting] = useState(false)
 
-  const submit = async (event: FormEvent) => {
+  const selectKnownAccount = (username: string) => {
+    if (usernameInput.current) usernameInput.current.value = username
+    setSelectedUsername(username)
+    passwordInput.current?.focus()
+  }
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (submitting) return
+    const form = event.currentTarget
+    const fields = new FormData(form)
+    const username = String(fields.get('username') ?? '').trim()
+    const displayName = String(fields.get('displayName') ?? '').trim()
+    const password = String(fields.get('password') ?? '')
     setSubmitting(true)
     try {
       if (auth.initialized) await auth.login(username, password)
       else await auth.bootstrap(username, displayName, password)
-      setPassword('')
+      form.reset()
     } catch {
       // AuthContext exposes the user-facing error.
     } finally {
@@ -48,18 +59,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
     <p className="owner-login-copy">{copy}</p>
 
     {auth.initialized && auth.knownAccounts.length ? <div className="known-account-list" aria-label="已保存账号">
-      {auth.knownAccounts.map((account) => <button key={account.username} type="button" className={`known-account${username.toLowerCase() === account.username.toLowerCase() ? ' active' : ''}`} onClick={() => setUsername(account.username)}>
+      {auth.knownAccounts.map((account) => <button key={account.username} type="button" className={`known-account${selectedUsername.toLowerCase() === account.username.toLowerCase() ? ' active' : ''}`} onClick={() => selectKnownAccount(account.username)}>
         <span className="known-account-avatar"><UserRound /></span>
         <span><strong>{account.displayName}</strong><small>@{account.username}</small></span>
       </button>)}
     </div> : null}
 
-    <form onSubmit={(event) => void submit(event)}>
+    <form autoComplete="on" onSubmit={(event) => void submit(event)}>
       <label htmlFor="account-username"><UserRound />用户名</label>
-      <div className="owner-password-field"><UserRound /><input id="account-username" name="username" autoComplete="username" value={username} onChange={(event) => setUsername(event.currentTarget.value)} placeholder="例如 owner" required /></div>
-      {!auth.initialized ? <><label htmlFor="account-display-name" className="account-second-label"><UserRound />显示名称</label><div className="owner-password-field"><UserRound /><input id="account-display-name" name="displayName" autoComplete="name" value={displayName} onChange={(event) => setDisplayName(event.currentTarget.value)} placeholder="例如 Joye" required /></div></> : null}
+      <div className="owner-password-field"><UserRound /><input ref={usernameInput} id="account-username" name="username" autoComplete="username" defaultValue={selectedUsername} onInput={(event) => setSelectedUsername(event.currentTarget.value)} autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="例如 owner" required /></div>
+      {!auth.initialized ? <><label htmlFor="account-display-name" className="account-second-label"><UserRound />显示名称</label><div className="owner-password-field"><UserRound /><input id="account-display-name" name="displayName" autoComplete="name" placeholder="例如 Joye" required /></div></> : null}
       <label htmlFor="account-password" className="account-second-label"><KeyRound />密码</label>
-      <div className="owner-password-field"><KeyRound /><input id="account-password" name="password" type="password" autoComplete={auth.initialized ? 'current-password' : 'new-password'} value={password} onChange={(event) => setPassword(event.currentTarget.value)} minLength={10} required /></div>
+      <div className="owner-password-field"><KeyRound /><input ref={passwordInput} id="account-password" name="password" type="password" autoComplete={auth.initialized ? 'current-password' : 'new-password'} minLength={10} required /></div>
       <button className="primary-button owner-login-submit" type="submit" disabled={submitting}>{submitting ? <LoaderCircle className="spin" /> : <LockKeyhole />}{submitting ? '处理中' : auth.initialized ? '登录' : '创建 Owner 并进入'}</button>
       {auth.error ? <p className="owner-login-error" role="alert">{auth.error}</p> : null}
     </form>
