@@ -59,6 +59,9 @@ export function SettingsPage() {
   const [accountPreset, setAccountPreset] = useState<'FULL' | 'VIEWER' | 'UPLOAD_ONLY'>('VIEWER')
   const [savingAccount, setSavingAccount] = useState(false)
   const [savingAccessId, setSavingAccessId] = useState<string | null>(null)
+  const [resetAllPassword, setResetAllPassword] = useState('')
+  const [resettingAllPasswords, setResettingAllPasswords] = useState(false)
+  const [accountResetMessage, setAccountResetMessage] = useState<string | null>(null)
 
   const loadStatus = async () => {
     setStatusError(null)
@@ -132,7 +135,7 @@ export function SettingsPage() {
   const refreshAccounts = async () => setAccounts((await api.listAccounts()).items)
 
   const createAccount = async () => {
-    if (!accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 10) return
+    if (!accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9) return
     setSavingAccount(true)
     setStatusError(null)
     try {
@@ -146,6 +149,23 @@ export function SettingsPage() {
       setStatusError(error instanceof Error ? error.message : 'ACCOUNT_CREATE_FAILED')
     } finally {
       setSavingAccount(false)
+    }
+  }
+
+  const resetAllPasswords = async () => {
+    if (resetAllPassword.length < 9) return
+    setResettingAllPasswords(true)
+    setStatusError(null)
+    setAccountResetMessage(null)
+    try {
+      const result = await api.resetAllAccountPasswords(resetAllPassword)
+      setResetAllPassword('')
+      setAccountResetMessage(`已统一重置 ${result.count} 个账号密码，旧登录会话已失效。`)
+      window.setTimeout(() => window.location.reload(), 700)
+    } catch (error) {
+      setStatusError(error instanceof Error ? error.message : 'ACCOUNT_PASSWORD_RESET_FAILED')
+    } finally {
+      setResettingAllPasswords(false)
     }
   }
 
@@ -322,11 +342,16 @@ export function SettingsPage() {
         <div className="account-create-grid">
           <label><span>用户名</span><input value={accountUsername} onChange={(event) => setAccountUsername(event.target.value)} placeholder="family" autoComplete="off" /></label>
           <label><span>显示名称</span><input value={accountDisplayName} onChange={(event) => setAccountDisplayName(event.target.value)} placeholder="Family" autoComplete="off" /></label>
-          <label><span>初始密码</span><input value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} type="password" minLength={10} autoComplete="new-password" placeholder="至少 10 个字符" /></label>
+          <label><span>初始密码</span><input value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} type="password" minLength={10} autoComplete="new-password" placeholder="至少 9 个字符" /></label>
           <label><span>初始权限</span><select value={accountPreset} onChange={(event) => setAccountPreset(event.target.value as 'FULL' | 'VIEWER' | 'UPLOAD_ONLY')}><option value="VIEWER">只读 · 可看全部</option><option value="UPLOAD_ONLY">仅上传 · 不可浏览</option><option value="FULL">完整成员 · 可读写</option></select></label>
-          <button className="primary-button" type="button" disabled={savingAccount || !accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 10} onClick={() => void createAccount()}>{savingAccount ? <LoaderCircle className="spin" /> : <Plus />}{savingAccount ? '创建中' : '创建账号'}</button>
+          <button className="primary-button" type="button" disabled={savingAccount || !accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9} onClick={() => void createAccount()}>{savingAccount ? <LoaderCircle className="spin" /> : <Plus />}{savingAccount ? '创建中' : '创建账号'}</button>
         </div>
-        <p className="settings-section-note">Owner 始终拥有全部权限。新普通账号默认只读；查看、下载、上传、编辑、删除都由 Worker 强制校验，不只是在界面里隐藏按钮。</p>
+        <div className="account-create-grid">
+          <label><span>统一新密码</span><input value={resetAllPassword} onChange={(event) => setResetAllPassword(event.target.value)} type="password" autoComplete="new-password" placeholder="至少 9 个字符，无其他复杂度要求" /></label>
+          <button className="secondary-button" type="button" disabled={resettingAllPasswords || resetAllPassword.length < 9 || !accounts.length} onClick={() => void resetAllPasswords()}>{resettingAllPasswords ? <LoaderCircle className="spin" /> : <RotateCw />}{resettingAllPasswords ? '重置中' : '统一重置现有账号密码'}</button>
+        </div>
+        {accountResetMessage ? <p className="settings-section-note">{accountResetMessage}</p> : null}
+        <p className="settings-section-note">统一重置会一次性更新全部应用账号，并让现有登录会话失效；密码仍只保存 PBKDF2-SHA256 哈希。Owner 始终拥有全部权限。新普通账号默认只读；查看、下载、上传、编辑、删除都由 Worker 强制校验，不只是在界面里隐藏按钮。</p>
         <div className="account-admin-list">{accounts.map((account) => {
           const savingAccess = savingAccessId === account.id
           const allLibrary = accountHasGrant(account, 'workspace', 'personal', 'read')

@@ -74,7 +74,7 @@ function friendlyAuthError(error: unknown): string {
     case 'USERNAME_EXISTS': return '这个用户名已经存在。'
     case 'USERNAME_INVALID': return '用户名使用 3–40 个字母、数字、点、下划线或短横线。'
     case 'DISPLAY_NAME_INVALID': return '请输入有效的显示名称。'
-    case 'PASSWORD_INVALID': return '密码至少需要 10 个字符。'
+    case 'PASSWORD_INVALID': return '密码至少需要 9 个字符。'
     case 'APP_ALREADY_INITIALIZED': return 'Owner 已经初始化，请直接登录。'
     case 'APP_NOT_INITIALIZED': return '还没有初始化 Owner 账号。'
     case 'APP_OWNER_REQUIRED': return '这个操作需要 Owner 账号。'

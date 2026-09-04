@@ -6,6 +6,7 @@ import {
   getAppUserById,
   getAppUserByUsername,
   listAppUsers,
+  resetAllAppUserPasswords,
   toPublicAppUser,
   updateAppUser,
   type AppUserRow,
@@ -87,7 +88,7 @@ function validateDisplayName(value: unknown): string {
 
 function validatePassword(value: unknown): string {
   const password = typeof value === 'string' ? value : ''
-  if (password.length < 10 || password.length > 256) throw new Error('PASSWORD_INVALID')
+  if (password.length < 9 || password.length > 256) throw new Error('PASSWORD_INVALID')
   return password
 }
 
@@ -315,6 +316,26 @@ authRoutes.post('/users', requireAccess, async (context) => {
     if (code.includes('UNIQUE')) return context.json({ error: 'USERNAME_EXISTS' }, 409)
     const status = authBodyErrorStatus(code)
     return context.json({ error: status === 500 ? 'APP_USER_CREATE_FAILED' : code }, status)
+  }
+})
+
+authRoutes.post('/users/reset-passwords', requireAccess, async (context) => {
+  const owner = await requireCurrentOwner(context)
+  if (!owner) return context.json({ error: 'APP_OWNER_REQUIRED' }, 403)
+  try {
+    const body = await jsonBody(context)
+    const password = validatePassword(body.password)
+    const users = await listAppUsers(context.env.DB)
+    const updates = await Promise.all(users.map(async (user) => ({
+      id: user.id,
+      passwordHash: await hashAppPassword(password),
+    })))
+    const count = await resetAllAppUserPasswords(context.env.DB, updates)
+    return context.json({ ok: true, count })
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'APP_PASSWORD_RESET_FAILED'
+    const status = authBodyErrorStatus(code)
+    return context.json({ error: status === 500 ? 'APP_PASSWORD_RESET_FAILED' : code }, status)
   }
 })
 

@@ -71,7 +71,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
       {!auth.initialized ? <><label htmlFor="account-display-name" className="account-second-label"><UserRound />显示名称</label><div className="owner-password-field"><UserRound /><input id="account-display-name" name="displayName" autoComplete="name" placeholder="例如 Joye" required /></div></> : null}
       <label htmlFor="account-password" className="account-second-label"><KeyRound />密码</label>
       <div className="owner-password-field"><KeyRound /><input ref={passwordInput} id="account-password" name="password" type="password" autoComplete={auth.initialized ? 'current-password' : 'new-password'} minLength={10} required /></div>
-      <button className="primary-button owner-login-submit" type="submit" disabled={submitting}>{submitting ? <LoaderCircle className="spin" /> : <LockKeyhole />}{submitting ? '处理中' : auth.initialized ? '登录' : '创建 Owner 并进入'}</button>
+      <button className="primary-button owner-login-submit" type="submit" formNoValidate disabled={submitting}>{submitting ? <LoaderCircle className="spin" /> : <LockKeyhole />}{submitting ? '处理中' : auth.initialized ? '登录' : '创建 Owner 并进入'}</button>
       {auth.error ? <p className="owner-login-error" role="alert">{auth.error}</p> : null}
     </form>
     <p className="owner-login-footnote">{localDesktop ? '应用账号密码只保存强哈希；登录会话使用本机 HttpOnly Cookie。桌面端只连接 Private Archive API 后端。' : '应用账号密码只保存强哈希；登录会话使用 HttpOnly Cookie。Cloudflare Access 仍然保留在外层。'}</p>

@@ -85,7 +85,7 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
   expect(duplicateCase.status()).toBe(409)
   expect((await page.request.post('/api/auth/users', { data: { username: 'ab', displayName: 'Bad', password: memberPassword } })).status()).toBe(400)
   expect((await page.request.post('/api/auth/users', { data: { username: 'valid-user', displayName: '', password: memberPassword } })).status()).toBe(400)
-  expect((await page.request.post('/api/auth/users', { data: { username: 'valid-user', displayName: 'Valid', password: 'too-short' } })).status()).toBe(400)
+  expect((await page.request.post('/api/auth/users', { data: { username: 'valid-user', displayName: 'Valid', password: 'short123' } })).status()).toBe(400)
 
   const selfDisable = await page.request.patch(`/api/auth/users/${ownerId}`, { data: { status: 'DISABLED' } })
   expect(selfDisable.status()).toBe(409)
@@ -238,6 +238,23 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
   const unaffectedIp = await newApi(undefined, '203.0.113.31')
   expect((await unaffectedIp.post('/api/auth/login', { data: { username: 'Owner', password: ownerPassword } })).ok()).toBeTruthy()
   await unaffectedIp.dispose()
+
+  const simplePassword = 'simple123'
+  const resetAll = await page.request.post('/api/auth/users/reset-passwords', { data: { password: simplePassword } })
+  expect(resetAll.status()).toBe(200)
+  await expect(resetAll.json()).resolves.toMatchObject({ ok: true, count: 13 })
+  expect((await page.request.get('/api/auth/me')).status()).toBe(401)
+  expect((await memberApi.get('/api/auth/me')).status()).toBe(401)
+
+  const resetOwner = await newApi(undefined, '203.0.113.32')
+  expect((await resetOwner.post('/api/auth/login', { data: { username: 'Owner', password: ownerPassword } })).status()).toBe(401)
+  expect((await resetOwner.post('/api/auth/login', { data: { username: 'Owner', password: simplePassword } })).status()).toBe(200)
+  await resetOwner.dispose()
+
+  const resetMember = await newApi(undefined, '203.0.113.33')
+  expect((await resetMember.post('/api/auth/login', { data: { username: createdMembers[1].username, password: memberPassword } })).status()).toBe(401)
+  expect((await resetMember.post('/api/auth/login', { data: { username: createdMembers[1].username, password: simplePassword } })).status()).toBe(200)
+  await resetMember.dispose()
 
   await memberApi.dispose()
 })

@@ -128,6 +128,19 @@ export async function updateAppUser(db: D1Database, id: string, input: {
   return getAppUserById(db, id)
 }
 
+export async function resetAllAppUserPasswords(db: D1Database, updates: Array<{ id: string; passwordHash: string }>): Promise<number> {
+  if (!updates.length) return 0
+  const now = new Date().toISOString()
+  const statements = updates.map(({ id, passwordHash }) => db.prepare(`UPDATE app_users
+    SET password_hash = ?, updated_at = ?
+    WHERE id = ? AND workspace_id = ?`).bind(passwordHash, now, id, PERSONAL_WORKSPACE_ID))
+  await db.batch([
+    ...statements,
+    db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID),
+  ])
+  return updates.length
+}
+
 export async function createAppSession(db: D1Database, userId: string, rawToken: string): Promise<string> {
   const now = new Date()
   const expiresAt = new Date(now.getTime() + APP_SESSION_TTL_SECONDS * 1000).toISOString()
