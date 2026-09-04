@@ -77,7 +77,7 @@ test('same photo capture deduplicates across JPEG and HEIC representations', asy
   const first = await request.post('/api/assets/reserve', {
     data: {
       ...common,
-      originalName: `IMG_${suffix}.jpeg`, mimeType: 'image/jpeg', sizeBytes: jpeg.byteLength,
+      originalName: `IMG_${suffix}.edited.jpeg`, mimeType: 'image/jpeg', sizeBytes: jpeg.byteLength,
       contentHash: createHash('sha256').update(jpeg).digest('hex'),
     },
   })
@@ -94,7 +94,7 @@ test('same photo capture deduplicates across JPEG and HEIC representations', asy
   const duplicate = await request.post('/api/assets/reserve', {
     data: {
       ...common,
-      originalName: `IMG_${suffix}.heic`, mimeType: 'image/heic', sizeBytes: heic.byteLength,
+      originalName: `IMG_${suffix}.edited.heic`, mimeType: 'image/heic', sizeBytes: heic.byteLength,
       contentHash: createHash('sha256').update(heic).digest('hex'),
     },
   })

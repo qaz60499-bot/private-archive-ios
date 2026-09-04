@@ -98,27 +98,28 @@ export async function getActiveStoredPhotoByCaptureIdentity(db: D1Database, inpu
 }): Promise<AssetRow | null> {
   const stem = normalizedFileStem(input.originalName)
   if (!stem || !Number.isFinite(input.width) || !Number.isFinite(input.height) || input.width <= 0 || input.height <= 0) return null
-  return db.prepare(`SELECT ${ASSET_COLUMNS} FROM ${ASSET_FROM}
+  // Let the indexed capture identity narrow the candidate set first, then compare the
+  // normalized filename stem in TypeScript. SQLite's instr() finds the first dot while
+  // normalizedFileStem() intentionally uses the final extension separator; doing the
+  // stem comparison in SQL therefore missed multi-dot names such as IMG_1.edited.HEIC.
+  const result = await db.prepare(`SELECT ${ASSET_COLUMNS} FROM ${ASSET_FROM}
     WHERE assets.workspace_id = ? AND assets.source_id = ?
       AND COALESCE(storage_objects.storage_backend, assets.storage_backend) = ?
       AND assets.media_type = 'photo' AND assets.status != 'trashed'
       AND COALESCE(storage_objects.storage_file_id, assets.storage_file_id) IS NOT NULL
       AND (assets.storage_object_id IS NULL OR storage_objects.delete_state = 'active')
-      AND lower(CASE WHEN instr(assets.original_name, '.') > 0
-        THEN substr(assets.original_name, 1, length(assets.original_name) - length(substr(assets.original_name, instr(assets.original_name, '.'))))
-        ELSE assets.original_name END) = ?
       AND assets.taken_at = ? AND assets.width = ? AND assets.height = ?
     ORDER BY CASE WHEN lower(assets.mime_type) IN ('image/heic', 'image/heif') THEN 0 ELSE 1 END,
-      assets.created_at DESC LIMIT 1`)
+      assets.created_at DESC`)
     .bind(
       PERSONAL_WORKSPACE_ID,
       input.sourceId ?? 'telegram-legacy',
       input.storageBackend ?? 'telegram_bot',
-      stem,
       input.takenAt,
       input.width,
       input.height,
-    ).first<AssetRow>()
+    ).all<AssetRow>()
+  return result.results.find((candidate) => normalizedFileStem(candidate.original_name) === stem) ?? null
 }
 
 export interface StorageObjectState {
@@ -135,7 +136,8 @@ export async function getStorageObjectStateByFileUniqueId(db: D1Database, fileUn
 
 export async function repairAssetFromActiveStorageObject(db: D1Database, assetId: string): Promise<boolean> {
   const asset = await db.prepare(`SELECT source_id, storage_backend, content_hash, size_bytes, mime_type
-    FROM assets WHERE id = ? AND workspace_id = ? AND storage_object_id IS NULL AND storage_file_id IS NULL`)
+    FROM assets WHERE id = ? AND workspace_id = ? AND status != 'trashed'
+      AND storage_object_id IS NULL AND storage_file_id IS NULL`)
     .bind(assetId, PERSONAL_WORKSPACE_ID)
     .first<{ source_id: string; storage_backend: AssetRow['storage_backend']; content_hash: string | null; size_bytes: number; mime_type: string }>()
   if (!asset?.content_hash) return false
@@ -149,15 +151,21 @@ export async function repairAssetFromActiveStorageObject(db: D1Database, assetId
   if (!object) return false
 
   const now = new Date().toISOString()
-  const attached = await db.prepare(`UPDATE assets SET storage_object_id = ?, status = 'stored', updated_at = ?
-    WHERE id = ? AND workspace_id = ? AND storage_object_id IS NULL AND storage_file_id IS NULL`)
-    .bind(object.id, now, assetId, PERSONAL_WORKSPACE_ID).run()
-  if (attached.meta.changes === 0) return false
-
-  await db.prepare(`UPDATE upload_jobs SET status = 'done', last_error = NULL, updated_at = ?
-    WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)`)
-    .bind(now, assetId).run()
-  return true
+  const [attached] = await db.batch([
+    db.prepare(`UPDATE assets SET storage_object_id = ?, status = 'stored', updated_at = ?
+      WHERE id = ? AND workspace_id = ? AND status != 'trashed'
+        AND storage_object_id IS NULL AND storage_file_id IS NULL
+        AND EXISTS (SELECT 1 FROM storage_objects WHERE id = ? AND workspace_id = ? AND delete_state = 'active')`)
+      .bind(object.id, now, assetId, PERSONAL_WORKSPACE_ID, object.id, PERSONAL_WORKSPACE_ID),
+    db.prepare(`UPDATE upload_jobs SET status = 'done', last_error = NULL, updated_at = ?
+      WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+        AND EXISTS (
+          SELECT 1 FROM assets
+          WHERE id = ? AND workspace_id = ? AND status = 'stored' AND storage_object_id = ?
+        )`)
+      .bind(now, assetId, assetId, PERSONAL_WORKSPACE_ID, object.id),
+  ])
+  return attached.meta.changes > 0
 }
 
 export async function createDeduplicatedLogicalAsset(db: D1Database, params: {
@@ -249,23 +257,27 @@ export async function createUploadJobForAsset(db: D1Database, params: {
   return true
 }
 
-export async function claimUploadStarted(db: D1Database, assetId: string, token: string, staleAfterMs?: number): Promise<number | null> {
+export interface UploadAttemptLease {
+  jobId: string
+  attempt: number
+}
+
+export async function claimUploadStarted(db: D1Database, assetId: string, token: string, staleAfterMs?: number): Promise<UploadAttemptLease | null> {
   const nowDate = new Date()
   const now = nowDate.toISOString()
   const staleCutoff = staleAfterMs === undefined
     ? '0001-01-01T00:00:00.000Z'
     : new Date(nowDate.getTime() - Math.max(0, staleAfterMs)).toISOString()
   const tokenHash = await hashToken(token)
-  const result = await db.prepare(`UPDATE upload_jobs
+  const row = await db.prepare(`UPDATE upload_jobs
     SET status = 'uploading', attempts = attempts + 1, updated_at = ?
     WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
       AND upload_token_hash = ? AND expires_at > ?
-      AND (status IN ('waiting', 'failed') OR (status = 'uploading' AND updated_at <= ?))`)
-    .bind(now, assetId, tokenHash, now, staleCutoff).run()
-  if (result.meta.changes === 0) return null
-  const row = await db.prepare(`SELECT attempts FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
-    .bind(assetId).first<{ attempts: number }>()
-  return row?.attempts ?? null
+      AND (status IN ('waiting', 'failed') OR (status = 'uploading' AND updated_at <= ?))
+    RETURNING id, attempts`)
+    .bind(now, assetId, tokenHash, now, staleCutoff)
+    .first<{ id: string; attempts: number }>()
+  return row ? { jobId: row.id, attempt: row.attempts } : null
 }
 
 export interface MarkStoredResult {
@@ -274,12 +286,14 @@ export interface MarkStoredResult {
   staleAttempt?: boolean
 }
 
-export async function markStored(db: D1Database, assetId: string, stored: StoredFile, expectedAttempt?: number): Promise<MarkStoredResult> {
+export async function markStored(db: D1Database, assetId: string, stored: StoredFile, expectedLease?: UploadAttemptLease): Promise<MarkStoredResult> {
   const now = new Date().toISOString()
-  if (expectedAttempt !== undefined) {
-    const job = await db.prepare(`SELECT status, attempts FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
-      .bind(assetId).first<{ status: string; attempts: number }>()
-    if (!job || job.status !== 'uploading' || job.attempts !== expectedAttempt) {
+  if (expectedLease) {
+    const job = await db.prepare(`SELECT status, attempts FROM upload_jobs
+      WHERE id = ? AND asset_id = ?
+        AND id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)`)
+      .bind(expectedLease.jobId, assetId, assetId).first<{ status: string; attempts: number }>()
+    if (!job || job.status !== 'uploading' || job.attempts !== expectedLease.attempt) {
       return { attached: false, discardStoredMessage: true, staleAttempt: true }
     }
   }
@@ -338,8 +352,14 @@ export async function markStored(db: D1Database, assetId: string, stored: Stored
         preview_message_id = CASE WHEN ? OR preview_file_id IS NOT NULL OR ? IS NULL THEN preview_message_id ELSE ? END,
         preview_file_id = CASE WHEN ? THEN preview_file_id ELSE COALESCE(preview_file_id, ?) END,
         status = 'stored', updated_at = ?
-      WHERE id = ? AND workspace_id = ?
-        AND EXISTS (SELECT 1 FROM storage_objects WHERE id = ? AND workspace_id = ? AND delete_state = 'active')`)
+      WHERE id = ? AND workspace_id = ? AND status != 'trashed'
+        AND EXISTS (SELECT 1 FROM storage_objects WHERE id = ? AND workspace_id = ? AND delete_state = 'active')
+        AND (? IS NULL OR EXISTS (
+          SELECT 1 FROM upload_jobs
+          WHERE id = ? AND asset_id = ?
+            AND id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+            AND status = 'uploading' AND attempts = ?
+        ))`)
       .bind(
         stored.backend, stored.mediaId ?? null, stored.importOrigin ?? 'web',
         preserveAssetStorageColumns, stored.chatId,
@@ -351,29 +371,64 @@ export async function markStored(db: D1Database, assetId: string, stored: Stored
         preserveAssetStorageColumns, stored.previewFileId ?? null, stored.messageId,
         preserveAssetStorageColumns, stored.previewFileId ?? null,
         now, assetId, PERSONAL_WORKSPACE_ID, targetObjectId, PERSONAL_WORKSPACE_ID,
+        expectedLease?.jobId ?? null, expectedLease?.jobId ?? '', assetId, assetId, expectedLease?.attempt ?? -1,
       ),
     db.prepare(`UPDATE upload_jobs SET status = 'done', last_error = NULL, updated_at = ?
-      WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+      WHERE id = CASE WHEN ? IS NULL
+        THEN (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+        ELSE ? END
+        AND asset_id = ?
+        AND (? IS NULL OR (
+          id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+          AND status = 'uploading' AND attempts = ?
+        ))
         AND EXISTS (
           SELECT 1 FROM assets
           WHERE id = ? AND workspace_id = ? AND status = 'stored' AND storage_object_id = ?
         )`)
-      .bind(now, assetId, assetId, PERSONAL_WORKSPACE_ID, targetObjectId),
+      .bind(
+        now,
+        expectedLease?.jobId ?? null, assetId, expectedLease?.jobId ?? '', assetId,
+        expectedLease?.jobId ?? null, assetId, expectedLease?.attempt ?? -1,
+        assetId, PERSONAL_WORKSPACE_ID, targetObjectId,
+      ),
   ])
-  if (attached.meta.changes === 0) return { attached: false, discardStoredMessage: true }
+  if (attached.meta.changes === 0) {
+    if (expectedLease) {
+      const latest = await db.prepare(`SELECT id, status, attempts FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1`)
+        .bind(assetId).first<{ id: string; status: string; attempts: number }>()
+      if (!latest || latest.id !== expectedLease.jobId || latest.status !== 'uploading' || latest.attempts !== expectedLease.attempt) {
+        // Keep a newly persisted storage object/message available for the existing
+        // iOS orphan-repair path. Deleting it here would turn a safe stale commit into
+        // another full upload while leaving the storage_objects row inconsistent.
+        return { attached: false, discardStoredMessage, staleAttempt: true }
+      }
+    }
+    return { attached: false, discardStoredMessage }
+  }
   return { attached: true, discardStoredMessage }
 }
 
-export async function markUploadFailed(db: D1Database, assetId: string, error: string, expectedAttempt?: number): Promise<boolean> {
+export async function markUploadFailed(db: D1Database, assetId: string, error: string, expectedLease?: UploadAttemptLease): Promise<boolean> {
   const now = new Date().toISOString()
-  if (expectedAttempt !== undefined) {
-    const job = await db.prepare(`UPDATE upload_jobs SET status = 'failed', last_error = ?, updated_at = ?
-      WHERE id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
-        AND status = 'uploading' AND attempts = ?`)
-      .bind(error.slice(0, 320), now, assetId, expectedAttempt).run()
-    if (job.meta.changes === 0) return false
-    await db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ? AND status != 'trashed'`).bind(now, assetId).run()
-    return true
+  if (expectedLease) {
+    const [job] = await db.batch([
+      db.prepare(`UPDATE upload_jobs SET status = 'failed', last_error = ?, updated_at = ?
+        WHERE id = ? AND asset_id = ?
+          AND id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+          AND status = 'uploading' AND attempts = ?`)
+        .bind(error.slice(0, 320), now, expectedLease.jobId, assetId, assetId, expectedLease.attempt),
+      db.prepare(`UPDATE assets SET status = 'failed', updated_at = ?
+        WHERE id = ? AND status != 'trashed'
+          AND EXISTS (
+            SELECT 1 FROM upload_jobs
+            WHERE id = ? AND asset_id = ?
+              AND id = (SELECT id FROM upload_jobs WHERE asset_id = ? ORDER BY created_at DESC LIMIT 1)
+              AND status = 'failed' AND attempts = ?
+          )`)
+        .bind(now, assetId, expectedLease.jobId, assetId, assetId, expectedLease.attempt),
+    ])
+    return job.meta.changes > 0
   }
   await db.batch([
     db.prepare(`UPDATE assets SET status = 'failed', updated_at = ? WHERE id = ? AND status != 'trashed'`).bind(now, assetId),
