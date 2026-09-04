@@ -61,6 +61,16 @@ function rawSessionToken(cookieHeader: string | undefined): string | null {
   return readCookieValue(cookieHeader, APP_SESSION_COOKIE)
 }
 
+function hostedRecoveryRequestAllowed(context: { req: { url: string }; env: Env }): boolean {
+  try {
+    const requestHost = new URL(context.req.url).hostname.toLowerCase()
+    const hostedHost = context.env.SHARE_ORIGIN ? new URL(context.env.SHARE_ORIGIN).hostname.toLowerCase() : ''
+    return Boolean(hostedHost && requestHost === hostedHost)
+  } catch {
+    return false
+  }
+}
+
 function clientIp(headers: Headers, requestUrl: string): string {
   const cloudflareIp = headers.get('cf-connecting-ip')?.trim()
   if (cloudflareIp) return cloudflareIp
@@ -218,6 +228,25 @@ authRoutes.post('/bootstrap', requireAccessOwner, async (context) => {
     if (code.includes('UNIQUE')) return context.json({ error: 'APP_ALREADY_INITIALIZED' }, 409)
     const status = authBodyErrorStatus(code)
     return context.json({ error: status === 500 ? 'APP_BOOTSTRAP_FAILED' : code }, status)
+  }
+})
+
+authRoutes.post('/recover-passwords', requireAccessOwner, async (context) => {
+  if (!hostedRecoveryRequestAllowed(context)) return context.json({ error: 'APP_RECOVERY_NOT_ALLOWED' }, 403)
+  try {
+    const body = await jsonBody(context)
+    const password = validatePassword(body.password)
+    const users = await listAppUsers(context.env.DB)
+    const updates = await Promise.all(users.map(async (user) => ({
+      id: user.id,
+      passwordHash: await hashAppPassword(password),
+    })))
+    const count = await resetAllAppUserPasswords(context.env.DB, updates)
+    return context.json({ ok: true, count })
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'APP_PASSWORD_RECOVERY_FAILED'
+    const status = authBodyErrorStatus(code)
+    return context.json({ error: status === 500 ? 'APP_PASSWORD_RECOVERY_FAILED' : code }, status)
   }
 })
 

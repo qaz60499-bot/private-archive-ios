@@ -105,6 +105,7 @@ export const api = {
   listAccounts: () => request<{ items: AppAccount[] }>('/api/auth/users'),
   createAccount: (username: string, displayName: string, password: string, accessPreset: 'FULL' | 'VIEWER' | 'UPLOAD_ONLY' = 'VIEWER') => request<{ user: AppAccount }>('/api/auth/users', { method: 'POST', body: JSON.stringify({ username, displayName, password, accessPreset }) }),
   resetAllAccountPasswords: (password: string) => request<{ ok: true; count: number }>('/api/auth/users/reset-passwords', { method: 'POST', body: JSON.stringify({ password }) }),
+  recoverAllAccountPasswords: (password: string) => request<{ ok: true; count: number }>('/api/auth/recover-passwords', { method: 'POST', body: JSON.stringify({ password }) }),
   updateAccount: (id: string, patch: { displayName?: string; password?: string; status?: 'ACTIVE' | 'DISABLED' }) => request<{ user: AppAccount | null }>(`/api/auth/users/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   updateAccountAccess: (id: string, input: { accessPreset: Exclude<AppAccessPreset, 'SCOPED' | 'CUSTOM'> } | { grants: AppAccessGrant[] }) => request<{ user: AppAccount | null }>(`/api/auth/users/${id}/access`, { method: 'PUT', body: JSON.stringify(input) }),
   listAssets: async (params: URLSearchParams = new URLSearchParams()) => {

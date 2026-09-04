@@ -61,7 +61,9 @@ describe('hosted upload API capability boundary', () => {
     expect(isHostedUploadApiRequestAllowed('PUT', '/api/assets/asset-1/content')).toBe(true)
     expect(isHostedUploadApiRequestAllowed('POST', '/api/assets/asset-1/preview')).toBe(true)
     expect(isHostedUploadApiRequestAllowed('POST', '/api/share/exchange')).toBe(true)
+    expect(isHostedUploadApiRequestAllowed('POST', '/api/auth/recover-passwords')).toBe(true)
 
+    expect(isHostedUploadApiRequestAllowed('GET', '/api/auth/recover-passwords')).toBe(false)
     expect(isHostedUploadApiRequestAllowed('GET', '/api/assets')).toBe(false)
     expect(isHostedUploadApiRequestAllowed('GET', '/api/assets/asset-1/media')).toBe(false)
     expect(isHostedUploadApiRequestAllowed('DELETE', '/api/assets/asset-1')).toBe(false)

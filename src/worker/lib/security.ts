@@ -54,6 +54,7 @@ export function isHostedUploadApiRequestAllowed(method: string, pathname: string
   // implicit D1 OWNER capability from normal archive/admin APIs on the hosted host.
   if (path === '/api/share' || path.startsWith('/api/share/')) return true
   if (path === '/api/health') return verb === 'GET' || verb === 'HEAD'
+  if (path === '/api/auth/recover-passwords') return verb === 'POST'
   if (path === '/api/storage-preference') return verb === 'GET'
   if (path === '/api/assets/reserve') return verb === 'POST'
   if (/^\/api\/assets\/[^/]+\/content$/.test(path)) return verb === 'PUT'

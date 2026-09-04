@@ -256,5 +256,12 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
   expect((await resetMember.post('/api/auth/login', { data: { username: createdMembers[1].username, password: simplePassword } })).status()).toBe(200)
   await resetMember.dispose()
 
+  const recoveryApi = await newApi(undefined, '203.0.113.34')
+  const recovered = await recoveryApi.post('/api/auth/recover-passwords', { data: { password: simplePassword } })
+  expect(recovered.status()).toBe(200)
+  await expect(recovered.json()).resolves.toMatchObject({ ok: true, count: 13 })
+  expect((await recoveryApi.post('/api/auth/login', { data: { username: 'Owner', password: simplePassword } })).status()).toBe(200)
+  await recoveryApi.dispose()
+
   await memberApi.dispose()
 })
