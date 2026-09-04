@@ -27,6 +27,7 @@ import {
   recentAccountLoginFailuresRuntime,
   recentLoginFailuresRuntime,
   recordLoginAttemptRuntime,
+  refreshAppSessionRuntime,
 } from '../lib/auth-runtime'
 import { readCookieValue } from '../lib/cookies'
 import { isDesktopApiRequest, requireAccess, requireAccessOwner, resolveRequestAppUser } from '../lib/security'
@@ -177,7 +178,14 @@ authRoutes.get('/status', requireAccess, async (context) => {
     appUsersInitialized(context.env.DB),
     resolveRequestAppUser(context),
   ])
-  if (presentedSession && !user) {
+  if (presentedSession && user) {
+    try {
+      await refreshAppSessionRuntime(context.env, user, presentedSession)
+      context.header('Set-Cookie', sessionCookie(presentedSession, secureCookie(context.req.url), requestCookieDomain(context)))
+    } catch (error) {
+      console.warn('App session rolling refresh unavailable', { error: error instanceof Error ? error.message : String(error) })
+    }
+  } else if (presentedSession) {
     context.header('Set-Cookie', clearSessionCookie(secureCookie(context.req.url), requestCookieDomain(context)))
   }
   return context.json({

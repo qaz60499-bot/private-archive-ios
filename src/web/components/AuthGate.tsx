@@ -49,7 +49,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   const title = auth.initialized ? '登录私人档案' : '初始化 Owner 账号'
   const copy = auth.initialized
-    ? '选择已使用过的账号，或输入另一个账号。登录后会保持 7 天会话。'
+    ? '选择已使用过的账号，或输入另一个账号。此设备登录后会长期保持登录，正常关闭或重启无需再次输入密码。'
     : '这是第一次启用应用账号。创建 Owner 后，可以在设置里继续添加其他账号。'
 
   return <main className="owner-login-shell"><section className="owner-login-card">

@@ -39,11 +39,13 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
   const bootstrapCookie = bootstrap.headers()['set-cookie']
   expect(bootstrapCookie).toContain('HttpOnly')
   expect(bootstrapCookie).toContain('SameSite=Lax')
-  expect(bootstrapCookie).toContain('Max-Age=604800')
+  expect(bootstrapCookie).toContain('Max-Age=34560000')
   expect(bootstrapCookie).not.toContain('Secure') // local HTTP; production HTTPS adds Secure.
   const firstOwnerToken = sessionToken(bootstrapCookie)
 
   const statusAfterBootstrap = await page.request.get('/api/auth/status')
+  expect(statusAfterBootstrap.headers()['set-cookie']).toContain('Max-Age=34560000')
+  expect(sessionToken(statusAfterBootstrap.headers()['set-cookie'])).toBe(firstOwnerToken)
   await expect(statusAfterBootstrap.json()).resolves.toMatchObject({
     initialized: true,
     authenticated: true,

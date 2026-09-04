@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { appPasswordNeedsUpgrade, createAppSessionToken, hashAppPassword, hashAppSessionToken, verifyAppPassword } from '../../src/worker/lib/app-auth'
+import { APP_SESSION_TTL_SECONDS, appPasswordNeedsUpgrade, createAppSessionToken, hashAppPassword, hashAppSessionToken, verifyAppPassword } from '../../src/worker/lib/app-auth'
 
 describe('application account authentication', () => {
   it('hashes and verifies passwords without storing plaintext', async () => {
@@ -25,6 +25,10 @@ describe('application account authentication', () => {
     const encoded = `pbkdf2-sha256$100000$${encode(salt)}$${encode(new Uint8Array(bits))}`
     expect(await verifyAppPassword(password, encoded)).toBe(true)
     expect(appPasswordNeedsUpgrade(encoded)).toBe(true)
+  })
+
+  it('uses a long rolling device-session window', () => {
+    expect(APP_SESSION_TTL_SECONDS).toBe(400 * 24 * 60 * 60)
   })
 
   it('creates opaque session tokens and stable one-way hashes', async () => {

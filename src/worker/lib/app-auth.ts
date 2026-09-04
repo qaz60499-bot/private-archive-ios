@@ -73,4 +73,8 @@ export async function hashAppSessionToken(token: string): Promise<string> {
 }
 
 export const APP_SESSION_COOKIE = 'pa_account'
-export const APP_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+// Keep a signed-in device persistent across normal app restarts. Browsers cap
+// persistent cookies at roughly 400 days, so use that as the rolling window and
+// refresh it on authenticated app startup. Explicit logout, password changes, or
+// account disablement still revoke the session immediately.
+export const APP_SESSION_TTL_SECONDS = 400 * 24 * 60 * 60

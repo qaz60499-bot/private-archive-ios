@@ -143,6 +143,16 @@ export async function createAppSession(db: D1Database, userId: string, rawToken:
   return expiresAt
 }
 
+export async function refreshAppSession(db: D1Database, userId: string, rawToken: string): Promise<boolean> {
+  const now = new Date()
+  const expiresAt = new Date(now.getTime() + APP_SESSION_TTL_SECONDS * 1000).toISOString()
+  const tokenHash = await hashAppSessionToken(rawToken)
+  const result = await db.prepare(`UPDATE app_sessions SET expires_at = ?, last_seen_at = ?
+    WHERE token_hash = ? AND user_id = ? AND workspace_id = ?`)
+    .bind(expiresAt, now.toISOString(), tokenHash, userId, PERSONAL_WORKSPACE_ID).run()
+  return result.meta.changes > 0
+}
+
 export async function resolveAppSession(db: D1Database, rawToken: string): Promise<AppUserRow | null> {
   const tokenHash = await hashAppSessionToken(rawToken)
   const now = new Date().toISOString()

@@ -16,6 +16,16 @@ describe('application session resilience guard', () => {
     expect(block).toContain('D1 auth session backup unavailable')
   })
 
+  it('rolls a valid device session forward in both Durable Object and D1 stores', () => {
+    const refreshStart = source.indexOf('export async function refreshAppSessionRuntime')
+    const resolveStart = source.indexOf('export async function resolveAppSessionRuntime')
+    const block = source.slice(refreshStart, resolveStart)
+    expect(block).toContain('runtime.createSession(tokenHash, user.id, APP_SESSION_TTL_SECONDS, user.password_hash)')
+    expect(block).toContain('refreshD1AppSession(env.DB, user.id, rawToken)')
+    expect(block).toContain('Promise.allSettled')
+    expect(block).toContain("throw new Error('APP_SESSION_REFRESH_UNAVAILABLE')")
+  })
+
   it('falls back to the mirrored D1 session when Durable Object lookups are unavailable', () => {
     const resolveStart = source.indexOf('export async function resolveAppSessionRuntime')
     const deleteStart = source.indexOf('export async function deleteAppSessionRuntime')

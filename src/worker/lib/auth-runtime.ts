@@ -8,6 +8,7 @@ import {
   recentAccountLoginFailures as recentD1AccountLoginFailures,
   recentLoginFailures as recentD1LoginFailures,
   recordLoginAttempt as recordD1LoginAttempt,
+  refreshAppSession as refreshD1AppSession,
   resolveAppSession as resolveD1AppSession,
   type AppUserRow,
 } from '../db/app-users-repository'
@@ -83,6 +84,22 @@ export async function createAppSessionRuntime(env: Env, userId: string, rawToken
     console.warn('D1 auth session backup unavailable', { userId, error: error instanceof Error ? error.message : String(error) })
   }
   return runtimeExpiry
+}
+
+export async function refreshAppSessionRuntime(env: Env, user: AppUserRow, rawToken: string): Promise<void> {
+  const runtime = authRuntime(env)
+  if (!runtime) {
+    if (!(await refreshD1AppSession(env.DB, user.id, rawToken))) throw new Error('APP_SESSION_REFRESH_UNAVAILABLE')
+    return
+  }
+  const tokenHash = await hashAppSessionToken(rawToken)
+  const [runtimeResult, d1Result] = await Promise.allSettled([
+    runtime.createSession(tokenHash, user.id, APP_SESSION_TTL_SECONDS, user.password_hash),
+    refreshD1AppSession(env.DB, user.id, rawToken),
+  ])
+  const runtimeRefreshed = runtimeResult.status === 'fulfilled'
+  const d1Refreshed = d1Result.status === 'fulfilled' && d1Result.value
+  if (!runtimeRefreshed && !d1Refreshed) throw new Error('APP_SESSION_REFRESH_UNAVAILABLE')
 }
 
 export async function resolveAppSessionRuntime(env: Env, rawToken: string): Promise<AppUserRow | null> {
