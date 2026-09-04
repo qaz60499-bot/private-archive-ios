@@ -173,7 +173,11 @@ function parseAccessGrants(value: unknown): AppUserGrant[] | null {
 authRoutes.get('/status', requireAccess, async (context) => {
   await pruneAuthRuntime(context.env)
   const initialized = await appUsersInitialized(context.env.DB)
+  const presentedSession = rawSessionToken(context.req.header('Cookie'))
   const user = await resolveRequestAppUser(context)
+  if (presentedSession && !user) {
+    context.header('Set-Cookie', clearSessionCookie(secureCookie(context.req.url), requestCookieDomain(context)))
+  }
   return context.json({
     initialized,
     authenticated: Boolean(user),

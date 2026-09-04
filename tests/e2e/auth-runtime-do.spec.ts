@@ -23,6 +23,14 @@ test('Durable Object auth runtime enforces login and revocation with D1 session 
   expect(initial.status()).toBe(200)
   await expect(initial.json()).resolves.toMatchObject({ initialized: false, authenticated: false, user: null })
 
+  const staleSessionApi = await newApi('definitely-stale-session-token')
+  const staleStatus = await staleSessionApi.get('/api/auth/status')
+  expect(staleStatus.status()).toBe(200)
+  await expect(staleStatus.json()).resolves.toMatchObject({ initialized: false, authenticated: false, user: null })
+  expect(staleStatus.headers()['set-cookie']).toContain('pa_account=')
+  expect(staleStatus.headers()['set-cookie']).toContain('Max-Age=0')
+  await staleSessionApi.dispose()
+
   const bootstrap = await page.request.post('/api/auth/bootstrap', {
     data: { username: 'Owner', displayName: 'Joye Owner', password: ownerPassword },
   })

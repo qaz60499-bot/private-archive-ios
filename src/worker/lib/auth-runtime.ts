@@ -91,19 +91,33 @@ export async function resolveAppSessionRuntime(env: Env, rawToken: string): Prom
   if (!runtime) return resolveD1AppSession(env.DB, rawToken)
 
   const tokenHash = await hashAppSessionToken(rawToken)
-  const session = await runtime.resolveSession(tokenHash)
+  let session: { userId: string; authVersion?: string } | null
+  try {
+    session = await runtime.resolveSession(tokenHash)
+  } catch (error) {
+    // A Durable Object outage must not turn an otherwise harmless stale desktop/iOS
+    // cookie into HTTP 500. Newly issued sessions are mirrored into D1 specifically
+    // so reads can survive a runtime outage.
+    console.warn('Durable auth session lookup unavailable; falling back to D1', { error: error instanceof Error ? error.message : String(error) })
+    return resolveD1AppSession(env.DB, rawToken)
+  }
   if (session) {
     const user = await getAppUserById(env.DB, session.userId)
     if (!user || user.status !== 'ACTIVE' || !session.authVersion || session.authVersion !== user.password_hash) {
       // Missing authVersion means the token came from the short-lived migration
       // generation. Fail it closed so password changes cannot leave a DO session alive.
-      await runtime.deleteSession(tokenHash)
+      try { await runtime.deleteSession(tokenHash) } catch { /* invalid session still fails closed */ }
       return null
     }
     return user
   }
 
-  if (await runtime.isLegacyRevoked(tokenHash)) return null
+  try {
+    if (await runtime.isLegacyRevoked(tokenHash)) return null
+  } catch (error) {
+    console.warn('Durable auth revocation lookup unavailable; falling back to D1', { error: error instanceof Error ? error.message : String(error) })
+    return resolveD1AppSession(env.DB, rawToken)
+  }
   return resolveD1AppSession(env.DB, rawToken)
 }
 
@@ -115,15 +129,29 @@ export async function deleteAppSessionRuntime(env: Env, rawToken: string): Promi
   }
 
   const tokenHash = await hashAppSessionToken(rawToken)
-  await runtime.deleteSession(tokenHash)
-  // Revoke first so logout remains fail-closed even if the D1 delete is temporarily
-  // unavailable. Newly issued sessions are mirrored into D1 for resilience, so also
-  // remove that backup whenever possible instead of leaving logout dependent on the
-  // Durable Object revocation record alone.
-  await runtime.revokeLegacySession(tokenHash, APP_SESSION_TTL_SECONDS)
+  try {
+    await runtime.deleteSession(tokenHash)
+  } catch (error) {
+    console.warn('Durable auth session delete unavailable', { error: error instanceof Error ? error.message : String(error) })
+  }
+
+  let runtimeRevoked = false
+  try {
+    // Revoke before relying on the D1 cleanup so a mirrored token cannot be revived
+    // by the normal legacy fallback if the D1 delete is temporarily unavailable.
+    await runtime.revokeLegacySession(tokenHash, APP_SESSION_TTL_SECONDS)
+    runtimeRevoked = true
+  } catch (error) {
+    console.warn('Durable auth session revocation unavailable', { error: error instanceof Error ? error.message : String(error) })
+  }
+
+  let d1Deleted = false
   try {
     await deleteD1AppSession(env.DB, rawToken)
+    d1Deleted = true
   } catch (error) {
     console.warn('D1 auth session delete unavailable', { error: error instanceof Error ? error.message : String(error) })
   }
+
+  if (!runtimeRevoked && !d1Deleted) throw new Error('APP_SESSION_REVOKE_UNAVAILABLE')
 }
