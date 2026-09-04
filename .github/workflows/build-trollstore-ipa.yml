@@ -75,12 +75,26 @@ jobs:
             xcrun simctl shutdown "$UDID" 2>/dev/null || true
           }
           trap cleanup EXIT
+          wait_for_log_marker() {
+            marker="$1"
+            timeout_seconds="$2"
+            for attempt in $(seq 1 "$timeout_seconds"); do
+              if grep -q "$marker" "$LOG_FILE"; then return 0; fi
+              sleep 1
+            done
+            echo "Missing iOS runtime smoke marker after ${timeout_seconds}s: $marker" >&2
+            echo "--- App simulator log ---" >&2
+            cat "$LOG_FILE" >&2 || true
+            echo "--- Recent App unified log ---" >&2
+            xcrun simctl spawn "$UDID" log show --last 2m --style compact --predicate 'process == "App"' >&2 || true
+            return 1
+          }
+
           sleep 1
           SIMCTL_CHILD_PRIVATE_ARCHIVE_PICKER_SMOKE=1 xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
-          sleep 15
-          grep -q 'PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED' "$LOG_FILE"
-          grep -q 'PRIVATE_ARCHIVE_PICKER_SMOKE_DISMISSED' "$LOG_FILE"
-          grep -q 'PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=80 recoverable=80' "$LOG_FILE"
+          wait_for_log_marker 'PRIVATE_ARCHIVE_PICKER_SMOKE_PRESENTED' 45
+          wait_for_log_marker 'PRIVATE_ARCHIVE_PICKER_SMOKE_DISMISSED' 45
+          wait_for_log_marker 'PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=80 recoverable=80' 60
 
           xcrun simctl terminate "$UDID" cd.cc.joye.photo 2>/dev/null || true
           node scripts/ios-upload-protocol-smoke-server.mjs > "$SERVER_LOG" 2>&1 &
