@@ -22,7 +22,28 @@ else delete document.documentElement.dataset.nativePlatform
 // updated Service Worker takes control.
 void clearSensitivePrivateCaches().catch(() => undefined)
 
-if (!nativeApp) {
+const localDesktopSurface = !nativeApp && ['127.0.0.1', 'localhost', '::1'].includes(window.location.hostname)
+
+if (localDesktopSurface) {
+  // The Windows desktop app serves an immutable bundle from the installed EXE.
+  // A PWA Service Worker on the loopback origin can outlive an upgrade and keep
+  // rendering stale authentication state (for example, showing Owner bootstrap
+  // even when the live API reports initialized=true). Remove legacy registrations
+  // and UI caches on startup; cookies and saved credentials are unaffected.
+  if ('serviceWorker' in navigator) {
+    void navigator.serviceWorker.getRegistrations().then(async (registrations) => {
+      await Promise.all(registrations.map((registration) => registration.unregister()))
+      if ('caches' in globalThis) {
+        const keys = await caches.keys()
+        await Promise.all(keys.map((key) => caches.delete(key)))
+      }
+      if (navigator.serviceWorker.controller && sessionStorage.getItem('private-archive:desktop-sw-reset') !== '1') {
+        sessionStorage.setItem('private-archive:desktop-sw-reset', '1')
+        window.location.reload()
+      }
+    }).catch(() => undefined)
+  }
+} else if (!nativeApp) {
   registerSW({
     immediate: true,
     onRegisteredSW: (_swUrl, registration) => {

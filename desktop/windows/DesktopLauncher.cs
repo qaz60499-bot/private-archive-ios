@@ -84,6 +84,7 @@ internal static class DesktopLauncher
             {
                 server.Start();
                 WriteServerState(port);
+                PurgeObsoleteDesktopServiceWorkerState();
 
                 if (serverOnly)
                 {
@@ -374,6 +375,30 @@ internal static class DesktopLauncher
             catch { }
         }
         return null;
+    }
+
+    private static void PurgeObsoleteDesktopServiceWorkerState()
+    {
+        // The desktop shell is versioned inside this executable, but an older PWA
+        // service worker can still serve a stale cached index.html from the persistent
+        // Edge profile. Remove only Service Worker/cache state before launching Edge;
+        // keep Login Data, Cookies and Local Storage intact so saved credentials and
+        // the HttpOnly pa_account session survive upgrades.
+        string defaultProfile = Path.Combine(EdgeProfileDir, "Default");
+        string[] disposable = new[]
+        {
+            Path.Combine(defaultProfile, "Service Worker"),
+            Path.Combine(defaultProfile, "Cache"),
+            Path.Combine(defaultProfile, "Code Cache"),
+        };
+        foreach (string path in disposable)
+        {
+            try
+            {
+                if (Directory.Exists(path)) Directory.Delete(path, true);
+            }
+            catch { }
+        }
     }
 
     private static void OpenDefaultBrowser(string url)
