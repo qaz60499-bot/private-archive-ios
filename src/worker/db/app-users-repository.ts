@@ -133,6 +133,7 @@ export async function createAppSession(db: D1Database, userId: string, rawToken:
   const expiresAt = new Date(now.getTime() + APP_SESSION_TTL_SECONDS * 1000).toISOString()
   const tokenHash = await hashAppSessionToken(rawToken)
   await db.batch([
+    db.prepare('DELETE FROM app_sessions WHERE expires_at <= ?').bind(now.toISOString()),
     db.prepare(`INSERT INTO app_sessions (token_hash, user_id, workspace_id, expires_at, created_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?)`)
       .bind(tokenHash, userId, PERSONAL_WORKSPACE_ID, expiresAt, now.toISOString(), now.toISOString()),

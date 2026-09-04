@@ -6,6 +6,7 @@ import ImageIO
 import AVFoundation
 import PhotosUI
 import UniformTypeIdentifiers
+import WebKit
 
 private let nativeUploadChanged = Notification.Name("PrivateArchiveNativeBackgroundUploadChanged")
 
@@ -55,6 +56,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 #endif
         return URL(string: "https://api.photo.joye.cc.cd")!
     }()
+    var authenticationCookieURL: URL { apiBase }
     private var fileManager: FileManager { FileManager.default }
     private let stateQueue = DispatchQueue(label: "cd.cc.joye.photo.background-upload.state")
     private let workerQueue = DispatchQueue(label: "cd.cc.joye.photo.background-upload.worker", qos: .utility)
@@ -1977,7 +1979,10 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     }
 }
 
-class PrivateArchiveBridgeViewController: CAPBridgeViewController {
+class PrivateArchiveBridgeViewController: CAPBridgeViewController, WKHTTPCookieStoreObserver {
+    private let appSessionCookieName = "pa_account"
+    private var observedCookieStore: WKHTTPCookieStore?
+
     override func capacitorDidLoad() {
         super.capacitorDidLoad()
         // Capacitor 8 enables automatic plugin registration by default. In that mode
@@ -1987,6 +1992,12 @@ class PrivateArchiveBridgeViewController: CAPBridgeViewController {
         // app-owned plugin and works regardless of automatic package-plugin discovery.
         let nativeUploadPlugin = NativeBackgroundUploadPlugin()
         bridge?.registerPluginInstance(nativeUploadPlugin)
+        if let webView {
+            let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+            observedCookieStore = cookieStore
+            cookieStore.add(self)
+            bootstrapAuthenticationCookieStores(cookieStore)
+        }
 #if DEBUG
         // CI launches the simulator with this environment variable to exercise the
         // real PhotosUI construction/presentation path. It is compiled out of Release
@@ -1995,5 +2006,43 @@ class PrivateArchiveBridgeViewController: CAPBridgeViewController {
             nativeUploadPlugin.runPhotoPickerRuntimeSmoke()
         }
 #endif
+    }
+
+    deinit {
+        observedCookieStore?.remove(self)
+    }
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        syncWebAuthenticationCookieToNative(cookieStore)
+    }
+
+    private func bootstrapAuthenticationCookieStores(_ cookieStore: WKHTTPCookieStore) {
+        // The WKWebView store is authoritative for app login. Never seed it from the
+        // native URLSession store: doing so could resurrect a cookie after an explicit
+        // WebView logout if the native observer was interrupted before cleanup.
+        syncWebAuthenticationCookieToNative(cookieStore)
+    }
+
+    private func syncWebAuthenticationCookieToNative(_ cookieStore: WKHTTPCookieStore) {
+        let apiURL = NativeBackgroundUploadManager.shared.authenticationCookieURL
+        guard let apiHost = apiURL.host?.lowercased() else { return }
+        cookieStore.getAllCookies { [weak self] cookies in
+            guard let self else { return }
+            if let cookie = self.applicationSessionCookie(in: cookies, apiHost: apiHost) {
+                HTTPCookieStorage.shared.setCookie(cookie)
+                NativeBackgroundUploadManager.shared.resumePendingTransfers()
+                return
+            }
+            for cookie in HTTPCookieStorage.shared.cookies(for: apiURL) ?? [] where cookie.name == self.appSessionCookieName {
+                HTTPCookieStorage.shared.deleteCookie(cookie)
+            }
+        }
+    }
+
+    private func applicationSessionCookie(in cookies: [HTTPCookie], apiHost: String) -> HTTPCookie? {
+        cookies.first { cookie in
+            cookie.name == appSessionCookieName
+                && cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() == apiHost
+        }
     }
 }

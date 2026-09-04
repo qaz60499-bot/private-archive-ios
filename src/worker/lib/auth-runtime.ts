@@ -61,8 +61,29 @@ export async function clearLoginFailuresRuntime(env: Env, ip: string, username: 
 export async function createAppSessionRuntime(env: Env, userId: string, rawToken: string, authVersion?: string): Promise<string> {
   const runtime = authRuntime(env)
   if (!runtime || !authVersion) return createD1AppSession(env.DB, userId, rawToken)
+
   const tokenHash = await hashAppSessionToken(rawToken)
-  return runtime.createSession(tokenHash, userId, APP_SESSION_TTL_SECONDS, authVersion)
+  let runtimeExpiry: string
+  try {
+    runtimeExpiry = await runtime.createSession(tokenHash, userId, APP_SESSION_TTL_SECONDS, authVersion)
+  } catch {
+    // If the Durable Object is temporarily unavailable, a login should still be
+    // able to establish the legacy D1-backed session instead of accepting the
+    // password and then returning a broken unauthenticated client.
+    return createD1AppSession(env.DB, userId, rawToken)
+  }
+
+  try {
+    // Keep one low-write fallback copy for newly issued sessions. Session reads
+    // still prefer the Durable Object, while the existing revocation/auth-version
+    // rules prevent this backup from reviving a logged-out or password-rotated
+    // token. This makes a still-valid desktop/iOS cookie survive a DO namespace or
+    // storage interruption without putting per-request writes back on D1.
+    await createD1AppSession(env.DB, userId, rawToken)
+  } catch (error) {
+    console.warn('D1 auth session backup unavailable', { userId, error: error instanceof Error ? error.message : String(error) })
+  }
+  return runtimeExpiry
 }
 
 export async function resolveAppSessionRuntime(env: Env, rawToken: string): Promise<AppUserRow | null> {
@@ -95,8 +116,14 @@ export async function deleteAppSessionRuntime(env: Env, rawToken: string): Promi
 
   const tokenHash = await hashAppSessionToken(rawToken)
   await runtime.deleteSession(tokenHash)
-  // Existing sessions created before the Durable Object migration remain in D1.
-  // D1 may be temporarily write-exhausted, so revoke the legacy token in the DO
-  // instead of making logout depend on a D1 DELETE succeeding.
+  // Revoke first so logout remains fail-closed even if the D1 delete is temporarily
+  // unavailable. Newly issued sessions are mirrored into D1 for resilience, so also
+  // remove that backup whenever possible instead of leaving logout dependent on the
+  // Durable Object revocation record alone.
   await runtime.revokeLegacySession(tokenHash, APP_SESSION_TTL_SECONDS)
+  try {
+    await deleteD1AppSession(env.DB, rawToken)
+  } catch (error) {
+    console.warn('D1 auth session delete unavailable', { error: error instanceof Error ? error.message : String(error) })
+  }
 }

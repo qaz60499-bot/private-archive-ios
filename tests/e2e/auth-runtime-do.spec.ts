@@ -16,7 +16,7 @@ async function newApi(cookie?: string, ip?: string) {
   return playwrightRequest.newContext({ baseURL: 'http://127.0.0.1:8799', extraHTTPHeaders: headers })
 }
 
-test('Durable Object auth runtime keeps login and sessions independent from D1 session writes', async ({ page }, testInfo) => {
+test('Durable Object auth runtime enforces login and revocation with D1 session fallback', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'auth runtime contract only needs one browser project')
 
   const initial = await page.request.get('/api/auth/status')
