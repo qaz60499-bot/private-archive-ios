@@ -1892,6 +1892,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
             let recoverable = jobs.filter { $0.ready && $0.status != "failed" }.count
             NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=%d recoverable=%d", jobs.count, recoverable)
             for job in jobs { NativeBackgroundUploadManager.shared.removeJob(id: job.id) }
+            NativeBackgroundUploadManager.shared.endStagingProtection()
             try? FileManager.default.removeItem(at: directory)
         }
     }

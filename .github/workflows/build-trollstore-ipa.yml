@@ -64,6 +64,7 @@ jobs:
           test -d "$APP_PATH"
           xcrun simctl install "$UDID" "$APP_PATH"
           LOG_FILE="$RUNNER_TEMP/private-archive-picker-smoke.log"
+          UNIFIED_LOG="$RUNNER_TEMP/private-archive-unified-smoke.log"
           SERVER_LOG="$RUNNER_TEMP/private-archive-protocol-server.log"
           SERVER_PID=""
           xcrun simctl spawn "$UDID" log stream --style compact --level debug --predicate 'process == "App"' > "$LOG_FILE" 2>&1 &
@@ -75,18 +76,26 @@ jobs:
             xcrun simctl shutdown "$UDID" 2>/dev/null || true
           }
           trap cleanup EXIT
+          refresh_unified_log() {
+            xcrun simctl spawn "$UDID" log show --last 3m --style compact --predicate 'process == "App"' > "$UNIFIED_LOG" 2>/dev/null || true
+          }
           wait_for_log_marker() {
             marker="$1"
             timeout_seconds="$2"
             for attempt in $(seq 1 "$timeout_seconds"); do
-              if grep -q "$marker" "$LOG_FILE"; then return 0; fi
+              if grep -q "$marker" "$LOG_FILE" 2>/dev/null; then return 0; fi
+              if [ $((attempt % 3)) -eq 0 ]; then
+                refresh_unified_log
+                if grep -q "$marker" "$UNIFIED_LOG" 2>/dev/null; then return 0; fi
+              fi
               sleep 1
             done
+            refresh_unified_log
             echo "Missing iOS runtime smoke marker after ${timeout_seconds}s: $marker" >&2
             echo "--- App simulator log ---" >&2
             cat "$LOG_FILE" >&2 || true
             echo "--- Recent App unified log ---" >&2
-            xcrun simctl spawn "$UDID" log show --last 2m --style compact --predicate 'process == "App"' >&2 || true
+            cat "$UNIFIED_LOG" >&2 || true
             return 1
           }
 
@@ -107,19 +116,20 @@ jobs:
           SIMCTL_CHILD_PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE=1 \
           SIMCTL_CHILD_PRIVATE_ARCHIVE_API_BASE_OVERRIDE=http://127.0.0.1:18765 \
             xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
-          sleep 22
+          wait_for_log_marker 'PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED' 45
 
           kill "$SERVER_PID" 2>/dev/null || true
           wait "$SERVER_PID" 2>/dev/null || true
           SERVER_PID=""
           kill "$LOG_PID" 2>/dev/null || true
           wait "$LOG_PID" 2>/dev/null || true
+          refresh_unified_log
           cat "$SERVER_LOG"
           cat "$LOG_FILE"
+          cat "$UNIFIED_LOG"
           grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_RESERVE_OK' "$SERVER_LOG"
           grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_CONTENT_OK bytes=262144' "$SERVER_LOG"
-          grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED' "$LOG_FILE"
-          if grep -E 'PRIVATE_ARCHIVE_(PROTOCOL|BULK_IMPORT)_SMOKE_FAILED|Terminating app due to uncaught exception|Main Thread Checker|EXC_BAD_ACCESS|Fatal error' "$LOG_FILE"; then
+          if grep -E 'PRIVATE_ARCHIVE_(PROTOCOL|BULK_IMPORT)_SMOKE_FAILED|Terminating app due to uncaught exception|Main Thread Checker|EXC_BAD_ACCESS|Fatal error' "$LOG_FILE" "$UNIFIED_LOG"; then
             echo 'iOS runtime smoke detected an upload/picker failure or native crash' >&2
             exit 1
           fi
