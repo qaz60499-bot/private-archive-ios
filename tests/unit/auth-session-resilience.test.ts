@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 const source = readFileSync(new URL('../../src/worker/lib/auth-runtime.ts', import.meta.url), 'utf8')
+const durableSource = readFileSync(new URL('../../src/worker/durable/password-verifier.ts', import.meta.url), 'utf8')
 
 describe('application session resilience guard', () => {
   it('backs new Durable Object sessions with the existing D1 session store', () => {
@@ -26,12 +27,27 @@ describe('application session resilience guard', () => {
     expect(block.indexOf('runtime.isLegacyRevoked(tokenHash)')).toBeGreaterThan(-1)
   })
 
-  it('deletes the mirrored D1 session on logout while keeping an independent DO revocation guard', () => {
+  it('revokes the Durable Object session atomically and deletes the mirrored D1 session in parallel', () => {
     const deleteStart = source.indexOf('export async function deleteAppSessionRuntime')
     const block = source.slice(deleteStart)
-    const runtimeBranch = block.slice(block.indexOf('const tokenHash = await hashAppSessionToken(rawToken)'))
-    expect(runtimeBranch.indexOf('runtime.revokeLegacySession(tokenHash')).toBeGreaterThan(-1)
-    expect(runtimeBranch.indexOf('deleteD1AppSession(env.DB, rawToken)')).toBeGreaterThan(runtimeBranch.indexOf('runtime.revokeLegacySession(tokenHash'))
-    expect(runtimeBranch).toContain('if (!runtimeRevoked && !d1Deleted)')
+    expect(block).toContain('Promise.allSettled')
+    expect(block).toContain('runtime.revokeSession(tokenHash, APP_SESSION_TTL_SECONDS)')
+    expect(block).toContain('deleteD1AppSession(env.DB, rawToken)')
+    expect(block).toContain('if (!runtimeRevoked && !d1Deleted)')
+
+    const revokeStart = durableSource.indexOf('async revokeSession(')
+    const revokeEnd = durableSource.indexOf('async isLegacyRevoked(', revokeStart)
+    const revokeBlock = durableSource.slice(revokeStart, revokeEnd)
+    expect(revokeBlock).toContain('this.ctx.storage.transaction')
+    expect(revokeBlock).toContain('txn.delete(`auth-session:${tokenHash}`)')
+    expect(revokeBlock).toContain('txn.put(`auth-revoked:${tokenHash}`')
+  })
+
+  it('does not make a no-op Durable Object prune RPC on every auth request', () => {
+    const pruneStart = source.indexOf('export async function pruneAuthRuntime')
+    const recentStart = source.indexOf('export async function recentLoginFailuresRuntime')
+    const block = source.slice(pruneStart, recentStart)
+    expect(block).not.toContain('runtime.prune()')
+    expect(block).toContain('if (authRuntime(env)) return')
   })
 })

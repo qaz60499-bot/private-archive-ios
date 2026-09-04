@@ -116,6 +116,10 @@ function MobileBottomNav() {
 function AccountMenu() {
   const { user, switchAccount, logout } = useAuth()
   const [open, setOpen] = useState(false)
+  const runAccountAction = (action: () => Promise<void>) => {
+    setOpen(false)
+    void action()
+  }
   if (!user) return null
   return <div className="account-menu-wrap">
     <button className="account-menu-trigger" type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label={`当前账号 ${user.displayName}`}>
@@ -123,8 +127,8 @@ function AccountMenu() {
     </button>
     {open ? <div className="account-popover" role="menu">
       <div className="account-popover-head"><strong>{user.displayName}</strong><span>@{user.username} · {user.role}</span></div>
-      <button type="button" role="menuitem" onClick={() => void switchAccount()}><Repeat2 />切换账号</button>
-      <button type="button" role="menuitem" onClick={() => void logout()}><LogOut />退出登录</button>
+      <button type="button" role="menuitem" onClick={() => runAccountAction(switchAccount)}><Repeat2 />切换账号</button>
+      <button type="button" role="menuitem" onClick={() => runAccountAction(logout)}><LogOut />退出登录</button>
     </div> : null}
   </div>
 }

@@ -92,6 +92,14 @@ export class PasswordVerifier extends DurableObject<Env> {
     await this.ctx.storage.put(`auth-revoked:${tokenHash}`, { expiresAt } satisfies RevokedRecord)
   }
 
+  async revokeSession(tokenHash: string, ttlSeconds: number): Promise<void> {
+    const expiresAt = Date.now() + Math.max(1, ttlSeconds) * 1000
+    await this.ctx.storage.transaction(async (txn) => {
+      await txn.delete(`auth-session:${tokenHash}`)
+      await txn.put(`auth-revoked:${tokenHash}`, { expiresAt } satisfies RevokedRecord)
+    })
+  }
+
   async isLegacyRevoked(tokenHash: string): Promise<boolean> {
     const key = `auth-revoked:${tokenHash}`
     const record = await this.ctx.storage.get<RevokedRecord>(key)

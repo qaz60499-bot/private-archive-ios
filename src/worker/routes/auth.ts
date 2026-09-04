@@ -172,9 +172,11 @@ function parseAccessGrants(value: unknown): AppUserGrant[] | null {
 
 authRoutes.get('/status', requireAccess, async (context) => {
   await pruneAuthRuntime(context.env)
-  const initialized = await appUsersInitialized(context.env.DB)
   const presentedSession = rawSessionToken(context.req.header('Cookie'))
-  const user = await resolveRequestAppUser(context)
+  const [initialized, user] = await Promise.all([
+    appUsersInitialized(context.env.DB),
+    resolveRequestAppUser(context),
+  ])
   if (presentedSession && !user) {
     context.header('Set-Cookie', clearSessionCookie(secureCookie(context.req.url), requestCookieDomain(context)))
   }
@@ -215,30 +217,30 @@ authRoutes.post('/login', requireAccess, async (context) => {
   let stage = 'prune'
   try {
     await pruneAuthRuntime(context.env)
-    stage = 'initialized'
-    if (!(await appUsersInitialized(context.env.DB))) return context.json({ error: 'APP_NOT_INITIALIZED' }, 409)
-    stage = 'ip-rate-limit'
-    if (await recentLoginFailuresRuntime(context.env, ip) >= 8) {
-      context.header('Retry-After', '900')
-      return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429)
-    }
     stage = 'request-body'
     const body = await jsonBody(context)
     const username = validateUsername(body.username)
     const password = validatePassword(body.password)
-    stage = 'account-rate-limit'
-    if (await recentAccountLoginFailuresRuntime(context.env, username) >= 20) {
+    stage = 'preflight'
+    const [initialized, ipFailures, accountFailures, user] = await Promise.all([
+      appUsersInitialized(context.env.DB),
+      recentLoginFailuresRuntime(context.env, ip),
+      recentAccountLoginFailuresRuntime(context.env, username),
+      getAppUserByUsername(context.env.DB, username),
+    ])
+    if (!initialized) return context.json({ error: 'APP_NOT_INITIALIZED' }, 409)
+    if (ipFailures >= 8 || accountFailures >= 20) {
       context.header('Retry-After', '900')
       return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429)
     }
-    stage = 'load-user'
-    const user = await getAppUserByUsername(context.env.DB, username)
     stage = 'verify-password'
     const passwordMatches = await verifyLoginPassword(context.env, password, user?.password_hash ?? DUMMY_PASSWORD_HASH)
     const ok = Boolean(user && user.status === 'ACTIVE' && passwordMatches)
-    stage = 'record-attempt'
-    await recordLoginAttemptRuntime(context.env, ip, username, ok)
-    if (!ok || !user) return context.json({ error: 'LOGIN_INVALID' }, 401)
+    if (!ok || !user) {
+      stage = 'record-failure'
+      await recordLoginAttemptRuntime(context.env, ip, username, false)
+      return context.json({ error: 'LOGIN_INVALID' }, 401)
+    }
     stage = 'clear-failures'
     await clearLoginFailuresRuntime(context.env, ip, username)
     // Do not synchronously rehash legacy passwords during login. A stronger PBKDF2

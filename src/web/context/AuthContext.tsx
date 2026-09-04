@@ -66,7 +66,11 @@ function friendlyAuthError(error: unknown): string {
   const code = error instanceof ApiError ? error.code : error instanceof Error ? error.message : ''
   switch (code) {
     case 'LOGIN_INVALID': return '用户名或密码不正确。'
-    case 'LOGIN_RATE_LIMITED': return '登录尝试过多，请稍后再试。'
+    case 'LOGIN_RATE_LIMITED': return '登录尝试过多，请约 15 分钟后再试。'
+    case 'LOGIN_FAILED': return '登录服务刚才未能完成，请重试；账号和密码不会因此被修改。'
+    case 'REQUEST_TIMEOUT': return '登录请求超时，请检查网络后重试。'
+    case 'ACCESS_OR_NETWORK_FAILED': return '当前无法连接登录服务，请检查网络后重试。'
+    case 'NETWORK_OFFLINE': return '当前设备处于离线状态。'
     case 'USERNAME_EXISTS': return '这个用户名已经存在。'
     case 'USERNAME_INVALID': return '用户名使用 3–40 个字母、数字、点、下划线或短横线。'
     case 'DISPLAY_NAME_INVALID': return '请输入有效的显示名称。'
@@ -161,10 +165,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (username: string, password: string) => {
     setError(null)
+    clearNativeMediaCache()
+    const cachePurge = clearSensitivePrivateCaches().catch(() => 0)
     try {
-      const result = await api.loginAccount(username, password)
-      await clearSensitivePrivateCaches().catch(() => 0)
-      clearNativeMediaCache()
+      const [result] = await Promise.all([
+        api.loginAccount(username, password),
+        cachePurge,
+      ])
       setInitialized(true)
       setUser(result.user)
       activateUploadPrincipal(result.user)
@@ -177,12 +184,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const logout = useCallback(async () => {
-    try { await api.logoutAccount() } catch { /* local state still signs out */ }
-    await clearSensitivePrivateCaches().catch(() => 0)
+    // Cache cleanup is independent from server-side session revocation. Start both
+    // together so account switching does not wait for two serialized I/O phases.
     clearNativeMediaCache()
+    const cachePurge = clearSensitivePrivateCaches().catch(() => 0)
+    try { await api.logoutAccount() } catch { /* local state still signs out */ }
     setUser(null)
     activateUploadPrincipal(null)
     setError(null)
+    void cachePurge
   }, [])
 
   const switchAccount = useCallback(async () => {

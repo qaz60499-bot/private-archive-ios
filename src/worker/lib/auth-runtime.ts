@@ -20,11 +20,10 @@ function authRuntime(env: Env) {
 }
 
 export async function pruneAuthRuntime(env: Env): Promise<void> {
-  const runtime = authRuntime(env)
-  if (runtime) {
-    await runtime.prune()
-    return
-  }
+  // Durable auth state is expired lazily by the individual lookup methods. Avoid a
+  // no-op Durable Object RPC on every status/login request; only the legacy D1
+  // fallback needs periodic pruning.
+  if (authRuntime(env)) return
   await pruneD1AppAuth(env.DB)
 }
 
@@ -129,29 +128,24 @@ export async function deleteAppSessionRuntime(env: Env, rawToken: string): Promi
   }
 
   const tokenHash = await hashAppSessionToken(rawToken)
-  try {
-    await runtime.deleteSession(tokenHash)
-  } catch (error) {
-    console.warn('Durable auth session delete unavailable', { error: error instanceof Error ? error.message : String(error) })
+  // One DO transaction atomically removes the live session and installs the legacy
+  // fallback revocation guard. Delete the mirrored D1 copy concurrently so logout
+  // latency is one network round-trip instead of three serialized round-trips.
+  const [runtimeResult, d1Result] = await Promise.allSettled([
+    runtime.revokeSession(tokenHash, APP_SESSION_TTL_SECONDS),
+    deleteD1AppSession(env.DB, rawToken),
+  ])
+  const runtimeRevoked = runtimeResult.status === 'fulfilled'
+  const d1Deleted = d1Result.status === 'fulfilled'
+  if (!runtimeRevoked) {
+    console.warn('Durable auth session revocation unavailable', {
+      error: runtimeResult.reason instanceof Error ? runtimeResult.reason.message : String(runtimeResult.reason),
+    })
   }
-
-  let runtimeRevoked = false
-  try {
-    // Revoke before relying on the D1 cleanup so a mirrored token cannot be revived
-    // by the normal legacy fallback if the D1 delete is temporarily unavailable.
-    await runtime.revokeLegacySession(tokenHash, APP_SESSION_TTL_SECONDS)
-    runtimeRevoked = true
-  } catch (error) {
-    console.warn('Durable auth session revocation unavailable', { error: error instanceof Error ? error.message : String(error) })
+  if (!d1Deleted) {
+    console.warn('D1 auth session delete unavailable', {
+      error: d1Result.reason instanceof Error ? d1Result.reason.message : String(d1Result.reason),
+    })
   }
-
-  let d1Deleted = false
-  try {
-    await deleteD1AppSession(env.DB, rawToken)
-    d1Deleted = true
-  } catch (error) {
-    console.warn('D1 auth session delete unavailable', { error: error instanceof Error ? error.message : String(error) })
-  }
-
   if (!runtimeRevoked && !d1Deleted) throw new Error('APP_SESSION_REVOKE_UNAVAILABLE')
 }
