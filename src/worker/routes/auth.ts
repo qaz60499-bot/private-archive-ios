@@ -145,10 +145,12 @@ function authBodyErrorStatus(code: string): 400 | 413 | 500 {
   return code.endsWith('_INVALID') ? 400 : 500
 }
 
-async function verifyLoginPassword(env: Env, password: string, encodedHash: string): Promise<boolean> {
-  const verifier = env.PASSWORD_VERIFIER
-  if (!verifier) return verifyAppPassword(password, encodedHash)
-  return verifier.getByName('app-login-password-verifier').verify(password, encodedHash)
+async function verifyLoginPassword(_env: Env, password: string, encodedHash: string): Promise<boolean> {
+  // Keep password derivation in the request Worker. The same WebCrypto PBKDF2 path
+  // is already used successfully by password recovery, while routing the 600k-round
+  // verification through Durable Object RPC can fail before login reaches session
+  // creation. The Durable Object remains responsible for throttling/session state.
+  return verifyAppPassword(password, encodedHash)
 }
 
 async function requireCurrentOwner(context: Parameters<typeof resolveRequestAppUser>[0]) {

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 const source = readFileSync(new URL('../../src/worker/lib/auth-runtime.ts', import.meta.url), 'utf8')
 const durableSource = readFileSync(new URL('../../src/worker/durable/password-verifier.ts', import.meta.url), 'utf8')
+const authRouteSource = readFileSync(new URL('../../src/worker/routes/auth.ts', import.meta.url), 'utf8')
 
 describe('application session resilience guard', () => {
   it('backs new Durable Object sessions with the existing D1 session store', () => {
@@ -59,5 +60,27 @@ describe('application session resilience guard', () => {
     const block = source.slice(pruneStart, recentStart)
     expect(block).not.toContain('runtime.prune()')
     expect(block).toContain('if (authRuntime(env)) return')
+  })
+
+  it('keeps password verification on the request Worker instead of Durable Object RPC', () => {
+    const verifyStart = authRouteSource.indexOf('async function verifyLoginPassword')
+    const ownerStart = authRouteSource.indexOf('async function requireCurrentOwner', verifyStart)
+    const block = authRouteSource.slice(verifyStart, ownerStart)
+    expect(block).toContain('return verifyAppPassword(password, encodedHash)')
+    expect(block).not.toContain('.verify(password, encodedHash)')
+  })
+
+  it('falls back to D1 when Durable Object throttle bookkeeping is unavailable', () => {
+    const recentStart = source.indexOf('export async function recentLoginFailuresRuntime')
+    const createStart = source.indexOf('export async function createAppSessionRuntime')
+    const block = source.slice(recentStart, createStart)
+    expect(block).toContain('Durable auth IP throttle lookup unavailable; falling back to D1')
+    expect(block).toContain('Durable auth account throttle lookup unavailable; falling back to D1')
+    expect(block).toContain('Durable auth failure recording unavailable; falling back to D1')
+    expect(block).toContain('Durable auth failure cleanup unavailable; falling back to D1')
+    expect(block).toContain('recentD1LoginFailures(env.DB, ip, windowMinutes)')
+    expect(block).toContain('recentD1AccountLoginFailures(env.DB, username, windowMinutes)')
+    expect(block).toContain('recordD1LoginAttempt(env.DB, ip, username, success)')
+    expect(block).toContain('clearD1LoginFailures(env.DB, ip, username)')
   })
 })

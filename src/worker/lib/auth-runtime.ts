@@ -30,21 +30,41 @@ export async function pruneAuthRuntime(env: Env): Promise<void> {
 
 export async function recentLoginFailuresRuntime(env: Env, ip: string, windowMinutes = 15): Promise<number> {
   const runtime = authRuntime(env)
-  return runtime ? runtime.recentFailures(ip, windowMinutes) : recentD1LoginFailures(env.DB, ip, windowMinutes)
+  if (!runtime) return recentD1LoginFailures(env.DB, ip, windowMinutes)
+  try {
+    return await runtime.recentFailures(ip, windowMinutes)
+  } catch (error) {
+    console.warn('Durable auth IP throttle lookup unavailable; falling back to D1', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return recentD1LoginFailures(env.DB, ip, windowMinutes)
+  }
 }
 
 export async function recentAccountLoginFailuresRuntime(env: Env, username: string, windowMinutes = 15): Promise<number> {
   const runtime = authRuntime(env)
-  return runtime
-    ? runtime.recentFailures(`account:${username.trim().toLowerCase()}`, windowMinutes)
-    : recentD1AccountLoginFailures(env.DB, username, windowMinutes)
+  if (!runtime) return recentD1AccountLoginFailures(env.DB, username, windowMinutes)
+  try {
+    return await runtime.recentFailures(`account:${username.trim().toLowerCase()}`, windowMinutes)
+  } catch (error) {
+    console.warn('Durable auth account throttle lookup unavailable; falling back to D1', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return recentD1AccountLoginFailures(env.DB, username, windowMinutes)
+  }
 }
 
 export async function recordLoginAttemptRuntime(env: Env, ip: string, username: string, success: boolean): Promise<void> {
   const runtime = authRuntime(env)
   if (runtime) {
-    await runtime.recordAttempt(ip, username, success)
-    return
+    try {
+      await runtime.recordAttempt(ip, username, success)
+      return
+    } catch (error) {
+      console.warn('Durable auth failure recording unavailable; falling back to D1', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
   await recordD1LoginAttempt(env.DB, ip, username, success)
 }
@@ -52,8 +72,14 @@ export async function recordLoginAttemptRuntime(env: Env, ip: string, username: 
 export async function clearLoginFailuresRuntime(env: Env, ip: string, username: string): Promise<void> {
   const runtime = authRuntime(env)
   if (runtime) {
-    await runtime.clearFailures(ip, username)
-    return
+    try {
+      await runtime.clearFailures(ip, username)
+      return
+    } catch (error) {
+      console.warn('Durable auth failure cleanup unavailable; falling back to D1', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
   await clearD1LoginFailures(env.DB, ip, username)
 }
