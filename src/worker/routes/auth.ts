@@ -237,11 +237,14 @@ authRoutes.post('/recover-passwords', requireAccessOwner, async (context) => {
     const body = await jsonBody(context)
     const password = validatePassword(body.password)
     const users = await listAppUsers(context.env.DB)
-    const updates = await Promise.all(users.map(async (user) => ({
-      id: user.id,
-      passwordHash: await hashAppPassword(password),
-    })))
-    const count = await resetAllAppUserPasswords(context.env.DB, updates)
+    // Recovery intentionally assigns one shared password to every account. Derive
+    // PBKDF2 once so the request does not spend 600k rounds per account and exhaust
+    // the Worker CPU budget before the D1 update is reached.
+    const passwordHash = await hashAppPassword(password)
+    const count = await resetAllAppUserPasswords(
+      context.env.DB,
+      users.map((user) => ({ id: user.id, passwordHash })),
+    )
     return context.json({ ok: true, count })
   } catch (error) {
     const code = error instanceof Error ? error.message : 'APP_PASSWORD_RECOVERY_FAILED'
@@ -355,11 +358,11 @@ authRoutes.post('/users/reset-passwords', requireAccess, async (context) => {
     const body = await jsonBody(context)
     const password = validatePassword(body.password)
     const users = await listAppUsers(context.env.DB)
-    const updates = await Promise.all(users.map(async (user) => ({
-      id: user.id,
-      passwordHash: await hashAppPassword(password),
-    })))
-    const count = await resetAllAppUserPasswords(context.env.DB, updates)
+    const passwordHash = await hashAppPassword(password)
+    const count = await resetAllAppUserPasswords(
+      context.env.DB,
+      users.map((user) => ({ id: user.id, passwordHash })),
+    )
     return context.json({ ok: true, count })
   } catch (error) {
     const code = error instanceof Error ? error.message : 'APP_PASSWORD_RESET_FAILED'
