@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { APP_SESSION_TTL_SECONDS, appPasswordNeedsUpgrade, createAppSessionToken, hashAppPassword, hashAppSessionToken, verifyAppPassword } from '../../src/worker/lib/app-auth'
+import { APP_SESSION_TTL_SECONDS, appPasswordChallenge, appPasswordNeedsUpgrade, createAppSessionToken, hashAppPassword, hashAppSessionToken, verifyAppPassword, verifyAppPasswordProof } from '../../src/worker/lib/app-auth'
+import { derivePasswordProof } from '../../src/web/lib/password-recovery'
 
 describe('application account authentication', () => {
   it('hashes and verifies passwords without storing plaintext', async () => {
@@ -10,6 +11,17 @@ describe('application account authentication', () => {
     expect(encoded).not.toContain(password)
     expect(await verifyAppPassword(password, encoded)).toBe(true)
     expect(await verifyAppPassword('wrong-password', encoded)).toBe(false)
+  })
+
+  it('verifies a client-derived login proof without repeating PBKDF2 on the Worker', async () => {
+    const password = 'correct-horse-photo-archive'
+    const encoded = await hashAppPassword(password)
+    const challenge = appPasswordChallenge(encoded)
+    expect(challenge).not.toBeNull()
+    const proof = await derivePasswordProof(password, challenge!.salt, challenge!.iterations)
+    expect(verifyAppPasswordProof(proof, encoded)).toBe(true)
+    const wrongProof = await derivePasswordProof('wrong-password', challenge!.salt, challenge!.iterations)
+    expect(verifyAppPasswordProof(wrongProof, encoded)).toBe(false)
   })
 
   it('accepts the legacy password work factor so login can upgrade it in place', async () => {

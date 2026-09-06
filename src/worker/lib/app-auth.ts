@@ -11,14 +11,14 @@ function encodeBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
 }
 
-function decodeBase64Url(value: string): Uint8Array {
+export function decodeBase64Url(value: string): Uint8Array {
   const normalized = value.replaceAll('-', '+').replaceAll('_', '/')
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
   const binary = atob(padded)
   return Uint8Array.from(binary, (char) => char.charCodeAt(0))
 }
 
-function constantTimeBytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+export function constantTimeBytesEqual(left: Uint8Array, right: Uint8Array): boolean {
   const max = Math.max(left.length, right.length)
   let difference = left.length ^ right.length
   for (let index = 0; index < max; index += 1) difference |= (left[index] ?? 0) ^ (right[index] ?? 0)
@@ -41,6 +41,25 @@ export async function hashAppPassword(password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16))
   const derived = await derivePassword(password, salt, CURRENT_PASSWORD_ITERATIONS, PASSWORD_BYTES)
   return `pbkdf2-sha256$${CURRENT_PASSWORD_ITERATIONS}$${encodeBase64Url(salt)}$${encodeBase64Url(derived)}`
+}
+
+export function appPasswordChallenge(encodedHash: string): { algorithm: 'pbkdf2-sha256'; iterations: number; salt: string } | null {
+  const [algorithm, iterationsRaw, saltRaw, hashRaw] = encodedHash.split('$')
+  const iterations = Number(iterationsRaw)
+  if (algorithm !== 'pbkdf2-sha256' || !Number.isInteger(iterations) || !saltRaw || !hashRaw) return null
+  if (iterations !== CURRENT_PASSWORD_ITERATIONS && !LEGACY_PASSWORD_ITERATIONS.has(iterations)) return null
+  return { algorithm: 'pbkdf2-sha256', iterations, salt: saltRaw }
+}
+
+export function verifyAppPasswordProof(proof: string, encodedHash: string): boolean {
+  const challenge = appPasswordChallenge(encodedHash)
+  if (!challenge || !/^[A-Za-z0-9_-]{43}$/.test(proof)) return false
+  const [, , , hashRaw] = encodedHash.split('$')
+  try {
+    return constantTimeBytesEqual(decodeBase64Url(proof), decodeBase64Url(hashRaw))
+  } catch {
+    return false
+  }
 }
 
 export async function verifyAppPassword(password: string, encodedHash: string): Promise<boolean> {

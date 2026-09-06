@@ -1,5 +1,6 @@
 import type { ActivityItem, Album, AppAccessGrant, AppAccessPreset, AppAccount, ArchiveSummary, Asset, AuthStatus, DiscoverModule, IntegrationStatus, ShareLink, StorageBackend, TelegramDiscovery, TelegramSource, UsageSnapshot } from '../types'
 import { apiRequestUrl, isNativeApp, nativeApiResourceUrl, nativePlatform } from './native-platform'
+import { derivePasswordProof } from './password-recovery'
 
 export class ApiError extends Error {
   constructor(public readonly status: number, public readonly code: string, public readonly retryAfterMs?: number) {
@@ -99,7 +100,11 @@ function normalizeAssetForSurface(asset: Asset): Asset {
 export const api = {
   authStatus: () => request<AuthStatus>('/api/auth/status'),
   bootstrapAccount: (username: string, displayName: string, password: string) => request<{ user: AppAccount }>('/api/auth/bootstrap', { method: 'POST', body: JSON.stringify({ username, displayName, password }) }),
-  loginAccount: (username: string, password: string) => request<{ user: AppAccount }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  loginAccount: async (username: string, password: string) => {
+    const challenge = await request<{ algorithm: 'pbkdf2-sha256'; iterations: number; salt: string }>('/api/auth/challenge', { method: 'POST', body: JSON.stringify({ username }) })
+    const passwordProof = await derivePasswordProof(password, challenge.salt, challenge.iterations)
+    return request<{ user: AppAccount }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, passwordProof }) })
+  },
   logoutAccount: () => request<{ ok: true }>('/api/auth/logout', { method: 'POST', body: '{}' }),
   currentAccount: () => request<{ user: AppAccount }>('/api/auth/me'),
   listAccounts: () => request<{ items: AppAccount[] }>('/api/auth/users'),

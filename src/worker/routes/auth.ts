@@ -18,7 +18,7 @@ import {
   replaceAppUserGrants,
   type AppUserGrant,
 } from '../db/app-user-access-repository'
-import { APP_SESSION_COOKIE, APP_SESSION_TTL_SECONDS, createAppSessionToken, hashAppPassword, verifyAppPassword } from '../lib/app-auth'
+import { APP_SESSION_COOKIE, APP_SESSION_TTL_SECONDS, appPasswordChallenge, createAppSessionToken, hashAppPassword, verifyAppPassword, verifyAppPasswordProof } from '../lib/app-auth'
 import { appendCookieDomain, nativeAppCookieDomain } from '../lib/app-session-cookie'
 import {
   clearLoginFailuresRuntime,
@@ -276,6 +276,21 @@ authRoutes.post('/recover-passwords', requireAccessOwner, async (context) => {
   }
 })
 
+authRoutes.post('/challenge', requireAccess, async (context) => {
+  try {
+    const body = await jsonBody(context)
+    const username = validateUsername(body.username)
+    const user = await getAppUserByUsername(context.env.DB, username)
+    const challenge = appPasswordChallenge(user?.password_hash ?? DUMMY_PASSWORD_HASH)
+    if (!challenge) return context.json({ error: 'LOGIN_FAILED' }, 500)
+    return context.json(challenge)
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'LOGIN_FAILED'
+    const status = authBodyErrorStatus(code)
+    return context.json({ error: status === 500 ? 'LOGIN_FAILED' : code }, status)
+  }
+})
+
 authRoutes.post('/login', requireAccess, async (context) => {
   const ip = clientIp(context.req.raw.headers, context.req.url)
   let stage = 'prune'
@@ -284,7 +299,12 @@ authRoutes.post('/login', requireAccess, async (context) => {
     stage = 'request-body'
     const body = await jsonBody(context)
     const username = validateUsername(body.username)
-    const password = validatePassword(body.password)
+    const password = body.passwordProof === undefined ? validatePassword(body.password) : null
+    const passwordProof = body.passwordProof === undefined
+      ? null
+      : typeof body.passwordProof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(body.passwordProof)
+        ? body.passwordProof
+        : (() => { throw new Error('PASSWORD_INVALID') })()
     stage = 'preflight'
     const [initialized, ipFailures, accountFailures, user] = await Promise.all([
       appUsersInitialized(context.env.DB),
@@ -298,7 +318,10 @@ authRoutes.post('/login', requireAccess, async (context) => {
       return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429)
     }
     stage = 'verify-password'
-    const passwordMatches = await verifyLoginPassword(context.env, password, user?.password_hash ?? DUMMY_PASSWORD_HASH)
+    const encodedHash = user?.password_hash ?? DUMMY_PASSWORD_HASH
+    const passwordMatches = passwordProof !== null
+      ? verifyAppPasswordProof(passwordProof, encodedHash)
+      : await verifyLoginPassword(context.env, password ?? '', encodedHash)
     const ok = Boolean(user && user.status === 'ACTIVE' && passwordMatches)
     if (!ok || !user) {
       stage = 'record-failure'
