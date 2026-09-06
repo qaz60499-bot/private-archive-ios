@@ -3,6 +3,7 @@ import { KeyRound, LoaderCircle, LockKeyhole, ShieldCheck, UserRound } from 'luc
 import { useAuth } from '../context/AuthContext'
 import { reauthenticateAccess } from '../lib/access-session'
 import { api } from '../lib/api'
+import { deriveRecoveryPasswordHash } from '../lib/password-recovery'
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const auth = useAuth()
@@ -48,7 +49,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
     setRecoveryError(null)
     setRecoveryMessage(null)
     try {
-      const result = await api.recoverAllAccountPasswords(recoveryPassword)
+      const passwordHash = await deriveRecoveryPasswordHash(recoveryPassword)
+      const result = await api.recoverAllAccountPasswords(passwordHash)
       setRecoveryPassword('')
       setRecoveryMessage(`已统一重置 ${result.count} 个账号密码。请使用新密码登录。`)
     } catch (error) {

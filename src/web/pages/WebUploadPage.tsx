@@ -7,6 +7,7 @@ import { ImportToast } from '../components/ImportToast'
 import { OfflineBadge } from '../components/UploadControls'
 import { useArchive } from '../context/ArchiveContext'
 import { api } from '../lib/api'
+import { deriveRecoveryPasswordHash } from '../lib/password-recovery'
 import { summarizeImportErrors } from '../lib/import-error-summary'
 import { summarizeUploadBatches } from '../lib/offline/batch'
 import {
@@ -187,7 +188,8 @@ export function WebUploadPage() {
     setRecoveryMessage(null)
     setRecoveryError(null)
     try {
-      const result = await api.recoverAllAccountPasswords(recoveryPassword)
+      const passwordHash = await deriveRecoveryPasswordHash(recoveryPassword)
+      const result = await api.recoverAllAccountPasswords(passwordHash)
       setRecoveryPassword('')
       setRecoveryMessage(`已统一重置 ${result.count} 个应用账号密码。旧登录会话已失效，请使用新密码登录。`)
     } catch (caught) {

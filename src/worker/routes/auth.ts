@@ -102,6 +102,14 @@ function validatePassword(value: unknown): string {
   return password
 }
 
+function validatePasswordHash(value: unknown): string {
+  const passwordHash = typeof value === 'string' ? value : ''
+  if (!/^pbkdf2-sha256\$600000\$[A-Za-z0-9_-]{22}\$[A-Za-z0-9_-]{43}$/.test(passwordHash)) {
+    throw new Error('PASSWORD_HASH_INVALID')
+  }
+  return passwordHash
+}
+
 const MAX_AUTH_JSON_BYTES = 16 * 1024
 
 async function jsonBody(context: { req: { raw: Request } }): Promise<Record<string, unknown>> {
@@ -238,14 +246,15 @@ authRoutes.post('/recover-passwords', requireAccessOwner, async (context) => {
   let stage = 'request-body'
   try {
     const body = await jsonBody(context)
-    const password = validatePassword(body.password)
     stage = 'load-users'
     const users = await listAppUsers(context.env.DB)
-    // Recovery intentionally assigns one shared password to every account. Derive
-    // PBKDF2 once so the request does not spend 600k rounds per account and exhaust
-    // the Worker CPU budget before the D1 update is reached.
-    stage = 'hash-password'
-    const passwordHash = await hashAppPassword(password)
+    // The Access-protected browser recovery page derives the same 600k-round
+    // PBKDF2 hash locally, keeping plaintext on the device and avoiding Worker CPU
+    // exhaustion. Retain raw-password fallback for older hosted clients.
+    stage = 'password-hash'
+    const passwordHash = body.passwordHash === undefined
+      ? await hashAppPassword(validatePassword(body.password))
+      : validatePasswordHash(body.passwordHash)
     stage = 'reset-passwords'
     const count = await resetAllAppUserPasswords(
       context.env.DB,
