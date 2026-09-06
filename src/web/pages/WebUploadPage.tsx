@@ -130,6 +130,10 @@ export function WebUploadPage() {
   const [storageBackend, setStorageBackend] = useState<StorageBackend>('telegram_user_group')
   const [activeImports, setActiveImports] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [recoveryPassword, setRecoveryPassword] = useState('')
+  const [recoveringPasswords, setRecoveringPasswords] = useState(false)
+  const [recoveryMessage, setRecoveryMessage] = useState<string | null>(null)
+  const [recoveryError, setRecoveryError] = useState<string | null>(null)
   const folderRef = useRef<HTMLInputElement>(null)
   const coarsePointer = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches
   const compactViewport = typeof matchMedia === 'function' && matchMedia('(max-width: 900px)').matches
@@ -177,6 +181,22 @@ export function WebUploadPage() {
     if (selected.length) void addFiles(selected)
   }
 
+  const recoverPasswords = async () => {
+    if (recoveringPasswords || recoveryPassword.length < 9) return
+    setRecoveringPasswords(true)
+    setRecoveryMessage(null)
+    setRecoveryError(null)
+    try {
+      const result = await api.recoverAllAccountPasswords(recoveryPassword)
+      setRecoveryPassword('')
+      setRecoveryMessage(`已统一重置 ${result.count} 个应用账号密码。旧登录会话已失效，请使用新密码登录。`)
+    } catch (caught) {
+      setRecoveryError(caught instanceof Error ? caught.message : 'APP_PASSWORD_RECOVERY_FAILED')
+    } finally {
+      setRecoveringPasswords(false)
+    }
+  }
+
   return <main className="web-upload-shell">
     <section className="web-upload-card" aria-labelledby="web-upload-title">
       <header className="web-upload-head">
@@ -186,6 +206,16 @@ export function WebUploadPage() {
           <button className="secondary-button" type="button" onClick={() => { window.location.assign('/cdn-cgi/access/logout') }}><LogOut />退出 Access</button>
         </div>
       </header>
+
+      <section className="web-upload-storage" aria-labelledby="web-account-recovery-title">
+        <div className="web-upload-section-title"><h2 id="web-account-recovery-title">账号恢复</h2><p>忘记应用账号密码时，可使用当前已验证的 Cloudflare Access 身份统一重置全部应用账号。</p></div>
+        <div className="account-create-grid">
+          <label><span>统一新密码</span><input value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} type="password" autoComplete="new-password" placeholder="至少 9 个字符，无其他复杂度要求" /></label>
+          <button className="secondary-button" type="button" disabled={recoveringPasswords || recoveryPassword.length < 9} onClick={() => void recoverPasswords()}>{recoveringPasswords ? <LoaderCircle className="spin" /> : <ShieldCheck />}{recoveringPasswords ? '重置中' : '统一重置全部应用账号密码'}</button>
+        </div>
+        {recoveryMessage ? <p className="owner-login-copy" role="status">{recoveryMessage}</p> : null}
+        {recoveryError ? <p className="inline-error web-upload-error" role="alert">{recoveryError}</p> : null}
+      </section>
 
       <section className="web-upload-storage" aria-labelledby="web-storage-title">
         <div className="web-upload-section-title"><h2 id="web-storage-title">本次上传存储到</h2><p>不会因为浏览器能力不足而静默更换存储后端。</p></div>
