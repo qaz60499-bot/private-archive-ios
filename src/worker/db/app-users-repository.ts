@@ -131,13 +131,41 @@ export async function updateAppUser(db: D1Database, id: string, input: {
 export async function resetAllAppUserPasswords(db: D1Database, updates: Array<{ id: string; passwordHash: string }>): Promise<number> {
   if (!updates.length) return 0
   const now = new Date().toISOString()
-  const statements = updates.map(({ id, passwordHash }) => db.prepare(`UPDATE app_users
+  const updateStatement = (id: string, passwordHash: string) => db.prepare(`UPDATE app_users
     SET password_hash = ?, updated_at = ?
-    WHERE id = ? AND workspace_id = ?`).bind(passwordHash, now, id, PERSONAL_WORKSPACE_ID))
-  await db.batch([
-    ...statements,
-    db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID),
-  ])
+    WHERE id = ? AND workspace_id = ?`).bind(passwordHash, now, id, PERSONAL_WORKSPACE_ID)
+
+  try {
+    const results = await db.batch([
+      ...updates.map(({ id, passwordHash }) => updateStatement(id, passwordHash)),
+      db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID),
+    ])
+    for (let index = 0; index < updates.length; index += 1) {
+      if (Number(results[index]?.meta.changes ?? 0) !== 1) throw new Error('APP_PASSWORD_RESET_TARGET_MISSING')
+    }
+  } catch (error) {
+    // D1 batch is the preferred all-or-nothing path. If the batch transport itself
+    // is temporarily unavailable, retry the small personal-account set one row at a
+    // time. Every row receives the same already-derived hash, so a partial retry is
+    // idempotent and the final verification below prevents a false success response.
+    console.warn('App password reset batch unavailable; retrying sequentially', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    for (const { id, passwordHash } of updates) {
+      const result = await updateStatement(id, passwordHash).run()
+      if (Number(result.meta.changes ?? 0) !== 1) throw new Error('APP_PASSWORD_RESET_TARGET_MISSING', { cause: error })
+    }
+    await db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID).run()
+  }
+
+  const placeholders = updates.map(() => '?').join(',')
+  const rows = await db.prepare(`SELECT id, password_hash FROM app_users
+    WHERE workspace_id = ? AND id IN (${placeholders})`)
+    .bind(PERSONAL_WORKSPACE_ID, ...updates.map(({ id }) => id)).all<{ id: string; password_hash: string }>()
+  const expected = new Map(updates.map(({ id, passwordHash }) => [id, passwordHash]))
+  if (rows.results.length !== updates.length || rows.results.some((row) => expected.get(row.id) !== row.password_hash)) {
+    throw new Error('APP_PASSWORD_RESET_VERIFY_FAILED')
+  }
   return updates.length
 }
 

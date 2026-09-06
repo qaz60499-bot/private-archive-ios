@@ -235,23 +235,35 @@ authRoutes.post('/bootstrap', requireAccessOwner, async (context) => {
 
 authRoutes.post('/recover-passwords', requireAccessOwner, async (context) => {
   if (!hostedRecoveryRequestAllowed(context)) return context.json({ error: 'APP_RECOVERY_NOT_ALLOWED' }, 403)
+  let stage = 'request-body'
   try {
     const body = await jsonBody(context)
     const password = validatePassword(body.password)
+    stage = 'load-users'
     const users = await listAppUsers(context.env.DB)
     // Recovery intentionally assigns one shared password to every account. Derive
     // PBKDF2 once so the request does not spend 600k rounds per account and exhaust
     // the Worker CPU budget before the D1 update is reached.
+    stage = 'hash-password'
     const passwordHash = await hashAppPassword(password)
+    stage = 'reset-passwords'
     const count = await resetAllAppUserPasswords(
       context.env.DB,
       users.map((user) => ({ id: user.id, passwordHash })),
     )
+
+    // A successful owner recovery must also release the throttle state created by
+    // the failed attempts that led to recovery. Durable Object cleanup is best-effort
+    // because the password reset itself has already been verified against D1.
+    stage = 'clear-login-failures'
+    const ip = clientIp(context.req.raw.headers, context.req.url)
+    await Promise.allSettled(users.map((user) => clearLoginFailuresRuntime(context.env, ip, user.username)))
     return context.json({ ok: true, count })
   } catch (error) {
     const code = error instanceof Error ? error.message : 'APP_PASSWORD_RECOVERY_FAILED'
+    console.error('App password recovery failed', { stage, code })
     const status = authBodyErrorStatus(code)
-    return context.json({ error: status === 500 ? 'APP_PASSWORD_RECOVERY_FAILED' : code }, status)
+    return context.json({ error: status === 500 ? 'APP_PASSWORD_RECOVERY_FAILED' : code, stage }, status)
   }
 })
 
