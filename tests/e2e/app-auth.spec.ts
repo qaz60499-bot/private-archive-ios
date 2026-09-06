@@ -246,6 +246,13 @@ test('strict app-account auth covers bootstrap, sessions, roles, switching, disa
   expect((await page.request.get('/api/auth/me')).status()).toBe(401)
   expect((await memberApi.get('/api/auth/me')).status()).toBe(401)
 
+  await page.goto('/?app=personal-desktop')
+  await expect(page.getByRole('heading', { name: '登录私人档案' })).toBeVisible()
+  await page.getByLabel('用户名').fill('Owner')
+  await page.getByLabel('密码').fill(simplePassword)
+  await page.getByRole('button', { name: '登录' }).click()
+  await expect(page.getByRole('button', { name: '当前账号 Joye Owner' })).toBeVisible()
+
   const resetOwner = await newApi(undefined, '203.0.113.32')
   expect((await resetOwner.post('/api/auth/login', { data: { username: 'Owner', password: ownerPassword } })).status()).toBe(401)
   expect((await resetOwner.post('/api/auth/login', { data: { username: 'Owner', password: simplePassword } })).status()).toBe(200)

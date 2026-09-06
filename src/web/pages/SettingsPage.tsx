@@ -342,7 +342,7 @@ export function SettingsPage() {
         <div className="account-create-grid">
           <label><span>用户名</span><input value={accountUsername} onChange={(event) => setAccountUsername(event.target.value)} placeholder="family" autoComplete="off" /></label>
           <label><span>显示名称</span><input value={accountDisplayName} onChange={(event) => setAccountDisplayName(event.target.value)} placeholder="Family" autoComplete="off" /></label>
-          <label><span>初始密码</span><input value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} type="password" minLength={10} autoComplete="new-password" placeholder="至少 9 个字符" /></label>
+          <label><span>初始密码</span><input value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} type="password" minLength={9} autoComplete="new-password" placeholder="至少 9 个字符" /></label>
           <label><span>初始权限</span><select value={accountPreset} onChange={(event) => setAccountPreset(event.target.value as 'FULL' | 'VIEWER' | 'UPLOAD_ONLY')}><option value="VIEWER">只读 · 可看全部</option><option value="UPLOAD_ONLY">仅上传 · 不可浏览</option><option value="FULL">完整成员 · 可读写</option></select></label>
           <button className="primary-button" type="button" disabled={savingAccount || !accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9} onClick={() => void createAccount()}>{savingAccount ? <LoaderCircle className="spin" /> : <Plus />}{savingAccount ? '创建中' : '创建账号'}</button>
         </div>

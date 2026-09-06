@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 const authGate = readFileSync(new URL('../../src/web/components/AuthGate.tsx', import.meta.url), 'utf8')
+const settingsPage = readFileSync(new URL('../../src/web/pages/SettingsPage.tsx', import.meta.url), 'utf8')
 
 describe('application login autofill regression guard', () => {
   it('submits the live DOM values so browser and iOS password autofill are accepted', () => {
@@ -18,5 +19,12 @@ describe('application login autofill regression guard', () => {
     expect(authGate).toContain('autoComplete="username"')
     expect(authGate).toContain("autoComplete={auth.initialized ? 'current-password' : 'new-password'}")
     expect(authGate).toContain('passwordInput.current?.focus()')
+  })
+
+  it('keeps client password constraints aligned with the worker 9-character minimum', () => {
+    expect(authGate).toContain('minLength={9} required')
+    expect(authGate).not.toContain('minLength={10}')
+    expect(settingsPage).toContain('minLength={9} autoComplete="new-password"')
+    expect(settingsPage).not.toContain('minLength={10}')
   })
 })
