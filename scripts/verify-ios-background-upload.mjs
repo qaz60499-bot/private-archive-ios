@@ -28,6 +28,7 @@ assert(appDelegateSource.includes('handleEventsForBackgroundURLSession identifie
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.handleBackgroundEvents'), 'AppDelegate must forward background URLSession wakeups to the upload manager')
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'AppDelegate must reconcile uploads on background transition')
 assert(source.includes('PRIVATE_ARCHIVE_API_BASE_OVERRIDE') && source.includes('PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED'), 'Debug build must include the simulator reserve-to-content protocol smoke')
+assert(source.includes('PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE') && source.includes('return "pa_account=protocol-smoke-session"'), 'Debug localhost protocol smoke must not depend on Simulator IP-cookie persistence')
 assert(source.includes('private lazy var protocolSmokeContentSession: URLSession'), 'Debug protocol smoke must have a localhost-capable delegated content transport')
 assert(appDelegateSource.includes('runNativeProtocolRuntimeSmoke()'), 'Debug app launch must invoke the native protocol smoke when requested')
 
