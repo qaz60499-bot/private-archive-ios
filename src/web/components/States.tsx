@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { ArchiveX, CircleAlert, Images, LoaderCircle, RefreshCw } from 'lucide-react'
 
 export function SkeletonGrid() {
@@ -17,6 +18,18 @@ export function PageIntro({ eyebrow, title, description, count }: { eyebrow: str
 }
 
 export function LoadMore({ loading, onLoad }: { loading: boolean; onLoad: () => void }) {
-  return <div className="load-more-row" aria-live="polite"><button className="secondary-button" type="button" disabled={loading} onClick={onLoad}>{loading && <LoaderCircle className="spin" />}<span>{loading ? '正在载入…' : '载入更早档案'}</span></button></div>
+  const sentinelRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const target = sentinelRef.current
+    if (!target || loading || typeof IntersectionObserver === 'undefined') return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) onLoad()
+    }, { rootMargin: '320px 0px' })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [loading, onLoad])
+
+  return <div ref={sentinelRef} className="load-more-row" aria-live="polite" aria-busy={loading}>{loading ? <><LoaderCircle className="spin" /><span>正在载入更早档案…</span></> : <span className="sr-only">继续向下滚动会自动载入更早档案</span>}</div>
 }
 
