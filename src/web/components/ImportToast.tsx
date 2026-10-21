@@ -1,10 +1,7 @@
-import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { CheckCircle2, LoaderCircle, X, XCircle } from 'lucide-react'
 import { useArchive } from '../context/ArchiveContext'
-import { subscribeUploadScheduler } from '../lib/offline/processor'
-import { listLocalUploads } from '../lib/offline/store'
-import type { LocalUploadJob } from '../types'
+import { useLocalUploads } from '../lib/offline/use-local-uploads'
 
 // App-level import feedback. "Queued" means the bytes have been persisted in a
 // recovery queue (native iOS staging or browser storage); it is deliberately distinct from Telegram confirmation.
@@ -12,28 +9,9 @@ import type { LocalUploadJob } from '../types'
 // deduplicated by reusing an existing Telegram object, or fails and needs attention.
 export function ImportToast() {
   const { importStatus, dismissImportStatus } = useArchive()
-  const [jobs, setJobs] = useState<LocalUploadJob[]>([])
-
   const batchId = importStatus?.batchId
-  useEffect(() => {
-    if (!batchId) return
-    let disposed = false
-    const reload = async () => {
-      const all = await listLocalUploads()
-      if (!disposed) setJobs(all.filter((job) => job.batchId === batchId))
-    }
-    void reload()
-    const unsubscribe = subscribeUploadScheduler(() => void reload())
-    const onNativeState = () => void reload()
-    window.addEventListener('private-archive:native-upload-state', onNativeState)
-    const timer = window.setInterval(() => void reload(), 1500)
-    return () => {
-      disposed = true
-      unsubscribe()
-      window.removeEventListener('private-archive:native-upload-state', onNativeState)
-      window.clearInterval(timer)
-    }
-  }, [batchId])
+  const { jobs: allJobs } = useLocalUploads(Boolean(batchId))
+  const jobs = batchId ? allJobs.filter((job) => job.batchId === batchId) : []
 
   if (typeof document === 'undefined' || !importStatus) return null
   const { active, total, processed, queued, phase, error } = importStatus

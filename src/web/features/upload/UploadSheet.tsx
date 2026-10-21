@@ -1,18 +1,60 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Camera, CheckCircle2, CloudDownload, FileUp, FolderOpen, LoaderCircle, Pause, Play, RotateCcw, Trash2, Video, WifiOff, X, XCircle } from 'lucide-react'
 import { useArchive } from '../../context/ArchiveContext'
 import { api } from '../../lib/api'
 import { telegramUserGroupBridge } from '../../lib/telegram-user-group'
 import { summarizeImportErrors } from '../../lib/import-error-summary'
-import { canUseIosBackgroundUpload } from '../../lib/native-background-upload'
+import { canUseIosBackgroundUpload, getNativeUploadAuthenticationPending, getQuarantinedNativeUploadCount } from '../../lib/native-background-upload'
 import { isNativeApp, nativePlatform } from '../../lib/native-platform'
 import { summarizeUploadBatches, type UploadBatchSummary } from '../../lib/offline/batch'
-import { listLocalUploads, removeLocalUpload } from '../../lib/offline/store'
+import { useLocalUploads } from '../../lib/offline/use-local-uploads'
+import { removeLocalUpload } from '../../lib/offline/store'
 import {
   cancelLocalUpload, cancelUploadBatch, deleteUploadBatch, pauseLocalUpload, pauseUploadBatch, resumeLocalUpload, resumeUploadBatch,
-  retryFailedUploadBatch, subscribeUploadScheduler,
+  retryFailedUploadBatch,
 } from '../../lib/offline/processor'
 import type { LocalUploadJob, StorageBackend } from '../../types'
+
+const NATIVE_QUARANTINE_EVENT = 'private-archive:native-upload-quarantined'
+const NATIVE_AUTH_PENDING_EVENT = 'private-archive:native-upload-auth-pending'
+
+let quarantineSnapshot = getQuarantinedNativeUploadCount()
+let authenticationPendingSnapshot = getNativeUploadAuthenticationPending()
+const quarantineSubscribers = new Set<() => void>()
+const authenticationPendingSubscribers = new Set<() => void>()
+
+function onQuarantineChange(event: Event): void {
+  const count = (event as CustomEvent<{ count?: unknown }>).detail?.count
+  quarantineSnapshot = typeof count === 'number' && Number.isInteger(count) ? Math.max(0, count) : getQuarantinedNativeUploadCount()
+  quarantineSubscribers.forEach((listener) => listener())
+}
+
+function onAuthenticationPendingChange(event: Event): void {
+  const pending = (event as CustomEvent<{ pending?: unknown }>).detail?.pending
+  authenticationPendingSnapshot = typeof pending === 'boolean' ? pending : getNativeUploadAuthenticationPending()
+  authenticationPendingSubscribers.forEach((listener) => listener())
+}
+
+function subscribeNativeQuarantine(listener: () => void): () => void {
+  quarantineSubscribers.add(listener)
+  if (quarantineSubscribers.size === 1) window.addEventListener(NATIVE_QUARANTINE_EVENT, onQuarantineChange)
+  return () => {
+    quarantineSubscribers.delete(listener)
+    if (quarantineSubscribers.size === 0) window.removeEventListener(NATIVE_QUARANTINE_EVENT, onQuarantineChange)
+  }
+}
+
+function subscribeNativeAuthPending(listener: () => void): () => void {
+  authenticationPendingSubscribers.add(listener)
+  if (authenticationPendingSubscribers.size === 1) window.addEventListener(NATIVE_AUTH_PENDING_EVENT, onAuthenticationPendingChange)
+  return () => {
+    authenticationPendingSubscribers.delete(listener)
+    if (authenticationPendingSubscribers.size === 0) window.removeEventListener(NATIVE_AUTH_PENDING_EVENT, onAuthenticationPendingChange)
+  }
+}
+
+function getQuarantineSnapshot(): number { return quarantineSnapshot }
+function getAuthenticationPendingSnapshot(): boolean { return authenticationPendingSnapshot }
 
 const stageLabels: Record<LocalUploadJob['stage'], string> = {
   registered: '等待准备', preparing: '读取元数据与指纹', reserving: '核对精确重复', preview: '保存预览', original: '保存 Telegram 原件', completed: '已完成',
@@ -67,19 +109,19 @@ function BatchSection({ batch, compact, reload }: { batch: UploadBatchSummary; c
 }
 
 export function UploadQueue({ compact = false, suspended = false }: { compact?: boolean; suspended?: boolean }) {
-  const [jobs, setJobs] = useState<LocalUploadJob[]>([])
-  const reload = async () => setJobs(await listLocalUploads())
-  useEffect(() => {
-    if (suspended) return
-    void listLocalUploads().then(setJobs)
-    const unsubscribe = subscribeUploadScheduler(() => void reload())
-    const timer = window.setInterval(() => void reload(), 2_000)
-    return () => { unsubscribe(); window.clearInterval(timer) }
-  }, [suspended])
+  const { jobs, reload } = useLocalUploads(!suspended)
+  const quarantineCount = useSyncExternalStore(subscribeNativeQuarantine, getQuarantineSnapshot, getQuarantineSnapshot)
+  const authenticationPending = useSyncExternalStore(subscribeNativeAuthPending, getAuthenticationPendingSnapshot, getAuthenticationPendingSnapshot)
   if (suspended) return null
   const batches = summarizeUploadBatches(jobs)
-  if (!jobs.length) return compact ? null : <p className="queue-empty">本机暂无待上传项目。</p>
-  return <div className={`upload-queue${compact ? ' compact' : ''}`} aria-live="polite">{batches.slice(0, compact ? 1 : undefined).map((batch) => <BatchSection key={batch.id} batch={batch} compact={compact} reload={reload} />)}</div>
+  const quarantineNotice = quarantineCount > 0
+    ? <p className="offline-notice upload-quarantine-notice" role="status">有 {quarantineCount} 项旧版上传尚未确认所属账号，原件已保留，暂未自动上传。</p>
+    : null
+  const authenticationNotice = authenticationPending
+    ? <p className="offline-notice upload-auth-pending-notice" role="status">后台上传正在等待登录验证，原件与队列已保留；网络恢复后会重试。</p>
+    : null
+  if (!jobs.length) return <>{quarantineNotice}{authenticationNotice}{compact ? null : <p className="queue-empty">本机暂无待上传项目。</p>}</>
+  return <>{quarantineNotice}{authenticationNotice}<div className={`upload-queue${compact ? ' compact' : ''}`} aria-live="polite">{batches.slice(0, compact ? 1 : undefined).map((batch) => <BatchSection key={batch.id} batch={batch} compact={compact} reload={reload} />)}</div></>
 }
 
 export function UploadSheet() {
@@ -173,7 +215,7 @@ export function UploadSheet() {
         <label className={storageBackend === 'telegram_bot' ? 'active' : ''}><input type="radio" name="upload-storage-backend" value="telegram_bot" checked={storageBackend === 'telegram_bot'} onChange={() => setStorageBackend('telegram_bot')} /><strong>Telegram Bot</strong><small>兼容 / 备用 · 新文件仅建议 ≤20 MB</small></label>
       </div>
       {storageBackend === 'telegram_user_group' && !telegramUserGroupBridge.available ? <p className="offline-notice"><WifiOff />私人群组上传需要 Windows 客户端里的 Telegram Storage Bridge。手机端请直接把文件分享到 Telegram 的 <b>ai</b> 私人群组，Windows 客户端会自动补扫导入；也可以手动切换到 Bot 存储小文件。</p> : null}
-      {canUseIosBackgroundUpload(storageBackend) ? <p className="native-background-note"><CheckCircle2 />Bot 上传已使用 iOS 原生后台传输。锁屏或切换到其他 App 后可继续；如果从多任务界面强制划掉 Private Archive，iOS 会停止后台任务，重新打开后会恢复。</p> : null}
+      {canUseIosBackgroundUpload(storageBackend) ? <p className="native-background-note"><CheckCircle2 />Bot 上传已使用 iOS 原生后台传输。锁屏或切换到其他 App 后可继续；如果从多任务界面强制划掉 Private Adventure，iOS 会停止后台任务，重新打开后会恢复。</p> : null}
       {mobile ? <div className="mobile-native-import">
         <div className={`drop-zone mobile-photo-picker${busy ? ' is-importing' : ''}`}>
           {busy ? <LoaderCircle className="spin" /> : <FileUp />}<strong>{busy ? '后台正在加入，可继续选择更多照片' : '照片 / iCloud Photos'}</strong><span>从系统照片库多选。原图里存在的拍摄时间、GPS、尺寸和相机信息会在上传准备阶段读取并保留。</span>

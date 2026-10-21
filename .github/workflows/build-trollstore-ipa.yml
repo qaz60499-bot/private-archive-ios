@@ -117,6 +117,7 @@ jobs:
           SIMCTL_CHILD_PRIVATE_ARCHIVE_API_BASE_OVERRIDE=http://127.0.0.1:18765 \
             xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
           wait_for_log_marker 'PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED' 45
+          wait_for_log_marker 'PRIVATE_ARCHIVE_ACCOUNT_ISOLATION_SMOKE_COMPLETED' 15
 
           kill "$SERVER_PID" 2>/dev/null || true
           wait "$SERVER_PID" 2>/dev/null || true
@@ -133,6 +134,17 @@ jobs:
             echo 'iOS runtime smoke detected an upload/picker failure or native crash' >&2
             exit 1
           fi
+
+      - name: Preserve simulator acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-Simulator-Acceptance-Logs
+          path: |
+            ${{ runner.temp }}/private-archive-*-smoke.log
+            ${{ runner.temp }}/private-archive-protocol-server.log
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Analyze iOS upload implementation
         run: |

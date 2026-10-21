@@ -9,7 +9,7 @@ const DesktopApp = lazy(() => import('./DesktopApp'))
 const SharePage = lazy(() => import('./pages/SharePage').then((module) => ({ default: module.SharePage })))
 
 function LoadingSurface() {
-  return <main className="surface-loading" aria-live="polite">正在打开 Private Archive…</main>
+  return <main className="surface-loading" aria-live="polite">正在打开 Private Adventure…</main>
 }
 
 export default function App() {

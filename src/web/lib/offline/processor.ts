@@ -3,7 +3,7 @@ import { sha256File } from '../file-hash'
 import { prepareMedia } from '../preview/media-metadata'
 import { telegramUserGroupBridge } from '../telegram-user-group'
 import {
-  getLocalUpload, getLocalUploadFile, getLocalUploadPreview, listLocalUploads, releaseLocalUploadPayload, removeLocalUpload, storeLocalUploadPreview, updateLocalUpload,
+  getLocalUpload, getLocalUploadFile, getLocalUploadPreview, getLocalUploadPrincipal, getLocalUploadPrincipalVersion, listLocalUploads, recoverInterruptedLocalPreparation, releaseLocalUploadPayload, removeLocalUpload, storeLocalUploadPreview, subscribeLocalUploadPrincipal, updateLocalUpload,
 } from './store'
 import type { LocalUploadJob } from '../../types'
 import { calculateRetryDelay, friendlyUploadError, getUploadSchedulerLimits as policyLimits } from './scheduler-policy'
@@ -18,6 +18,14 @@ const subscribers = new Set<() => void>()
 let schedulerPromise: Promise<void> | null = null
 let scheduledTimer: ReturnType<typeof globalThis.setTimeout> | undefined
 let throttledUntil = 0
+
+subscribeLocalUploadPrincipal(() => {
+  activePrepare.forEach((controller) => controller.abort())
+  activeUpload.forEach((controller) => controller.abort())
+  if (scheduledTimer) globalThis.clearTimeout(scheduledTimer)
+  scheduledTimer = undefined
+  notify()
+})
 
 export function getUploadSchedulerLimits(mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches) {
   const connection = (navigator as Navigator & { connection?: { effectiveType?: string; saveData?: boolean; downlink?: number } }).connection
@@ -46,10 +54,13 @@ function isTransient(error: unknown): boolean {
 }
 
 async function reconcileCanceledReservation(job: LocalUploadJob): Promise<void> {
+  const principalVersion = getLocalUploadPrincipalVersion()
+  const stillOwned = () => job.principalId === getLocalUploadPrincipal() && principalVersion === getLocalUploadPrincipalVersion()
   const assetId = job.remoteAssetId
-  if (!assetId || !navigator.onLine) return
+  if (!assetId || !navigator.onLine || !stillOwned()) return
   try {
     const cleanup = await api.discardUnstoredAssets([assetId])
+    if (!stillOwned()) return
     if (cleanup.discarded > 0) {
       if (job.nativeBackground) await removeNativeBackgroundTransfer(job.id).catch(() => undefined)
       await updateLocalUpload(job.id, {
@@ -61,6 +72,7 @@ async function reconcileCanceledReservation(job: LocalUploadJob): Promise<void> 
 
     try {
       const { asset } = await api.getAsset(assetId)
+      if (!stillOwned()) return
       if (asset.status === 'trashed') {
         if (job.nativeBackground) await removeNativeBackgroundTransfer(job.id).catch(() => undefined)
         await updateLocalUpload(job.id, { remoteAssetId: undefined, uploadToken: undefined })
@@ -98,6 +110,7 @@ async function prepareLocalUpload(job: LocalUploadJob): Promise<void> {
   activePrepare.set(job.id, controller)
   try {
     const file = await getLocalUploadFile(job)
+    if (controller.signal.aborted) return
     if (!file) throw new Error(job.transientPayload ? '手机快速上传的原件已因页面刷新或关闭而释放，请重新选择该文件。' : '本地文件副本不可用，请移除后重新选择原文件。')
     await updateLocalUpload(job.id, { prepareStatus: 'preparing', stage: 'preparing', progress: 5, error: undefined })
     notify()
@@ -111,6 +124,7 @@ async function prepareLocalUpload(job: LocalUploadJob): Promise<void> {
   } catch (error) {
     if (!controller.signal.aborted) await updateLocalUpload(job.id, { prepareStatus: 'failed', status: 'failed', error: friendlyUploadError(error) })
   } finally {
+    if (controller.signal.aborted) await recoverInterruptedLocalPreparation(job)
     activePrepare.delete(job.id)
     notify()
     void wakeUploadScheduler('prepare-finished')
@@ -120,6 +134,7 @@ async function prepareLocalUpload(job: LocalUploadJob): Promise<void> {
 async function processLocalUploadById(id: string, expectedContentHash?: string): Promise<boolean> {
   if (activeUpload.has(id)) return false
   const controller = new AbortController()
+  const principalVersion = getLocalUploadPrincipalVersion()
   activeUpload.set(id, controller)
   if (expectedContentHash) activeUploadContentHashes.set(id, expectedContentHash)
   let job: LocalUploadJob | undefined
@@ -130,7 +145,7 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
     activeUploadContentHashes.delete(id)
     throw error
   }
-  if (!job || job.controlState !== 'active' || job.prepareStatus !== 'ready') {
+  if (!job || controller.signal.aborted || job.controlState !== 'active' || job.prepareStatus !== 'ready') {
     activeUpload.delete(id)
     activeUploadContentHashes.delete(id)
     return false
@@ -147,9 +162,16 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
   }
   let assetId = job.remoteAssetId
   let uploadToken = job.uploadToken
+  const assertActive = () => {
+    if (controller.signal.aborted || principalVersion !== getLocalUploadPrincipalVersion() || job.principalId !== getLocalUploadPrincipal()) {
+      throw new ApiError(0, 'UPLOAD_ACCOUNT_CHANGED')
+    }
+  }
   try {
+    assertActive()
     if (!navigator.onLine) throw new ApiError(0, 'NETWORK_OFFLINE')
     const file = await getLocalUploadFile(job)
+    assertActive()
     if (!file) throw new Error(job.transientPayload ? '手机快速上传的原件已因页面刷新或关闭而释放，请重新选择该文件。' : '本地文件副本不可用，请移除后重新选择原文件。')
     await updateLocalUpload(id, {
       status: job.attempts ? 'retrying' : 'uploading', stage: 'reserving', progress: Math.max(job.progress, 18),
@@ -158,8 +180,10 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
     notify()
 
     const reserve = async (force = false): Promise<'ready' | 'duplicate'> => {
+      assertActive()
       if (!force && assetId && uploadToken) return 'ready'
       const reservation = await api.reserve(job.metadata, controller.signal)
+      assertActive()
       if (reservation.duplicate) {
         await updateLocalUpload(id, {
           status: 'done', stage: 'completed', progress: 100, deduplicated: true,
@@ -181,11 +205,15 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
 
     const withFreshToken = async (operation: () => Promise<unknown>): Promise<boolean> => {
       try {
+        assertActive()
         await operation()
+        assertActive()
       } catch (error) {
         if (error instanceof ApiError && error.code === 'UPLOAD_TOKEN_INVALID_OR_EXPIRED') {
           if (await reserve(true) === 'duplicate') return false
+          assertActive()
           await operation()
+          assertActive()
           return true
         }
         throw error
@@ -194,18 +222,22 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
     }
 
     await updateLocalUpload(id, { stage: 'original', progress: 48 })
+    assertActive()
     if (job.storageBackend === 'telegram_user_group') {
       if (!contentHash) throw new Error('上传前未生成内容指纹。')
       const receiptAssetId = assetId as string
       const receipt = await telegramUserGroupBridge.upload(receiptAssetId, uploadToken as string, file, contentHash, controller.signal)
+      assertActive()
       await updateLocalUpload(id, { progress: 82 })
       try {
-        await api.commitUserGroupUpload(receiptAssetId, uploadToken as string, receipt)
+        assertActive()
+        await api.commitUserGroupUpload(receiptAssetId, uploadToken as string, receipt, controller.signal)
       } catch (error) {
         if (!(error instanceof ApiError && error.code === 'UPLOAD_TOKEN_INVALID_OR_EXPIRED')) throw error
         if (await reserve(true) === 'duplicate') return true
         if (assetId !== receiptAssetId) throw new Error('Telegram 已上传，但远端预约发生变化；已停止自动重试以避免错绑文件。', { cause: error })
-        await api.commitUserGroupUpload(receiptAssetId, uploadToken as string, receipt)
+        assertActive()
+        await api.commitUserGroupUpload(receiptAssetId, uploadToken as string, receipt, controller.signal)
       }
       await updateLocalUpload(id, { progress: 92, previewUploaded: ['photo', 'video'].includes(job.mediaType) || undefined })
     } else {
@@ -228,11 +260,13 @@ async function processLocalUploadById(id: string, expectedContentHash?: string):
       }
     }
 
+    assertActive()
     await updateLocalUpload(id, { status: 'done', stage: 'completed', progress: 100, error: undefined, uploadToken: undefined, nextAttemptAt: undefined })
     await releaseLocalUploadPayload(id)
     notifyArchiveCommitted()
     return true
   } catch (error) {
+    if (controller.signal.aborted || principalVersion !== getLocalUploadPrincipalVersion()) return false
     const latest = await getLocalUpload(id)
     if (latest?.controlState === 'paused' || latest?.controlState === 'canceled') return false
     const transient = isTransient(error)
@@ -264,10 +298,12 @@ function due(job: LocalUploadJob): boolean {
 }
 
 async function runSchedulerPass(): Promise<void> {
+  const principalVersion = getLocalUploadPrincipalVersion()
   if (!navigator.onLine) return
   const jobs = await listLocalUploads()
   const canceledReservations = jobs.filter((job) => job.controlState === 'canceled' && Boolean(job.remoteAssetId)).slice(0, 8)
   if (canceledReservations.length) await Promise.allSettled(canceledReservations.map(reconcileCanceledReservation))
+  if (principalVersion !== getLocalUploadPrincipalVersion()) return
   const limits = getUploadSchedulerLimits()
   const eligible = jobs.filter((job) => !job.nativeBackground && job.controlState === 'active' && !['done', 'failed'].includes(job.status) && due(job))
   const prepareSlots = Math.max(0, limits.prepare - activePrepare.size)
@@ -315,6 +351,7 @@ export function resumePendingUploads(): Promise<void> {
 
 export async function pauseLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
+  if (!job) return
   if (job?.nativeBackground) await pauseNativeBackgroundTransfer(id)
   await updateLocalUpload(id, {
     controlState: 'paused', status: 'paused', error: '已暂停，原件仍安全保存在本机。',
@@ -328,6 +365,7 @@ export async function pauseLocalUpload(id: string): Promise<void> {
 
 export async function resumeLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
+  if (!job) return
   if (job?.nativeBackground) {
     try {
       await resumeNativeBackgroundTransfer(job)
@@ -350,6 +388,7 @@ export async function resumeLocalUpload(id: string): Promise<void> {
 
 export async function cancelLocalUpload(id: string): Promise<void> {
   const job = await getLocalUpload(id)
+  if (!job) return
   activePrepare.get(id)?.abort()
   activeUpload.get(id)?.abort()
   if (job?.nativeBackground) await cancelNativeBackgroundTransfer(id)
@@ -386,6 +425,7 @@ export async function cancelUploadBatch(batchId: string): Promise<void> {
 }
 
 export async function deleteUploadBatch(batchId: string): Promise<void> {
+  const principalVersion = getLocalUploadPrincipalVersion()
   const jobs = (await listLocalUploads()).filter((job) => job.batchId === batchId)
   if (!jobs.length) return
   const unfinished = jobs.filter((job) => job.status !== 'done' && job.controlState !== 'canceled')
@@ -397,6 +437,7 @@ export async function deleteUploadBatch(batchId: string): Promise<void> {
   const orphanReservationIds = [...new Set(jobs
     .filter((job) => job.status !== 'done' && job.remoteAssetId)
     .map((job) => job.remoteAssetId as string))]
+  if (principalVersion !== getLocalUploadPrincipalVersion()) return
   if (orphanReservationIds.length && navigator.onLine) {
     await api.discardUnstoredAssets(orphanReservationIds).catch(() => undefined)
   }

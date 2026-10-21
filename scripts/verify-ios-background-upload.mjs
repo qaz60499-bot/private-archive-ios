@@ -28,7 +28,7 @@ assert(appDelegateSource.includes('handleEventsForBackgroundURLSession identifie
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.handleBackgroundEvents'), 'AppDelegate must forward background URLSession wakeups to the upload manager')
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'AppDelegate must reconcile uploads on background transition')
 assert(source.includes('PRIVATE_ARCHIVE_API_BASE_OVERRIDE') && source.includes('PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED'), 'Debug build must include the simulator reserve-to-content protocol smoke')
-assert(source.includes('PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE') && source.includes('return "pa_account=protocol-smoke-session"'), 'Debug localhost protocol smoke must not depend on Simulator IP-cookie persistence')
+assert(source.includes('PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE') && source.includes('authenticatePrincipal("protocol-smoke", cookies: ["pa_account=stale-account", "pa_account=protocol-smoke-session"]'), 'Debug localhost protocol smoke must validate stale and current explicit cookies without depending on Simulator IP-cookie persistence')
 assert(source.includes('private lazy var protocolSmokeContentSession: URLSession'), 'Debug protocol smoke must have a localhost-capable delegated content transport')
 assert(appDelegateSource.includes('runNativeProtocolRuntimeSmoke()'), 'Debug app launch must invoke the native protocol smoke when requested')
 
@@ -73,7 +73,7 @@ const reserve = section('private func scheduleReserve(', 'private func handleRes
 assert(reserve.includes('foregroundSession.dataTask(with: request)'), 'reservation must use a normal data task so the response/token is handled in one process callback')
 assert(reserve.includes('request.httpBody = payload'), 'foreground reservation must send its bounded JSON body directly')
 assert(reserve.includes('reserveTasks[record.id] === task'), 'reservation callback must reject only an actually superseded foreground task')
-assert(reserve.includes('cookieOverride ?? cookieHeader()'), 'reservation recovery must be able to reuse the request cookie')
+assert(reserve.includes('cookieHeader(for: record, capturedCookie: cookieOverride)'), 'reservation recovery must bind captured cookies to the persisted task owner')
 assert(reserve.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'reserve scheduling must recheck active state before task resume')
 
 const reserveResult = section('private func handleReserveResult(', 'private func contentUploadSession()')
@@ -121,7 +121,7 @@ const completion = section('private func complete(', 'private func cleanupFiles(
 assert(completion.includes('value.status != "done", value.status != "failed", value.status != "paused"'), 'completion must not overwrite paused/failed jobs')
 assert(completion.includes('value.contentTaskToken = nil'), 'successful completion must release the content-task generation token')
 
-const finishJob = section('func finishJob(', 'func listJobs()')
+const finishJob = section('func finishJob(', 'func listJobs(')
 assert(finishJob.includes('if value.status == "failed" || value.status == "done"'), 'finishJob must not resurrect a canceled/completed job')
 assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'finishJob must preserve pause state while hashing/staging completes')
 assert(finishJob.includes('self.nativeUploadErrorCode(error) == 9'), 'finishJob must not turn a temporary auth gap into a failed staged original')
@@ -138,7 +138,7 @@ assert(pauseAndCancel.includes('value.status != "done", value.status != "failed"
 assert(pauseAndCancel.includes('value.controlGeneration = generation'), 'pause must advance the desired-control generation')
 assert(pauseAndCancel.includes('expectedControlGeneration: generation') && pauseAndCancel.includes('expectedStatus: "paused"'), 'late pause enumeration must not suspend a newer resumed task')
 const cancel = section('func cancelJob(', 'func removeJob(')
-assert(cancel.includes('guard var value = records[id], value.status != "done"'), 'cancel must not overwrite a completed upload')
+assert(cancel.includes('guard var value = records[id]') && cancel.includes('value.status != "done" else { return nil }'), 'cancel must not overwrite a completed upload')
 assert(cancel.indexOf('value.status = "failed"') < cancel.indexOf('performOnTasks(id: id, action: { $0.cancel() })'), 'cancel state must be serialized before task cancellation callbacks')
 
 const destructiveOriginalDeletes = [...source.matchAll(/removeItem\(at: originalURL\(id\)\)/g)]

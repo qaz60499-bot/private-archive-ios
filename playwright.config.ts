@@ -17,6 +17,9 @@ export default defineConfig({
     baseURL: 'http://127.0.0.1:8799',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
+    launchOptions: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }
+      : undefined,
     // Browser-level routing assertions must see network failures deterministically.
     // Blocking the PWA service worker in E2E prevents a cached preview from bypassing
     // page.route() and keeps each fresh Playwright process isolated from SW state.

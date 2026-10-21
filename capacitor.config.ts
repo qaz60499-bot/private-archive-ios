@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli'
 
 const config: CapacitorConfig = {
   appId: 'cd.cc.joye.photo',
-  appName: 'Private Archive',
+  appName: 'Private Adventure',
   webDir: 'dist',
   server: {
     hostname: 'localhost',

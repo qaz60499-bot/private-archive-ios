@@ -46,6 +46,9 @@ async function authenticatedFetch(path: string, init?: RequestInit, timeoutMs = 
       credentials: native ? 'include' : 'same-origin',
       redirect: 'manual',
     })
+    // Some native fetch bridges can deliver a response after abort. Do not let an
+    // old account's delayed response expire the newly selected account or continue.
+    if (init?.signal?.aborted) throw new ApiError(0, 'UPLOAD_ABORTED')
     if (response.type === 'opaqueredirect' || response.status === 0) {
       throw new ApiError(401, 'ACCESS_SIGN_IN_REQUIRED')
     }
@@ -192,8 +195,8 @@ export const api = {
   settings: () => request<IntegrationStatus>('/api/settings/status'),
   storagePreference: () => request<{ defaultStorageBackend: StorageBackend }>('/api/storage-preference'),
   setStoragePreference: (defaultStorageBackend: StorageBackend) => request<{ ok: true; defaultStorageBackend: StorageBackend }>('/api/storage-preference', { method: 'PUT', body: JSON.stringify({ defaultStorageBackend }) }),
-  commitUserGroupUpload: async (assetId: string, token: string, receipt: { chatId: string; messageId: number; mediaId?: string | null; sizeBytes: number }) => {
-    const result = await request<{ asset: Asset | null; alreadyStored: boolean }>(`/api/assets/${assetId}/user-group-commit`, { method: 'POST', headers: { 'X-Upload-Token': token }, body: JSON.stringify(receipt) })
+  commitUserGroupUpload: async (assetId: string, token: string, receipt: { chatId: string; messageId: number; mediaId?: string | null; sizeBytes: number }, signal?: AbortSignal) => {
+    const result = await request<{ asset: Asset | null; alreadyStored: boolean }>(`/api/assets/${assetId}/user-group-commit`, { method: 'POST', headers: { 'X-Upload-Token': token }, body: JSON.stringify(receipt), signal })
     return { ...result, asset: result.asset ? normalizeAssetForSurface(result.asset) : null }
   },
   updateUserGroupRuntime: (runtime: { connectionStatus: 'disconnected' | 'auth_required' | 'connected' | 'syncing' | 'error'; storageChatId?: string | null; storageChatTitle?: string | null; lastSyncAt?: string | null; lastError?: string | null; lastAckMessageId?: number | null }) => request<{ ok: true; runtime: NonNullable<IntegrationStatus['storage']>['userGroup'] }>('/api/telegram/user-group/runtime', { method: 'POST', body: JSON.stringify(runtime) }),

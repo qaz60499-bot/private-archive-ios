@@ -1,9 +1,9 @@
 /* eslint-disable react-refresh/only-export-components */
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, ApiError } from '../lib/api'
 import { setLocalUploadPrincipal } from '../lib/offline/store'
 import { wakeUploadScheduler } from '../lib/offline/processor'
-import { syncIosBackgroundUploads } from '../lib/native-background-upload'
+import { setIosBackgroundUploadPrincipal, syncIosBackgroundUploads } from '../lib/native-background-upload'
 import { clearSensitivePrivateCaches } from '../lib/private-cache'
 import { clearNativeMediaCache } from '../lib/native-media'
 import type { AppAccount } from '../types'
@@ -52,9 +52,16 @@ function rememberAccount(account: AppAccount): KnownAccount[] {
   return next
 }
 
-function activateUploadPrincipal(account: AppAccount | null): void {
+export async function activateUploadPrincipal(account: AppAccount | null): Promise<void> {
+  // Invalidate/abort Web work before a login/logout request changes the shared cookie.
+  setLocalUploadPrincipal(null)
+  if (!account) {
+    await setIosBackgroundUploadPrincipal(null)
+    return
+  }
   setLocalUploadPrincipal(account?.id ?? null, { adoptLegacy: account?.role === 'OWNER' })
-  if (!account) return
+  // Native cookie validation is independent of a successful Web login. Its failure
+  // leaves native transfers gated; the existing visibility/recovery sync retries it.
   // Startup can restore the Web auth cookie after the native URLSession and Web
   // scheduler have already made their first pass. Reconcile immediately when the
   // principal becomes valid instead of waiting for another online/foreground event.
@@ -71,10 +78,12 @@ function friendlyAuthError(error: unknown): string {
     case 'REQUEST_TIMEOUT': return '登录请求超时，请检查网络后重试。'
     case 'ACCESS_OR_NETWORK_FAILED': return '当前无法连接登录服务，请检查网络后重试。'
     case 'NETWORK_OFFLINE': return '当前设备处于离线状态。'
+    case 'UPLOAD_ACCOUNT_SESSION_UNAVAILABLE':
+    case 'UPLOAD_ACCOUNT_SESSION_MISMATCH': return '后台上传登录会话尚未就绪，请重试登录。已有原件和上传队列已保留。'
     case 'USERNAME_EXISTS': return '这个用户名已经存在。'
     case 'USERNAME_INVALID': return '用户名使用 3–40 个字母、数字、点、下划线或短横线。'
     case 'DISPLAY_NAME_INVALID': return '请输入有效的显示名称。'
-    case 'PASSWORD_INVALID': return '密码至少需要 9 个字符。'
+    case 'PASSWORD_INVALID': return '密码长度必须为 9–256 个字符。'
     case 'APP_ALREADY_INITIALIZED': return 'Owner 已经初始化，请直接登录。'
     case 'APP_NOT_INITIALIZED': return '还没有初始化 Owner 账号。'
     case 'APP_OWNER_REQUIRED': return '这个操作需要 Owner 账号。'
@@ -83,6 +92,7 @@ function friendlyAuthError(error: unknown): string {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const authGeneration = useRef(0)
   const [loading, setLoading] = useState(true)
   const [initialized, setInitialized] = useState(false)
   const [user, setUser] = useState<AppAccount | null>(null)
@@ -91,56 +101,63 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [knownAccounts, setKnownAccounts] = useState<KnownAccount[]>(() => readKnownAccounts())
 
   const refresh = useCallback(async () => {
+    const generation = ++authGeneration.current
     setLoading(true)
     setError(null)
     try {
       const status = await api.authStatus()
+      if (generation !== authGeneration.current) return
+      await activateUploadPrincipal(status.user)
+      if (generation !== authGeneration.current) return
       setInitialized(status.initialized)
       setUser(status.user)
-      activateUploadPrincipal(status.user)
       setAccessError(false)
       if (status.user) setKnownAccounts(rememberAccount(status.user))
     } catch (caught) {
+      if (generation !== authGeneration.current) return
       if (caught instanceof ApiError && caught.code === 'ACCESS_SIGN_IN_REQUIRED') {
         setAccessError(true)
         setUser(null)
-        activateUploadPrincipal(null)
+        await activateUploadPrincipal(null)
       } else {
         setError(friendlyAuthError(caught))
       }
     } finally {
-      setLoading(false)
+      if (generation === authGeneration.current) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
     let active = true
-    void api.authStatus().then((status) => {
-      if (!active) return
+    const generation = ++authGeneration.current
+    void api.authStatus().then(async (status) => {
+      if (!active || generation !== authGeneration.current) return
+      await activateUploadPrincipal(status.user)
+      if (!active || generation !== authGeneration.current) return
       setInitialized(status.initialized)
       setUser(status.user)
-      activateUploadPrincipal(status.user)
       setAccessError(false)
       setError(null)
       if (status.user) setKnownAccounts(rememberAccount(status.user))
-    }).catch((caught) => {
-      if (!active) return
+    }).catch(async (caught) => {
+      if (!active || generation !== authGeneration.current) return
       if (caught instanceof ApiError && caught.code === 'ACCESS_SIGN_IN_REQUIRED') {
         setAccessError(true)
         setUser(null)
-        activateUploadPrincipal(null)
+        await activateUploadPrincipal(null)
       } else {
         setError(friendlyAuthError(caught))
       }
     }).finally(() => {
-      if (active) setLoading(false)
+      if (active && generation === authGeneration.current) setLoading(false)
     })
     return () => { active = false }
   }, [])
   useEffect(() => {
     const onAuthRequired = () => {
+      authGeneration.current += 1
       setUser(null)
-      activateUploadPrincipal(null)
+      void activateUploadPrincipal(null).catch(() => undefined)
       void clearSensitivePrivateCaches().catch(() => undefined)
       clearNativeMediaCache()
       setError('登录会话已过期，请重新登录。')
@@ -150,12 +167,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const bootstrap = useCallback(async (username: string, displayName: string, password: string) => {
+    const generation = ++authGeneration.current
     setError(null)
     try {
+      await activateUploadPrincipal(null)
       const result = await api.bootstrapAccount(username, displayName, password)
+      if (generation !== authGeneration.current) return
+      await activateUploadPrincipal(result.user)
+      if (generation !== authGeneration.current) return
       setInitialized(true)
       setUser(result.user)
-      activateUploadPrincipal(result.user)
       setKnownAccounts(rememberAccount(result.user))
     } catch (caught) {
       setError(friendlyAuthError(caught))
@@ -164,17 +185,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const login = useCallback(async (username: string, password: string) => {
+    const generation = ++authGeneration.current
     setError(null)
     clearNativeMediaCache()
     const cachePurge = clearSensitivePrivateCaches().catch(() => 0)
     try {
+      await activateUploadPrincipal(null)
       const [result] = await Promise.all([
         api.loginAccount(username, password),
         cachePurge,
       ])
+      if (generation !== authGeneration.current) return
+      await activateUploadPrincipal(result.user)
+      if (generation !== authGeneration.current) return
       setInitialized(true)
       setUser(result.user)
-      activateUploadPrincipal(result.user)
       setAccessError(false)
       setKnownAccounts(rememberAccount(result.user))
     } catch (caught) {
@@ -184,13 +209,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const logout = useCallback(async () => {
+    const generation = ++authGeneration.current
+    await activateUploadPrincipal(null)
     // Cache cleanup is independent from server-side session revocation. Start both
     // together so account switching does not wait for two serialized I/O phases.
     clearNativeMediaCache()
     const cachePurge = clearSensitivePrivateCaches().catch(() => 0)
     try { await api.logoutAccount() } catch { /* local state still signs out */ }
+    if (generation !== authGeneration.current) return
     setUser(null)
-    activateUploadPrincipal(null)
     setError(null)
     void cachePurge
   }, [])

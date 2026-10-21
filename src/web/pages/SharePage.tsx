@@ -70,7 +70,7 @@ export function SharePage() {
 
   return <main className="share-page">
     <header className="share-header">
-      <div><p className="eyebrow">PRIVATE ARCHIVE · SHARED VIEW</p><h1>{principal.displayName}</h1><p>只显示拥有授权的内容。共享访问不会进入 Owner 管理平面。</p></div>
+      <div><p className="eyebrow">PRIVATE ADVENTURE · SHARED VIEW</p><h1>{principal.displayName}</h1><p>只显示拥有授权的内容。共享访问不会进入 Owner 管理平面。</p></div>
       <LockKeyhole aria-hidden="true" />
     </header>
 

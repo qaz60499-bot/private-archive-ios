@@ -49,17 +49,31 @@ const INDEXEDDB_PAYLOAD_FALLBACK_MAX_BYTES = 64 * 1024 * 1024
 const transientPayloads = new Map<string, File>()
 let activePrincipalId: string | null = null
 let adoptLegacyUploads = false
+let principalVersion = 0
+const principalListeners = new Set<() => void>()
 
 type PayloadKind = 'original' | 'preview'
 
 export function setLocalUploadPrincipal(principalId: string | null, options: { adoptLegacy?: boolean } = {}): void {
+  const changed = activePrincipalId !== principalId
   activePrincipalId = principalId
   adoptLegacyUploads = Boolean(principalId && options.adoptLegacy)
+  if (changed) {
+    principalVersion += 1
+    principalListeners.forEach((listener) => listener())
+  }
+}
+
+export function getLocalUploadPrincipal(): string | null { return activePrincipalId }
+export function getLocalUploadPrincipalVersion(): number { return principalVersion }
+export function subscribeLocalUploadPrincipal(listener: () => void): () => void {
+  principalListeners.add(listener)
+  return () => principalListeners.delete(listener)
 }
 
 function visibleToActivePrincipal(job: LocalUploadJob): boolean {
   if (!activePrincipalId) return false
-  return job.principalId === activePrincipalId || (!job.principalId && adoptLegacyUploads)
+  return job.principalId === activePrincipalId || (!job.principalId && !job.nativeBackground && adoptLegacyUploads)
 }
 
 function payloadKey(id: string, kind: PayloadKind): string {
@@ -145,12 +159,14 @@ async function removeFromOpfs(path?: string): Promise<void> {
 
 export async function registerNativeLocalUpload(options: {
   id: string
+  principalId?: string
   batchId: string
   file: File
   mediaType: LocalUploadJob['mediaType']
   storageBackend?: StorageBackend
 }): Promise<LocalUploadJob> {
-  if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
+  const principalId = options.principalId ?? activePrincipalId
+  if (!principalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
   const now = new Date().toISOString()
   // Keep a second durable copy until the native background upload completes. The
   // native bridge is fed from a WebView File in chunks; if iOS terminates the app in
@@ -166,7 +182,7 @@ export async function registerNativeLocalUpload(options: {
     id: options.id,
     schemaVersion: 2,
     batchId: options.batchId,
-    principalId: activePrincipalId,
+    principalId,
     fileName: options.file.name,
     mimeType: options.file.type || 'application/octet-stream',
     sizeBytes: options.file.size,
@@ -207,6 +223,7 @@ export async function registerNativeLocalUpload(options: {
 
 export async function registerNativeLocalUploadMirror(options: {
   id: string
+  principalId: string
   batchId: string
   fileName: string
   mimeType: string
@@ -222,14 +239,18 @@ export async function registerNativeLocalUploadMirror(options: {
   createdAt: string
   updatedAt: string
 }): Promise<LocalUploadJob> {
-  if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
+  if (!activePrincipalId || options.principalId !== activePrincipalId) throw new Error('UPLOAD_ACCOUNT_CHANGED')
   const existing = await (await dbPromise).get('uploads', options.id)
-  if (existing) return normalizeLocalUpload(existing)
+  if (existing) {
+    if (existing.principalId !== options.principalId) throw new Error('UPLOAD_ACCOUNT_MISMATCH')
+    return normalizeLocalUpload(existing)
+  }
+  if (options.principalId !== activePrincipalId) throw new Error('UPLOAD_ACCOUNT_CHANGED')
   const job: LocalUploadJob = {
     id: options.id,
     schemaVersion: 2,
     batchId: options.batchId,
-    principalId: activePrincipalId,
+    principalId: options.principalId,
     fileName: options.fileName,
     mimeType: options.mimeType || 'application/octet-stream',
     sizeBytes: options.sizeBytes,
@@ -262,6 +283,7 @@ export async function registerNativeLocalUploadMirror(options: {
 
 export async function enqueueLocalUpload(options: {
   file: File
+  principalId?: string
   batchId: string
   mediaType: LocalUploadJob['mediaType']
   storageBackend?: StorageBackend
@@ -270,7 +292,8 @@ export async function enqueueLocalUpload(options: {
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
   const persistPayload = options.persistPayload !== false
-  if (!activePrincipalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
+  const principalId = options.principalId ?? activePrincipalId
+  if (!principalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
   const opfsPath = persistPayload ? await writeToOpfs(id, options.file) : undefined
   if (persistPayload && !opfsPath && options.file.size > INDEXEDDB_PAYLOAD_FALLBACK_MAX_BYTES) {
     throw new Error('当前浏览器缺少适合大文件的持久化存储能力。请使用支持 OPFS 的桌面客户端上传该文件。')
@@ -280,7 +303,7 @@ export async function enqueueLocalUpload(options: {
     id,
     schemaVersion: 2,
     batchId: options.batchId,
-    principalId: activePrincipalId,
+    principalId,
     fileName: options.file.name,
     mimeType: options.file.type || 'application/octet-stream',
     sizeBytes: options.file.size,
@@ -322,7 +345,9 @@ export async function enqueueLocalUpload(options: {
 
 export async function listLocalUploads(): Promise<LocalUploadJob[]> {
   if (!activePrincipalId) return []
+  const version = principalVersion
   const raw = await (await dbPromise).getAllFromIndex('uploads', 'by-updated')
+  if (version !== principalVersion) return []
   const jobs = raw.map((job) => normalizeLocalUpload(job))
   const visible = jobs.filter(visibleToActivePrincipal).map((job) => job.principalId ? job : { ...job, principalId: activePrincipalId as string })
   if (visible.some((job) => {
@@ -334,7 +359,9 @@ export async function listLocalUploads(): Promise<LocalUploadJob[]> {
 
 export async function getLocalUpload(id: string): Promise<LocalUploadJob | undefined> {
   if (!activePrincipalId) return undefined
+  const version = principalVersion
   const job = await (await dbPromise).get('uploads', id)
+  if (version !== principalVersion) return undefined
   if (!job) return undefined
   const normalized = normalizeLocalUpload(job)
   if (!visibleToActivePrincipal(normalized)) return undefined
@@ -371,6 +398,20 @@ export async function storeLocalUploadPreview(id: string, preview?: Blob): Promi
   }
 }
 
+// The old account is deliberately no longer active when its preparation is aborted.
+// Reset only this non-network stage under its persisted owner so selecting that
+// account again can resume; never change owner, payload or a newer completed stage.
+export async function recoverInterruptedLocalPreparation(job: LocalUploadJob): Promise<void> {
+  if (!job.principalId) return
+  const database = await dbPromise
+  const transaction = database.transaction('uploads', 'readwrite')
+  const current = await transaction.store.get(job.id)
+  if (current?.principalId === job.principalId && current.prepareStatus === 'preparing') {
+    await transaction.store.put({ ...current, prepareStatus: 'pending', stage: 'registered', updatedAt: new Date().toISOString() })
+  }
+  await transaction.done
+}
+
 export async function getLocalUploadPreview(job: LocalUploadJob): Promise<Blob | null> {
   if (!visibleToActivePrincipal(job)) return null
   const persisted = await readPayload(job.id, 'preview')
@@ -380,8 +421,10 @@ export async function getLocalUploadPreview(job: LocalUploadJob): Promise<Blob |
 
 export async function updateLocalUpload(id: string, patch: Partial<LocalUploadJob>): Promise<LocalUploadJob | undefined> {
   if (!activePrincipalId) return undefined
+  const version = principalVersion
   const database = await dbPromise
   const current = await database.get('uploads', id)
+  if (version !== principalVersion) return undefined
   if (!current) return undefined
   const normalizedCurrent = normalizeLocalUpload(current)
   if (!visibleToActivePrincipal(normalizedCurrent)) return undefined
@@ -410,7 +453,9 @@ export async function releaseLocalUploadPayload(id: string): Promise<void> {
 
 export async function getLocalUploadsByBatch(batchId: string): Promise<LocalUploadJob[]> {
   if (!activePrincipalId) return []
+  const version = principalVersion
   const jobs = await (await dbPromise).getAllFromIndex('uploads', 'by-batch', batchId)
+  if (version !== principalVersion) return []
   return jobs.map((job) => normalizeLocalUpload(job)).filter(visibleToActivePrincipal)
 }
 

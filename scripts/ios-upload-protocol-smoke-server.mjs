@@ -36,6 +36,16 @@ const server = http.createServer(async (request, response) => {
       return
     }
 
+    if (request.method === 'GET' && request.url === '/api/auth/me') {
+      if (String(request.headers.cookie ?? '') === 'pa_account=stale-account') {
+        console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_STALE_COOKIE_REJECTED')
+        return json(response, 200, { user: { id: 'other-account' } })
+      }
+      if (!hasNativeHeaders(request)) return json(response, 403, { error: 'PROTOCOL_SMOKE_AUTH_HEADERS_INVALID' })
+      console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_AUTH_OK')
+      return json(response, 200, { user: { id: 'protocol-smoke' } })
+    }
+
     if (request.method === 'POST' && request.url === '/api/assets/reserve') {
       if (!hasNativeHeaders(request)) return json(response, 403, { error: 'PROTOCOL_SMOKE_RESERVE_HEADERS_INVALID' })
       if (request.headers['content-type'] !== 'application/json') return json(response, 400, { error: 'PROTOCOL_SMOKE_RESERVE_CONTENT_TYPE_INVALID' })

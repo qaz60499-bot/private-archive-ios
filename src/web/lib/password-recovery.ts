@@ -5,6 +5,16 @@ const MAX_PASSWORD_LENGTH = 256
 
 const encoder = new TextEncoder()
 
+export function passwordRecoveryErrorMessage(error: unknown): string {
+  const code = error instanceof Error ? error.message : ''
+  switch (code) {
+    case 'APP_RECOVERY_NOT_ALLOWED': return '密码恢复只能在 Cloudflare Access 保护的网页中完成。请打开浏览器恢复页面，完成后回到应用使用新密码登录。'
+    case 'PASSWORD_INVALID': return '密码长度必须为 9–256 个字符。'
+    case 'APP_PASSWORD_RECOVERY_FAILED': return '密码重置暂时未确认完成。请重试；如果密码已经更改，请使用新密码登录。'
+    default: return code || '密码重置未完成，请重试。'
+  }
+}
+
 function encodeBase64Url(bytes: Uint8Array): string {
   let binary = ''
   for (const byte of bytes) binary += String.fromCharCode(byte)

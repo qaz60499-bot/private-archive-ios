@@ -7,7 +7,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-        <string>Private Archive</string>
+		<string>Private Adventure</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -25,11 +25,11 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>用于直接拍摄照片和视频并保存到你的 Private Archive。</string>
+	<string>用于直接拍摄照片和视频并保存到你的 Private Adventure。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>用于从系统照片图库选择照片和视频上传到你的 Private Archive。</string>
+	<string>用于从系统照片图库选择照片和视频上传到你的 Private Adventure。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>用于将你从 Private Archive 保存的照片和视频写入系统照片图库。</string>
+	<string>用于将你从 Private Adventure 保存的照片和视频写入系统照片图库。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

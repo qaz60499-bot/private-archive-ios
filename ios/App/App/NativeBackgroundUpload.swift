@@ -12,6 +12,8 @@ private let nativeUploadChanged = Notification.Name("PrivateArchiveNativeBackgro
 
 struct NativeUploadRecord: Codable {
     var id: String
+    // Optional only for decoding pre-upgrade records. Unknown owners stay on disk.
+    var principalId: String? = nil
     var batchId: String?
     var fileName: String
     var mimeType: String
@@ -67,6 +69,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return queue
     }()
     private var records: [String: NativeUploadRecord] = [:]
+    private var activePrincipalId: String?
+    private var activeAuthenticationCookie: String?
+    private var authenticationGeneration = 0
+    private var authenticationWasSet = false
     private var stagingHashers: [String: SHA256] = [:]
     private var reserveTasks: [String: URLSessionDataTask] = [:]
     private var lastProgressAt: [String: Date] = [:]
@@ -90,8 +96,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         configuration.waitsForConnectivity = true
         configuration.allowsCellularAccess = true
         configuration.httpMaximumConnectionsPerHost = 3
-        configuration.httpCookieStorage = HTTPCookieStorage.shared
-        configuration.httpShouldSetCookies = true
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
         configuration.timeoutIntervalForRequest = 180
         configuration.timeoutIntervalForResource = 24 * 60 * 60
         return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
@@ -205,6 +211,103 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
+    // Pair an authenticated account with its exact cookie. Cookie-observer callbacks
+    // alone cannot identify an account and therefore never authorize a new upload.
+    func beginPrincipalChange() -> Int {
+        stateQueue.sync {
+            authenticationGeneration += 1
+            authenticationWasSet = true
+            activePrincipalId = nil
+            activeAuthenticationCookie = nil
+            let tasks = Array(reserveTasks.values)
+            reserveTasks.removeAll()
+            tasks.forEach { $0.cancel() }
+            return authenticationGeneration
+        }
+    }
+
+    func confirmPrincipal(_ principalId: String, cookie: String?, generation: Int) -> Bool {
+        stateQueue.sync {
+            guard authenticationGeneration == generation else { return false }
+            activePrincipalId = principalId
+            activeAuthenticationCookie = cookie
+            return true
+        }
+    }
+
+    func authenticatePrincipal(_ principalId: String, cookies: [String], generation: Int, completion: @escaping (Bool) -> Void) {
+        guard let cookie = cookies.first,
+              stateQueue.sync(execute: { authenticationGeneration == generation }) else {
+            completion(false)
+            return
+        }
+        let request = baseRequest(url: apiBase.appendingPathComponent("api/auth/me"), method: "GET", cookie: cookie)
+        foregroundSession.dataTask(with: request) { data, response, error in
+            guard error == nil, (response as? HTTPURLResponse)?.statusCode == 200,
+                  let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let user = object["user"] as? [String: Any], user["id"] as? String == principalId else {
+                // WK and CapacitorHttp cookie stores may temporarily disagree after
+                // login. Validate each captured candidate against the requested id.
+                self.authenticatePrincipal(principalId, cookies: Array(cookies.dropFirst()), generation: generation, completion: completion)
+                return
+            }
+            completion(self.confirmPrincipal(principalId, cookie: cookie, generation: generation))
+        }.resume()
+    }
+
+    func requirePrincipal(_ principalId: String, jobId: String? = nil, allowMissing: Bool = false) throws {
+        try stateQueue.sync {
+            guard !principalId.isEmpty, activePrincipalId == principalId else {
+                throw NSError(domain: "NativeBackgroundUpload", code: 16, userInfo: [NSLocalizedDescriptionKey: "UPLOAD_ACCOUNT_CHANGED"])
+            }
+            if let jobId {
+                guard let record = records[jobId] else {
+                    if allowMissing { return }
+                    throw NSError(domain: "NativeBackgroundUpload", code: 5, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND"])
+                }
+                guard record.principalId == principalId else {
+                    throw NSError(domain: "NativeBackgroundUpload", code: 16, userInfo: [NSLocalizedDescriptionKey: "UPLOAD_ACCOUNT_MISMATCH"])
+                }
+            }
+        }
+    }
+
+    func adoptLegacyJobs(principalId: String, ids: [String]) throws {
+        try requirePrincipal(principalId)
+        stateQueue.sync {
+            guard activePrincipalId == principalId else { return }
+            var changed = false
+            for id in ids {
+                guard var record = records[id], record.principalId == nil else { continue }
+                record.principalId = principalId
+                records[id] = record
+                changed = true
+            }
+            if changed { saveStateLocked() }
+        }
+    }
+
+    func quarantinedJobCount() -> Int {
+        stateQueue.sync { records.values.filter { $0.principalId == nil }.count }
+    }
+
+    private func mayScheduleLocked(_ record: NativeUploadRecord, cookieOverride: String?) -> Bool {
+        guard let owner = record.principalId else { return false }
+        if owner == activePrincipalId { return true }
+        // A daemon callback may wake the app before Web authentication starts. Its
+        // original request already belongs to this persisted record and captures the
+        // old account's cookie. Once the Web explicitly changes account, fail closed.
+        return !authenticationWasSet && cookieOverride != nil
+    }
+
+    private func cookieHeader(for record: NativeUploadRecord, capturedCookie: String?) -> String? {
+        stateQueue.sync {
+            guard mayScheduleLocked(record, cookieOverride: capturedCookie) else { return nil }
+            if record.principalId == activePrincipalId, let cookie = activeAuthenticationCookie { return cookie }
+            return capturedCookie
+        }
+    }
+
     private func recoverInterruptedStaging() {
         var changed = false
         let timestamp = now()
@@ -241,7 +344,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private func recoverRetryableFailures() {
         var changed = false
         let timestamp = now()
-        for (id, var record) in records where record.ready && record.status == "failed" {
+        for (id, var record) in records where record.principalId != nil && record.ready && record.status == "failed" {
             let url = originalURL(id)
             guard fileManager.fileExists(atPath: url.path), (try? fileSize(url)) == record.sizeBytes else { continue }
             // Any failed job with a complete durable original is recoverable. Do not
@@ -264,12 +367,15 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if changed { saveStateLocked() }
     }
 
-    func createJob(id: String, batchId: String? = nil, fileName: String, mimeType: String, sizeBytes: Int64, mediaType: String, lastModifiedMs: Double?) throws {
+    func createJob(id: String, principalId: String, batchId: String? = nil, fileName: String, mimeType: String, sizeBytes: Int64, mediaType: String, lastModifiedMs: Double?, authorizedPickerImport: Bool = false) throws {
         guard UUID(uuidString: id) != nil, sizeBytes >= 0, ["photo", "video", "file"].contains(mediaType) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 1, userInfo: [NSLocalizedDescriptionKey: "INVALID_JOB"])
         }
         var created: NativeUploadRecord?
         try stateQueue.sync {
+            guard activePrincipalId == principalId || authorizedPickerImport else {
+                throw NSError(domain: "NativeBackgroundUpload", code: 16, userInfo: [NSLocalizedDescriptionKey: "UPLOAD_ACCOUNT_CHANGED"])
+            }
             guard records[id] == nil, !fileManager.fileExists(atPath: originalURL(id).path) else {
                 throw NSError(domain: "NativeBackgroundUpload", code: 14, userInfo: [NSLocalizedDescriptionKey: "JOB_ALREADY_HAS_LOCAL_CACHE"])
             }
@@ -279,7 +385,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let timestamp = now()
             stagingHashers[id] = SHA256()
             let record = NativeUploadRecord(
-                id: id, batchId: batchId, fileName: fileName, mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
+                id: id, principalId: principalId, batchId: batchId, fileName: fileName, mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: lastModifiedMs,
                 status: "waiting", stage: "registered", progress: 0, attempts: 0, error: nil,
                 remoteAssetId: nil, uploadToken: nil, contentHash: nil, deduplicated: nil, contentTaskToken: nil, ready: false,
@@ -292,7 +398,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if let created { notify(created) }
     }
 
-    func importPickedPhoto(id: String, batchId: String, sourceURL: URL, fileName: String, mimeType: String, lastModifiedMs: Double?, completion: @escaping (Result<NativeUploadRecord, Error>) -> Void) {
+    func importPickedPhoto(id: String, principalId: String, batchId: String, sourceURL: URL, fileName: String, mimeType: String, lastModifiedMs: Double?, completion: @escaping (Result<NativeUploadRecord, Error>) -> Void) {
         // loadFileRepresentation only guarantees that sourceURL is valid for the
         // duration of its completion callback. Copy into our app-owned durable cache
         // synchronously before returning from that callback; hashing/reservation can
@@ -303,8 +409,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 throw NSError(domain: "NativeBackgroundUpload", code: 15, userInfo: [NSLocalizedDescriptionKey: "照片超过 Bot 20MB 上传限制。"])
             }
             try createJob(
-                id: id, batchId: batchId, fileName: fileName, mimeType: mimeType,
-                sizeBytes: sizeBytes, mediaType: "photo", lastModifiedMs: lastModifiedMs
+                id: id, principalId: principalId, batchId: batchId, fileName: fileName, mimeType: mimeType,
+                sizeBytes: sizeBytes, mediaType: "photo", lastModifiedMs: lastModifiedMs, authorizedPickerImport: true
             )
             let destination = originalURL(id)
             try fileManager.removeItem(at: destination)
@@ -326,9 +432,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    func appendChunk(id: String, data: Data) throws {
+    func appendChunk(id: String, data: Data, principalId: String? = nil) throws {
         try stateQueue.sync {
-            guard var record = records[id], !record.ready else {
+            guard var record = records[id], record.principalId != nil,
+                  record.principalId == (principalId ?? activePrincipalId), record.principalId == activePrincipalId, !record.ready else {
                 throw NSError(domain: "NativeBackgroundUpload", code: 3, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_STAGING"])
             }
             let url = originalURL(id)
@@ -423,15 +530,64 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    func listJobs() -> [NativeUploadRecord] {
-        stateQueue.sync { records.values.sorted { $0.createdAt > $1.createdAt } }
+    func listJobs(principalId: String? = nil) -> [NativeUploadRecord] {
+        stateQueue.sync {
+            guard principalId == nil || principalId == activePrincipalId else { return [] }
+            return records.values.filter { $0.principalId != nil && $0.principalId == activePrincipalId }.sorted { $0.createdAt > $1.createdAt }
+        }
     }
 
 #if DEBUG
+    private func verifyAccountIsolationRuntimeSmoke() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            if !condition { throw NSError(domain: "NativeBackgroundUpload", code: 50, userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        let id = UUID().uuidString
+        var generation = beginPrincipalChange()
+        _ = confirmPrincipal("isolation-a", cookie: "pa_account=isolation-a", generation: generation)
+        try createJob(id: id, principalId: "isolation-a", fileName: "owner-test.bin", mimeType: "application/octet-stream", sizeBytes: 3, mediaType: "file", lastModifiedMs: nil)
+        try appendChunk(id: id, data: Data([1, 2, 3]), principalId: "isolation-a")
+        guard let record = stateQueue.sync(execute: { records[id] }) else { throw NSError(domain: "NativeBackgroundUpload", code: 50) }
+        generation = beginPrincipalChange()
+        _ = confirmPrincipal("isolation-b", cookie: "pa_account=isolation-b", generation: generation)
+        try check(!listJobs().contains { $0.id == id }, "other-account-visible")
+        try check(cookieHeader(for: record, capturedCookie: "pa_account=isolation-a") == nil, "other-account-cookie")
+        cancelJob(id: id, principalId: "isolation-b")
+        removeJob(id: id, principalId: "isolation-b")
+        try check((try? fileSize(originalURL(id))) == 3, "other-account-deleted-original")
+        do {
+            try requirePrincipal("isolation-b", jobId: id)
+            throw NSError(domain: "NativeBackgroundUpload", code: 50, userInfo: [NSLocalizedDescriptionKey: "other-account-control"])
+        } catch {
+            if nativeUploadErrorCode(error) != 16 { throw error }
+        }
+        var legacy = dictionary(record)
+        legacy.removeValue(forKey: "principalId")
+        let unknown = try JSONDecoder().decode(NativeUploadRecord.self, from: JSONSerialization.data(withJSONObject: legacy))
+        try check(unknown.principalId == nil, "legacy-decode")
+        stateQueue.sync {
+            activePrincipalId = nil
+            activeAuthenticationCookie = nil
+            authenticationWasSet = false
+        }
+        try check(cookieHeader(for: record, capturedCookie: "pa_account=isolation-a") == "pa_account=isolation-a", "cold-task-cookie")
+        try check(cookieHeader(for: unknown, capturedCookie: "pa_account=isolation-a") == nil, "unknown-owner-cookie")
+        generation = beginPrincipalChange()
+        try check(!confirmPrincipal("isolation-b", cookie: "pa_account=isolation-b", generation: generation - 1), "stale-auth-confirmation")
+        _ = confirmPrincipal("isolation-a", cookie: "pa_account=isolation-a", generation: generation)
+        removeJob(id: id, principalId: "isolation-a")
+        NSLog("PRIVATE_ARCHIVE_ACCOUNT_ISOLATION_SMOKE_COMPLETED")
+    }
+
     func runNativeProtocolRuntimeSmoke() {
         guard ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1" else { return }
         guard let host = apiBase.host, host == "127.0.0.1" || host == "localhost" else {
             NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED invalid-api-base=%@", apiBase.absoluteString)
+            return
+        }
+        do { try verifyAccountIsolationRuntimeSmoke() }
+        catch {
+            NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED account-isolation=%@", error.localizedDescription)
             return
         }
         var cookieProperties: [HTTPCookiePropertyKey: Any] = [
@@ -447,12 +603,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
         HTTPCookieStorage.shared.setCookie(cookie)
+        let generation = beginPrincipalChange()
+        authenticatePrincipal("protocol-smoke", cookies: ["pa_account=stale-account", "pa_account=protocol-smoke-session"], generation: generation) { valid in
+            guard valid else {
+                NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED cookie-candidates")
+                return
+            }
+            NSLog("PRIVATE_ARCHIVE_COOKIE_CANDIDATES_SMOKE_COMPLETED")
+            self.runAuthenticatedProtocolRuntimeSmoke()
+        }
+    }
 
+    private func runAuthenticatedProtocolRuntimeSmoke() {
         let id = UUID().uuidString
         let bytes = Data(repeating: 0x5a, count: 256 * 1024)
         do {
             try createJob(
-                id: id,
+                id: id, principalId: "protocol-smoke",
                 batchId: "protocol-smoke",
                 fileName: "native-protocol-smoke.bin",
                 mimeType: "application/octet-stream",
@@ -496,9 +663,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 #endif
 
-    func pauseJob(id: String) {
+    func pauseJob(id: String, principalId: String? = nil) {
         let transition = stateQueue.sync { () -> (NativeUploadRecord, Int)? in
-            guard var value = records[id], value.status != "done", value.status != "failed" else { return nil }
+            guard var value = records[id], value.principalId != nil,
+                  value.principalId == (principalId ?? activePrincipalId), value.principalId == activePrincipalId,
+                  value.status != "done", value.status != "failed" else { return nil }
             let generation = (value.controlGeneration ?? 0) + 1
             value.controlGeneration = generation
             value.status = "paused"
@@ -510,10 +679,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
         guard let (paused, generation) = transition else { return }
         notify(paused)
-        performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "paused", action: { $0.suspend() })
+        performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "paused", expectedPrincipalId: paused.principalId, action: { $0.suspend() })
     }
 
-    func resumeJob(id: String, fileName: String?, mimeType: String?, sizeBytes: Int64?, mediaType: String?, contentHash: String?) throws {
+    func resumeJob(id: String, principalId: String, fileName: String?, mimeType: String?, sizeBytes: Int64?, mediaType: String?, contentHash: String?) throws {
+        try requirePrincipal(principalId, jobId: id, allowMissing: true)
         guard UUID(uuidString: id) != nil else {
             throw NSError(domain: "NativeBackgroundUpload", code: 1, userInfo: [NSLocalizedDescriptionKey: "INVALID_JOB"])
         }
@@ -526,18 +696,19 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if current == nil {
             guard let fileName, let sizeBytes, let mediaType,
                   sizeBytes >= 0, ["photo", "video", "file"].contains(mediaType),
-                  fileManager.fileExists(atPath: url.path), (try? fileSize(url)) == sizeBytes else {
+                  fileManager.fileExists(atPath: url.path), let actualSize = try? fileSize(url), actualSize <= sizeBytes else {
                 throw NSError(domain: "NativeBackgroundUpload", code: 5, userInfo: [NSLocalizedDescriptionKey: "JOB_NOT_FOUND_OR_CACHE_INCOMPLETE"])
             }
             let timestamp = now()
             let rebuilt = NativeUploadRecord(
-                id: id, batchId: nil, fileName: fileName, mimeType: mimeType?.isEmpty == false ? mimeType! : "application/octet-stream",
+                id: id, principalId: principalId, batchId: nil, fileName: fileName, mimeType: mimeType?.isEmpty == false ? mimeType! : "application/octet-stream",
                 sizeBytes: sizeBytes, mediaType: mediaType, lastModifiedMs: nil,
-                status: "failed", stage: "reserving", progress: 15, attempts: 0, error: "已从本机缓存重建上传记录。",
-                remoteAssetId: nil, uploadToken: nil, contentHash: contentHash ?? (try? sha256(url: url)), deduplicated: nil, contentTaskToken: nil, ready: true,
+                status: "failed", stage: actualSize == sizeBytes ? "reserving" : "registered", progress: 15, attempts: 0, error: "已从本机缓存重建上传记录。",
+                remoteAssetId: nil, uploadToken: nil, contentHash: actualSize == sizeBytes ? contentHash ?? (try? sha256(url: url)) : nil, deduplicated: nil, contentTaskToken: nil, ready: actualSize == sizeBytes,
                 createdAt: timestamp, updatedAt: timestamp
             )
             stateQueue.sync {
+                guard activePrincipalId == principalId else { return }
                 records[id] = rebuilt
                 saveStateLocked()
             }
@@ -580,7 +751,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             notify(retrying)
             let oldReserve = stateQueue.sync { reserveTasks.removeValue(forKey: id) }
             oldReserve?.cancel()
-            performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "retrying", action: { $0.cancel() }) { _ in
+            performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "retrying", expectedPrincipalId: principalId, action: { $0.cancel() }) { _ in
                 guard let current = self.stateQueue.sync(execute: { self.records[id] }),
                       (current.controlGeneration ?? 0) == generation, current.status == "retrying" else { return }
                 do { try self.scheduleReserve(current, earliest: nil) }
@@ -599,7 +770,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }) else { return }
         let generation = resumed.controlGeneration ?? 0
         notify(resumed)
-        performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "retrying", action: { $0.resume() }) { count in
+        performOnTasks(id: id, expectedControlGeneration: generation, expectedStatus: "retrying", expectedPrincipalId: principalId, action: { $0.resume() }) { count in
             guard count == 0,
                   let record = self.stateQueue.sync(execute: { self.records[id] }), record.ready,
                   (record.controlGeneration ?? 0) == generation, record.status == "retrying" else { return }
@@ -611,9 +782,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    func cancelJob(id: String) {
+    func cancelJob(id: String, principalId: String? = nil) {
         let canceled = stateQueue.sync { () -> NativeUploadRecord? in
-            guard var value = records[id], value.status != "done" else { return nil }
+            guard var value = records[id], value.principalId != nil,
+                  value.principalId == (principalId ?? activePrincipalId), value.principalId == activePrincipalId, value.status != "done" else { return nil }
             stagingHashers.removeValue(forKey: id)
             value.status = "failed"
             value.error = "已取消，本机临时原件已释放。"
@@ -633,7 +805,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         cleanupFiles(id)
     }
 
-    func removeJob(id: String) {
+    func removeJob(id: String, principalId: String? = nil) {
+        guard stateQueue.sync(execute: {
+            guard let record = records[id], let owner = record.principalId else { return false }
+            return owner == (principalId ?? activePrincipalId) && owner == activePrincipalId
+        }) else { return }
         let reserve = stateQueue.sync { reserveTasks.removeValue(forKey: id) }
         reserve?.cancel()
         performOnTasks(id: id, action: { $0.cancel() })
@@ -815,29 +991,14 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private func notify(_ record: NativeUploadRecord) {
         let payload = publicDictionary(record)
         DispatchQueue.main.async {
+            guard self.stateQueue.sync(execute: { record.principalId != nil && record.principalId == self.activePrincipalId }) else { return }
             NotificationCenter.default.post(name: nativeUploadChanged, object: nil, userInfo: ["job": payload])
         }
     }
 
-    private func cookieHeader() -> String? {
-#if DEBUG
-        // The CI protocol smoke uses a loopback IP. Recent Simulator runtimes can
-        // accept an HTTPCookie for 127.0.0.1 but then omit it from cookies(for:),
-        // which turns the smoke into a false APP_AUTH_REQUIRED failure. Keep this
-        // deterministic fallback strictly inside the Debug localhost smoke; Release
-        // builds still require the real shared HttpOnly application cookie.
-        if ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1",
-           let host = apiBase.host,
-           host == "127.0.0.1" || host == "localhost" {
-            return "pa_account=protocol-smoke-session"
-        }
-#endif
-        guard let cookies = HTTPCookieStorage.shared.cookies(for: apiBase), !cookies.isEmpty else { return nil }
-        return HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
-    }
-
     private func baseRequest(url: URL, method: String, cookie: String) -> URLRequest {
         var request = URLRequest(url: url)
+        request.httpShouldHandleCookies = false
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
@@ -879,7 +1040,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             }
             return
         }
-        guard let cookie = cookieOverride ?? cookieHeader() else {
+        guard let cookie = cookieHeader(for: record, capturedCookie: cookieOverride) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 9, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
         let payload = try reservePayload(record)
@@ -917,6 +1078,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let updated = stateQueue.sync { () -> NativeUploadRecord? in
             guard reserveTasks[record.id] == nil,
                   var value = records[record.id],
+                  mayScheduleLocked(value, cookieOverride: cookieOverride),
                   value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused",
                   !(value.stage == "original" && value.remoteAssetId != nil && value.uploadToken != nil) else { return nil }
@@ -1040,7 +1202,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         guard let assetId = record.remoteAssetId, let token = record.uploadToken else {
             throw NSError(domain: "NativeBackgroundUpload", code: 10, userInfo: [NSLocalizedDescriptionKey: "UPLOAD_RESERVATION_MISSING"])
         }
-        guard let cookie = cookieOverride ?? cookieHeader() else {
+        guard let cookie = cookieHeader(for: record, capturedCookie: cookieOverride) else {
             throw NSError(domain: "NativeBackgroundUpload", code: 11, userInfo: [NSLocalizedDescriptionKey: "APP_AUTH_REQUIRED"])
         }
         guard fileManager.fileExists(atPath: originalURL(record.id).path) else {
@@ -1055,6 +1217,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         var queued: NativeUploadRecord?
         let updated = stateQueue.sync { () -> NativeUploadRecord? in
             guard var value = records[record.id],
+                  mayScheduleLocked(value, cookieOverride: cookieOverride),
                   value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused",
                   value.remoteAssetId == assetId, value.uploadToken == token,
@@ -1366,12 +1529,17 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         id: String,
         expectedControlGeneration: Int? = nil,
         expectedStatus: String? = nil,
+        expectedPrincipalId: String? = nil,
         action: @escaping (URLSessionTask) -> Void,
         completion: ((Int) -> Void)? = nil
     ) {
         session.getAllTasks { contentTasks in
             let matches = contentTasks.filter { self.taskJobId($0) == id }
             let snapshot = self.stateQueue.sync { () -> (Bool, URLSessionDataTask?) in
+                if let expectedPrincipalId {
+                    guard self.activePrincipalId == expectedPrincipalId,
+                          self.records[id]?.principalId == expectedPrincipalId else { return (false, nil) }
+                }
                 if let expectedControlGeneration {
                     guard let record = self.records[id],
                           (record.controlGeneration ?? 0) == expectedControlGeneration,
@@ -1441,7 +1609,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     }
                     let taskIdentity = self.contentTaskIdentity(task)
                     let ownership = self.stateQueue.sync { () -> (Bool, NativeUploadRecord?) in
-                        guard var current = self.records[id], current.ready,
+                        guard var current = self.records[id], current.principalId != nil, current.ready,
                               current.status != "done", current.status != "failed", current.status != "paused" else { return (false, nil) }
                         guard self.contentRequestMatchesRecord(task, record: current) else {
                             if current.contentTaskToken == taskIdentity {
@@ -1498,7 +1666,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 let activeIds = activeReserveIds.union(validContentIds)
                 let resumable = self.stateQueue.sync {
                     self.records.values.filter {
-                        $0.ready && $0.status != "done" && $0.status != "failed" && $0.status != "paused" && !activeIds.contains($0.id)
+                        $0.ready && $0.principalId != nil && $0.principalId == self.activePrincipalId && $0.status != "done" && $0.status != "failed" && $0.status != "paused" && !activeIds.contains($0.id)
                     }.sorted { $0.createdAt < $1.createdAt }
                 }
                 for record in resumable {
@@ -1667,6 +1835,8 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     public let identifier = "NativeBackgroundUploadPlugin"
     public let jsName = "NativeBackgroundUpload"
     public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "setPrincipal", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "adoptLegacyJobs", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "createJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "appendChunk", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "finishJob", returnType: CAPPluginReturnPromise),
@@ -1685,6 +1855,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     // PhotosUI object and picker lifecycle field confined to the main thread.
     private var photoPickerCall: CAPPluginCall?
     private var photoPickerBatchId: String?
+    private var photoPickerPrincipalId: String?
     // Keep provider materialization bounded without parking dozens of GCD worker
     // threads on a semaphore. Large selections previously queued one blocking task per
     // photo (80 selections => 77 blocked workers), which can trigger thread pressure or
@@ -1717,17 +1888,17 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         return picker
     }
 
-    private func notifyPickerError(batchId: String, jobId: String?, message: String) {
+    private func notifyPickerError(batchId: String, principalId: String, jobId: String?, message: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            var data: [String: Any] = ["batchId": batchId, "message": message]
+            var data: [String: Any] = ["batchId": batchId, "principalId": principalId, "message": message]
             if let jobId { data["jobId"] = jobId }
             self.notifyListeners("pickerError", data: data, retainUntilConsumed: true)
         }
     }
 
     @objc func pickPhotos(_ call: CAPPluginCall) {
-        guard let batchId = call.getString("batchId"), UUID(uuidString: batchId) != nil else {
+        guard let batchId = call.getString("batchId"), let principalId = call.getString("principalId"), UUID(uuidString: batchId) != nil else {
             return call.reject("INVALID_BATCH")
         }
 
@@ -1737,6 +1908,8 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         // a real device even though xcodebuild/analyze succeeds.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return call.reject("PHOTO_PICKER_UNAVAILABLE") }
+            do { try NativeBackgroundUploadManager.shared.requirePrincipal(principalId) }
+            catch { return call.reject(error.localizedDescription) }
             guard self.photoPickerCall == nil else { return call.reject("PHOTO_PICKER_ALREADY_OPEN") }
             guard let viewController = self.bridge?.viewController,
                   viewController.presentedViewController == nil else {
@@ -1746,6 +1919,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
             let picker = self.makePhotoPicker()
             self.photoPickerCall = call
             self.photoPickerBatchId = batchId
+            self.photoPickerPrincipalId = principalId
             viewController.present(picker, animated: true)
         }
     }
@@ -1755,6 +1929,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         index: Int,
         stride: Int,
         batchId: String,
+        principalId: String,
         group: DispatchGroup
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
@@ -1782,17 +1957,18 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
                 // handler returns. importPickedPhoto performs the app-owned copy
                 // synchronously, then hashes/reserves asynchronously.
                 NativeBackgroundUploadManager.shared.importPickedPhoto(
-                    id: jobId, batchId: batchId, sourceURL: url, fileName: fileName,
+                    id: jobId, principalId: principalId, batchId: batchId, sourceURL: url, fileName: fileName,
                     mimeType: mimeType, lastModifiedMs: lastModifiedMs
                 ) { result in
                     if case .failure(let importError) = result {
-                        self.notifyPickerError(batchId: batchId, jobId: jobId, message: importError.localizedDescription)
+                        self.notifyPickerError(batchId: batchId, principalId: principalId, jobId: jobId, message: importError.localizedDescription)
                     }
                     group.leave()
                 }
             } else {
                 self.notifyPickerError(
                     batchId: batchId,
+                    principalId: principalId,
                     jobId: jobId,
                     message: error?.localizedDescription ?? "无法读取所选照片。"
                 )
@@ -1803,7 +1979,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
             // has either been copied or rejected. This keeps provider concurrency
             // strictly bounded without blocking any dispatch worker thread.
             DispatchQueue.main.async {
-                self.startPhotoImportLane(providers, index: index + stride, stride: stride, batchId: batchId, group: group)
+                self.startPhotoImportLane(providers, index: index + stride, stride: stride, batchId: batchId, principalId: principalId, group: group)
             }
         }
     }
@@ -1813,10 +1989,12 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         // CAPPluginCall and picker state on that actor as well.
         let call = photoPickerCall
         let batchId = photoPickerBatchId
+        let principalId = photoPickerPrincipalId
         photoPickerCall = nil
         photoPickerBatchId = nil
+        photoPickerPrincipalId = nil
         picker.dismiss(animated: true)
-        guard let call, let batchId else { return }
+        guard let call, let batchId, let principalId else { return }
         call.resolve(["batchId": batchId, "count": results.count])
         guard !results.isEmpty else { return }
 
@@ -1826,7 +2004,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         for _ in providers { group.enter() }
         let lanes = min(photoImportLaneCount, providers.count)
         for lane in 0..<lanes {
-            startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, group: group)
+            startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, principalId: principalId, group: group)
         }
         group.notify(queue: .main) {
             NativeBackgroundUploadManager.shared.endStagingProtection()
@@ -1856,6 +2034,9 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
 
     private func runBulkPhotoImportRuntimeSmoke(count: Int) {
         dispatchPrecondition(condition: .onQueue(.main))
+        let principalId = "bulk-import-smoke"
+        let generation = NativeBackgroundUploadManager.shared.beginPrincipalChange()
+        _ = NativeBackgroundUploadManager.shared.confirmPrincipal(principalId, cookie: nil, generation: generation)
         let batchId = UUID().uuidString
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PrivateArchiveBulkImportSmoke-\(batchId)", isDirectory: true)
@@ -1897,7 +2078,7 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
         for _ in providers { group.enter() }
         let lanes = min(photoImportLaneCount, providers.count)
         for lane in 0..<lanes {
-            startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, group: group)
+            startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, principalId: principalId, group: group)
         }
         group.notify(queue: .main) {
             let jobs = NativeBackgroundUploadManager.shared.listJobs().filter { $0.batchId == batchId }
@@ -1910,14 +2091,54 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     }
 #endif
 
+    @objc func setPrincipal(_ call: CAPPluginCall) {
+        let manager = NativeBackgroundUploadManager.shared
+        let generation = manager.beginPrincipalChange()
+        guard let principalId = call.getString("principalId"), !principalId.isEmpty else { return call.resolve() }
+        DispatchQueue.main.async { [weak self] in
+            guard let cookieStore = self?.bridge?.webView?.configuration.websiteDataStore.httpCookieStore else {
+                return call.reject("UPLOAD_COOKIE_STORE_UNAVAILABLE")
+            }
+            cookieStore.getAllCookies { cookies in
+                let apiURL = manager.authenticationCookieURL
+                let host = apiURL.host?.lowercased()
+                let matches: (HTTPCookie) -> Bool = { cookie in
+                    cookie.name == "pa_account" && cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() == host
+                }
+                // CapacitorHttp can receive Set-Cookie before WK's observer fires.
+                // Either source must pass /auth/me for this exact principal; a stale
+                // native cookie can never be adopted merely because it exists.
+                let candidates = cookies.filter(matches) + (HTTPCookieStorage.shared.cookies(for: apiURL) ?? []).filter(matches)
+                var headers: [String] = []
+                for cookie in candidates {
+                    if let header = HTTPCookie.requestHeaderFields(with: [cookie])["Cookie"], !headers.contains(header) { headers.append(header) }
+                }
+                guard !headers.isEmpty else {
+                    return call.reject("UPLOAD_ACCOUNT_SESSION_UNAVAILABLE")
+                }
+                manager.authenticatePrincipal(principalId, cookies: headers, generation: generation) { valid in
+                    guard valid else { return call.reject("UPLOAD_ACCOUNT_SESSION_MISMATCH") }
+                    call.resolve()
+                    manager.resumePendingTransfers()
+                }
+            }
+        }
+    }
+
+    @objc func adoptLegacyJobs(_ call: CAPPluginCall) {
+        guard let principalId = call.getString("principalId"), let ids = call.getArray("ids", String.self) else { return call.reject("INVALID_JOB") }
+        do { try NativeBackgroundUploadManager.shared.adoptLegacyJobs(principalId: principalId, ids: ids); call.resolve() }
+        catch { call.reject(error.localizedDescription) }
+    }
+
     @objc func createJob(_ call: CAPPluginCall) {
-        guard let id = call.getString("id"), let fileName = call.getString("fileName"),
+        guard let id = call.getString("id"), let principalId = call.getString("principalId"), let fileName = call.getString("fileName"),
               let size = call.getInt("sizeBytes"), let mediaType = call.getString("mediaType") else {
             return call.reject("INVALID_JOB")
         }
         do {
             try NativeBackgroundUploadManager.shared.createJob(
-                id: id, batchId: call.getString("batchId"), fileName: fileName, mimeType: call.getString("mimeType") ?? "application/octet-stream",
+                id: id, principalId: principalId, batchId: call.getString("batchId"), fileName: fileName, mimeType: call.getString("mimeType") ?? "application/octet-stream",
                 sizeBytes: Int64(size), mediaType: mediaType, lastModifiedMs: call.getDouble("lastModifiedMs")
             )
             call.resolve()
@@ -1925,15 +2146,17 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     }
 
     @objc func appendChunk(_ call: CAPPluginCall) {
-        guard let id = call.getString("id"), let base64 = call.getString("base64"), let data = Data(base64Encoded: base64) else {
+        guard let id = call.getString("id"), let principalId = call.getString("principalId"), let base64 = call.getString("base64"), let data = Data(base64Encoded: base64) else {
             return call.reject("INVALID_CHUNK")
         }
-        do { try NativeBackgroundUploadManager.shared.appendChunk(id: id, data: data); call.resolve() }
+        do { try NativeBackgroundUploadManager.shared.appendChunk(id: id, data: data, principalId: principalId); call.resolve() }
         catch { call.reject(error.localizedDescription) }
     }
 
     @objc func finishJob(_ call: CAPPluginCall) {
-        guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
+        guard let id = call.getString("id"), let principalId = call.getString("principalId") else { return call.reject("INVALID_JOB") }
+        do { try NativeBackgroundUploadManager.shared.requirePrincipal(principalId, jobId: id) }
+        catch { return call.reject(error.localizedDescription) }
         NativeBackgroundUploadManager.shared.finishJob(id: id) { result in
             switch result {
             case .success(let job): call.resolve(["job": NativeBackgroundUploadManager.shared.publicDictionary(job)])
@@ -1953,20 +2176,25 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     }
 
     @objc func listJobs(_ call: CAPPluginCall) {
-        call.resolve(["items": NativeBackgroundUploadManager.shared.listJobs().map { NativeBackgroundUploadManager.shared.publicDictionary($0) }])
+        guard let principalId = call.getString("principalId") else { return call.reject("UPLOAD_ACCOUNT_REQUIRED") }
+        do { try NativeBackgroundUploadManager.shared.requirePrincipal(principalId) }
+        catch { return call.reject(error.localizedDescription) }
+        call.resolve(["items": NativeBackgroundUploadManager.shared.listJobs(principalId: principalId).map { NativeBackgroundUploadManager.shared.publicDictionary($0) }, "quarantinedCount": NativeBackgroundUploadManager.shared.quarantinedJobCount()])
     }
 
     @objc func pauseJob(_ call: CAPPluginCall) {
-        guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
-        NativeBackgroundUploadManager.shared.pauseJob(id: id)
+        guard let id = call.getString("id"), let principalId = call.getString("principalId") else { return call.reject("INVALID_JOB") }
+        do { try NativeBackgroundUploadManager.shared.requirePrincipal(principalId, jobId: id) }
+        catch { return call.reject(error.localizedDescription) }
+        NativeBackgroundUploadManager.shared.pauseJob(id: id, principalId: principalId)
         call.resolve()
     }
 
     @objc func resumeJob(_ call: CAPPluginCall) {
-        guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
+        guard let id = call.getString("id"), let principalId = call.getString("principalId") else { return call.reject("INVALID_JOB") }
         do {
             try NativeBackgroundUploadManager.shared.resumeJob(
-                id: id,
+                id: id, principalId: principalId,
                 fileName: call.getString("fileName"),
                 mimeType: call.getString("mimeType"),
                 sizeBytes: call.getInt("sizeBytes").map { Int64($0) },
@@ -1980,14 +2208,18 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
     }
 
     @objc func cancelJob(_ call: CAPPluginCall) {
-        guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
-        NativeBackgroundUploadManager.shared.cancelJob(id: id)
+        guard let id = call.getString("id"), let principalId = call.getString("principalId") else { return call.reject("INVALID_JOB") }
+        do { try NativeBackgroundUploadManager.shared.requirePrincipal(principalId, jobId: id) }
+        catch { return call.reject(error.localizedDescription) }
+        NativeBackgroundUploadManager.shared.cancelJob(id: id, principalId: principalId)
         call.resolve()
     }
 
     @objc func removeJob(_ call: CAPPluginCall) {
-        guard let id = call.getString("id") else { return call.reject("INVALID_JOB") }
-        NativeBackgroundUploadManager.shared.removeJob(id: id)
+        guard let id = call.getString("id"), let principalId = call.getString("principalId") else { return call.reject("INVALID_JOB") }
+        do { try NativeBackgroundUploadManager.shared.requirePrincipal(principalId, jobId: id, allowMissing: true) }
+        catch { return call.reject(error.localizedDescription) }
+        NativeBackgroundUploadManager.shared.removeJob(id: id, principalId: principalId)
         call.resolve()
     }
 }

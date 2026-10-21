@@ -1,4 +1,4 @@
-import { enqueueLocalUpload } from './offline/store'
+import { enqueueLocalUpload, getLocalUploadPrincipal } from './offline/store'
 import { wakeUploadScheduler } from './offline/processor'
 import {
   beginIosBackgroundUploadStaging,
@@ -55,6 +55,8 @@ async function requestPersistentStorage(): Promise<void> {
 
 export async function importFiles(files: FileList | File[], online: boolean, options: ImportFilesOptions = {}): Promise<ImportFilesResult> {
   const selectedFiles = Array.from(files)
+  const principalId = getLocalUploadPrincipal()
+  if (selectedFiles.length && !principalId) throw new Error('当前账号尚未完成验证，无法创建上传任务。')
   const batchId = options.batchId ?? crypto.randomUUID()
   const errors: string[] = []
   const total = selectedFiles.length
@@ -88,9 +90,9 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
     try {
       const mediaType: MediaType = file.type.startsWith('image/') ? 'photo' : file.type.startsWith('video/') ? 'video' : 'file'
       if (iosBackgroundUpload) {
-        await enqueueIosBackgroundUpload({ file, batchId, mediaType, storageBackend })
+        await enqueueIosBackgroundUpload({ file, principalId: principalId!, batchId, mediaType, storageBackend })
       } else {
-        await enqueueLocalUpload({ file, batchId, mediaType, persistPayload, storageBackend })
+        await enqueueLocalUpload({ file, principalId: principalId!, batchId, mediaType, persistPayload, storageBackend })
       }
       queued += 1
       report('registering', windowNumber)

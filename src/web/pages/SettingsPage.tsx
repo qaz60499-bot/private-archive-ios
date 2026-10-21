@@ -135,7 +135,7 @@ export function SettingsPage() {
   const refreshAccounts = async () => setAccounts((await api.listAccounts()).items)
 
   const createAccount = async () => {
-    if (!accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9) return
+    if (!accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9 || accountPassword.length > 256) return
     setSavingAccount(true)
     setStatusError(null)
     try {
@@ -153,7 +153,7 @@ export function SettingsPage() {
   }
 
   const resetAllPasswords = async () => {
-    if (resetAllPassword.length < 9) return
+    if (resetAllPassword.length < 9 || resetAllPassword.length > 256) return
     setResettingAllPasswords(true)
     setStatusError(null)
     setAccountResetMessage(null)
@@ -294,7 +294,7 @@ export function SettingsPage() {
   if (!status) {
     if (statusError) {
       const accessExpired = statusError === 'ACCESS_SIGN_IN_REQUIRED' || statusError === 'OWNER_AUTH_REQUIRED'
-      return <div className="page"><PageIntro eyebrow="SETTINGS · PRIVATE ARCHIVE" title="设置" description={accessExpired ? '当前访问会话需要重新验证。' : '设置服务暂时没有成功返回；这不代表 Cloudflare Access 一定失效。'} /><section className="error-state" role="alert"><ShieldCheck /><h2>{accessExpired ? '需要重新验证访问权限' : '设置服务暂时不可用'}</h2><p>{statusError}</p><div className="settings-error-actions">{accessExpired ? <button className="primary-button" type="button" onClick={() => reauthenticateAccess()}>重新验证 Cloudflare Access</button> : null}<button className="secondary-button" type="button" onClick={() => void loadStatus()}>重新尝试</button></div></section></div>
+      return <div className="page"><PageIntro eyebrow="SETTINGS · PRIVATE ADVENTURE" title="设置" description={accessExpired ? '当前访问会话需要重新验证。' : '设置服务暂时没有成功返回；这不代表 Cloudflare Access 一定失效。'} /><section className="error-state" role="alert"><ShieldCheck /><h2>{accessExpired ? '需要重新验证访问权限' : '设置服务暂时不可用'}</h2><p>{statusError}</p><div className="settings-error-actions">{accessExpired ? <button className="primary-button" type="button" onClick={() => reauthenticateAccess()}>重新验证 Cloudflare Access</button> : null}<button className="secondary-button" type="button" onClick={() => void loadStatus()}>重新尝试</button></div></section></div>
     }
     return <div className="page"><SkeletonGrid /></div>
   }
@@ -316,7 +316,7 @@ export function SettingsPage() {
   }
 
   return <div className="page settings-page">
-    <PageIntro eyebrow="SETTINGS · PRIVATE ARCHIVE" title="设置" description="日常只需要管理档案、存储和回收站。工程级绑定与诊断信息收在高级区域，不再占据设置首页。" />
+    <PageIntro eyebrow="SETTINGS · PRIVATE ADVENTURE" title="设置" description="日常只需要管理档案、存储和回收站。工程级绑定与诊断信息收在高级区域，不再占据设置首页。" />
 
     <nav className="settings-section-nav" aria-label="设置分区">
       <a href="#settings-archive">档案</a>{isOwner ? <><a href="#settings-storage">存储</a><a href="#settings-accounts">账号</a><a href="#settings-sources">Telegram 来源</a><a href="#settings-sharing">共享</a><a href="#settings-trash">回收站</a></> : null}<a href="#settings-connections">连接</a>{isOwner ? <a href="#settings-advanced">高级</a> : null}
@@ -342,13 +342,13 @@ export function SettingsPage() {
         <div className="account-create-grid">
           <label><span>用户名</span><input value={accountUsername} onChange={(event) => setAccountUsername(event.target.value)} placeholder="family" autoComplete="off" /></label>
           <label><span>显示名称</span><input value={accountDisplayName} onChange={(event) => setAccountDisplayName(event.target.value)} placeholder="Family" autoComplete="off" /></label>
-          <label><span>初始密码</span><input value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} type="password" minLength={9} autoComplete="new-password" placeholder="至少 9 个字符" /></label>
+          <label><span>初始密码</span><input value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} type="password" minLength={9} maxLength={256} autoComplete="new-password" placeholder="9–256 个字符" /></label>
           <label><span>初始权限</span><select value={accountPreset} onChange={(event) => setAccountPreset(event.target.value as 'FULL' | 'VIEWER' | 'UPLOAD_ONLY')}><option value="VIEWER">只读 · 可看全部</option><option value="UPLOAD_ONLY">仅上传 · 不可浏览</option><option value="FULL">完整成员 · 可读写</option></select></label>
-          <button className="primary-button" type="button" disabled={savingAccount || !accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9} onClick={() => void createAccount()}>{savingAccount ? <LoaderCircle className="spin" /> : <Plus />}{savingAccount ? '创建中' : '创建账号'}</button>
+          <button className="primary-button" type="button" disabled={savingAccount || !accountUsername.trim() || !accountDisplayName.trim() || accountPassword.length < 9 || accountPassword.length > 256} onClick={() => void createAccount()}>{savingAccount ? <LoaderCircle className="spin" /> : <Plus />}{savingAccount ? '创建中' : '创建账号'}</button>
         </div>
         <div className="account-create-grid">
-          <label><span>统一新密码</span><input value={resetAllPassword} onChange={(event) => setResetAllPassword(event.target.value)} type="password" autoComplete="new-password" placeholder="至少 9 个字符，无其他复杂度要求" /></label>
-          <button className="secondary-button" type="button" disabled={resettingAllPasswords || resetAllPassword.length < 9 || !accounts.length} onClick={() => void resetAllPasswords()}>{resettingAllPasswords ? <LoaderCircle className="spin" /> : <RotateCw />}{resettingAllPasswords ? '重置中' : '统一重置现有账号密码'}</button>
+          <label><span>统一新密码</span><input value={resetAllPassword} onChange={(event) => setResetAllPassword(event.target.value)} type="password" minLength={9} maxLength={256} autoComplete="new-password" placeholder="9–256 个字符，无其他复杂度要求" /></label>
+          <button className="secondary-button" type="button" disabled={resettingAllPasswords || resetAllPassword.length < 9 || resetAllPassword.length > 256 || !accounts.length} onClick={() => void resetAllPasswords()}>{resettingAllPasswords ? <LoaderCircle className="spin" /> : <RotateCw />}{resettingAllPasswords ? '重置中' : '统一重置现有账号密码'}</button>
         </div>
         {accountResetMessage ? <p className="settings-section-note">{accountResetMessage}</p> : null}
         <p className="settings-section-note">统一重置会一次性更新全部应用账号，并让现有登录会话失效；密码仍只保存 PBKDF2-SHA256 哈希。Owner 始终拥有全部权限。新普通账号默认只读；查看、下载、上传、编辑、删除都由 Worker 强制校验，不只是在界面里隐藏按钮。</p>

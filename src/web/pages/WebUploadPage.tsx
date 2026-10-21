@@ -7,7 +7,7 @@ import { ImportToast } from '../components/ImportToast'
 import { OfflineBadge } from '../components/UploadControls'
 import { useArchive } from '../context/ArchiveContext'
 import { api } from '../lib/api'
-import { deriveRecoveryPasswordHash } from '../lib/password-recovery'
+import { deriveRecoveryPasswordHash, passwordRecoveryErrorMessage } from '../lib/password-recovery'
 import { summarizeImportErrors } from '../lib/import-error-summary'
 import { summarizeUploadBatches } from '../lib/offline/batch'
 import {
@@ -183,7 +183,7 @@ export function WebUploadPage() {
   }
 
   const recoverPasswords = async () => {
-    if (recoveringPasswords || recoveryPassword.length < 9) return
+    if (recoveringPasswords || recoveryPassword.length < 9 || recoveryPassword.length > 256) return
     setRecoveringPasswords(true)
     setRecoveryMessage(null)
     setRecoveryError(null)
@@ -193,7 +193,7 @@ export function WebUploadPage() {
       setRecoveryPassword('')
       setRecoveryMessage(`已统一重置 ${result.count} 个应用账号密码。旧登录会话已失效，请使用新密码登录。`)
     } catch (caught) {
-      setRecoveryError(caught instanceof Error ? caught.message : 'APP_PASSWORD_RECOVERY_FAILED')
+      setRecoveryError(passwordRecoveryErrorMessage(caught))
     } finally {
       setRecoveringPasswords(false)
     }
@@ -202,7 +202,7 @@ export function WebUploadPage() {
   return <main className="web-upload-shell">
     <section className="web-upload-card" aria-labelledby="web-upload-title">
       <header className="web-upload-head">
-        <div className="web-upload-brand"><span className="web-upload-mark"><UploadCloud /></span><div><p className="eyebrow">PRIVATE ARCHIVE</p><h1 id="web-upload-title">Upload Portal</h1><p className="web-upload-subtitle">安全上传照片、视频和文件到私人档案。</p></div></div>
+        <div className="web-upload-brand"><span className="web-upload-mark"><UploadCloud /></span><div><p className="eyebrow">PRIVATE ADVENTURE</p><h1 id="web-upload-title">Upload Portal</h1><p className="web-upload-subtitle">安全上传照片、视频和文件到私人档案。</p></div></div>
         <div className="web-upload-account">
           <span className="web-upload-user"><UserRound /><span><strong>Owner</strong><small>Cloudflare Access 已验证</small></span></span>
           <button className="secondary-button" type="button" onClick={() => { window.location.assign('/cdn-cgi/access/logout') }}><LogOut />退出 Access</button>
@@ -212,8 +212,9 @@ export function WebUploadPage() {
       <section className="web-upload-storage" aria-labelledby="web-account-recovery-title">
         <div className="web-upload-section-title"><h2 id="web-account-recovery-title">账号恢复</h2><p>忘记应用账号密码时，可使用当前已验证的 Cloudflare Access 身份统一重置全部应用账号。</p></div>
         <div className="account-create-grid">
-          <label><span>统一新密码</span><input value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} type="password" autoComplete="new-password" placeholder="至少 9 个字符，无其他复杂度要求" /></label>
-          <button className="secondary-button" type="button" disabled={recoveringPasswords || recoveryPassword.length < 9} onClick={() => void recoverPasswords()}>{recoveringPasswords ? <LoaderCircle className="spin" /> : <ShieldCheck />}{recoveringPasswords ? '重置中' : '统一重置全部应用账号密码'}</button>
+          <label><span>统一新密码</span><input value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} type="password" autoComplete="new-password" minLength={9} maxLength={256} aria-describedby="web-recovery-password-help" placeholder="9–256 个字符，无其他复杂度要求" /></label>
+          <small id="web-recovery-password-help" className="owner-login-copy">密码长度为 9–256 个字符。</small>
+          <button className="secondary-button" type="button" disabled={recoveringPasswords || recoveryPassword.length < 9 || recoveryPassword.length > 256} onClick={() => void recoverPasswords()}>{recoveringPasswords ? <LoaderCircle className="spin" /> : <ShieldCheck />}{recoveringPasswords ? '重置中' : '统一重置全部应用账号密码'}</button>
         </div>
         {recoveryMessage ? <p className="owner-login-copy" role="status">{recoveryMessage}</p> : null}
         {recoveryError ? <p className="inline-error web-upload-error" role="alert">{recoveryError}</p> : null}

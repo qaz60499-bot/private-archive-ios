@@ -22,7 +22,7 @@ const desktopGroups = [
 function DesktopSidebar() {
   return (
     <aside className="desktop-sidebar" aria-label="主导航">
-      <NavLink to="/" className="archive-mark" aria-label="Private Archive 首页"><ArchiveGlyph name="archive" /></NavLink>
+      <NavLink to="/" className="archive-mark" aria-label="Private Adventure 首页"><ArchiveGlyph name="archive" /></NavLink>
       <nav>
         {desktopGroups.map((items, groupIndex) => (
           <div className="rail-group" key={groupIndex}>
@@ -141,7 +141,7 @@ export function AppShell() {
       <DesktopSidebar />
       <div className="app-column">
         <header className="topbar">
-          <NavLink to="/" className="mobile-brand"><ArchiveGlyph name="archive" /><span>Private Archive</span></NavLink>
+          <NavLink to="/" className="mobile-brand"><ArchiveGlyph name="archive" /><span>Private Adventure</span></NavLink>
           <SearchBar />
           <OfflineBadge />
           <UploadButton />

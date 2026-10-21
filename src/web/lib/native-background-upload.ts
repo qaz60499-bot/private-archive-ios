@@ -1,10 +1,12 @@
 import { Capacitor, type PluginListenerHandle } from '@capacitor/core'
 import type { LocalUploadJob, MediaType, StorageBackend } from '../types'
 import { isNativeApp, nativePlatform } from './native-platform'
-import { NativeBackgroundUpload, resumeNativeBackgroundTransfer, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
+import { NativeBackgroundUpload, requireUploadPrincipal, resumeNativeBackgroundTransfer, type NativeBackgroundUploadJob } from './native-background-upload-plugin'
 import {
   getLocalUpload,
   getLocalUploadFile,
+  getLocalUploadPrincipal,
+  getLocalUploadPrincipalVersion,
   listLocalUploads,
   registerNativeLocalUpload,
   registerNativeLocalUploadMirror,
@@ -15,6 +17,34 @@ import {
 const NATIVE_CHUNK_BYTES = 2 * 1024 * 1024
 let listenerReady = false
 let listenerInitialization: Promise<boolean> | null = null
+let quarantinedNativeUploadCount = 0
+let nativePrincipalActivation: { principalId: string | null; version: number; promise: Promise<void> } | null = null
+let nativeUploadAuthenticationPending = false
+export function getQuarantinedNativeUploadCount(): number { return quarantinedNativeUploadCount }
+export function getNativeUploadAuthenticationPending(): boolean { return Boolean(getLocalUploadPrincipal()) && nativeUploadAuthenticationPending }
+
+function notifyNativeAuthenticationPending(pending: boolean): void {
+  nativeUploadAuthenticationPending = pending
+  globalThis.dispatchEvent(new CustomEvent('private-archive:native-upload-auth-pending', { detail: { pending } }))
+}
+
+export async function setIosBackgroundUploadPrincipal(principalId: string | null): Promise<void> {
+  if (!canUseIosBackgroundUpload('telegram_bot')) return
+  const version = getLocalUploadPrincipalVersion()
+  if (nativePrincipalActivation?.principalId === principalId && nativePrincipalActivation.version === version) {
+    return nativePrincipalActivation.promise
+  }
+  const activation = { principalId, version, promise: NativeBackgroundUpload.setPrincipal({ principalId }) }
+  nativePrincipalActivation = activation
+  notifyNativeAuthenticationPending(principalId !== null)
+  try {
+    await activation.promise
+    if (nativePrincipalActivation === activation) notifyNativeAuthenticationPending(false)
+  } catch (error) {
+    if (nativePrincipalActivation === activation) nativePrincipalActivation = null
+    throw error
+  }
+}
 
 export function canUseIosBackgroundUpload(storageBackend: StorageBackend): boolean {
   return storageBackend === 'telegram_bot'
@@ -33,11 +63,15 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
+  if (!job.principalId || job.principalId !== getLocalUploadPrincipal()) return
+  const principalVersion = getLocalUploadPrincipalVersion()
   let local = await getLocalUpload(job.id)
+  if (principalVersion !== getLocalUploadPrincipalVersion()) return
   if (!local && job.batchId) {
     try {
       local = await registerNativeLocalUploadMirror({
         id: job.id,
+        principalId: job.principalId,
         batchId: job.batchId,
         fileName: job.fileName,
         mimeType: job.mimeType,
@@ -57,7 +91,7 @@ async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
       return
     }
   }
-  if (!local?.nativeBackground) return
+  if (!local?.nativeBackground || local.principalId !== job.principalId || principalVersion !== getLocalUploadPrincipalVersion()) return
   await updateLocalUpload(job.id, {
     status: job.status,
     stage: job.stage,
@@ -93,12 +127,19 @@ export async function endIosBackgroundUploadStaging(): Promise<void> {
 
 async function stageNativeOriginal(options: {
   id: string
+  principalId: string
   batchId?: string
   file: File
   mediaType: MediaType
 }): Promise<NativeBackgroundUploadJob> {
+  const principalVersion = getLocalUploadPrincipalVersion()
+  const assertPrincipal = () => {
+    if (options.principalId !== getLocalUploadPrincipal() || principalVersion !== getLocalUploadPrincipalVersion()) throw new Error('UPLOAD_ACCOUNT_CHANGED')
+  }
+  assertPrincipal()
   await NativeBackgroundUpload.createJob({
     id: options.id,
+    principalId: options.principalId,
     batchId: options.batchId,
     fileName: options.file.name,
     mimeType: options.file.type || 'application/octet-stream',
@@ -109,14 +150,16 @@ async function stageNativeOriginal(options: {
   let lastStagingProgress = 0
   for (let offset = 0; offset < options.file.size; offset += NATIVE_CHUNK_BYTES) {
     const bytes = new Uint8Array(await options.file.slice(offset, Math.min(options.file.size, offset + NATIVE_CHUNK_BYTES)).arrayBuffer())
-    await NativeBackgroundUpload.appendChunk({ id: options.id, base64: bytesToBase64(bytes) })
+    assertPrincipal()
+    await NativeBackgroundUpload.appendChunk({ id: options.id, principalId: options.principalId, base64: bytesToBase64(bytes) })
     const localProgress = options.file.size ? Math.min(10, Math.round((offset + bytes.byteLength) / options.file.size * 10)) : 10
     if (localProgress > lastStagingProgress) {
       lastStagingProgress = localProgress
       await updateLocalUpload(options.id, { progress: localProgress, status: 'waiting', prepareStatus: 'ready', error: undefined })
     }
   }
-  const result = await NativeBackgroundUpload.finishJob({ id: options.id })
+  assertPrincipal()
+  const result = await NativeBackgroundUpload.finishJob({ id: options.id, principalId: options.principalId })
   await mirrorNativeJob(result.job)
   return result.job
 }
@@ -127,12 +170,16 @@ export async function pickIosBackgroundPhotos(batchId: string): Promise<{ batchI
   // attached listeners only after that recovery finished, so a user could open the
   // picker first and lose every create/finish event for the new batch. Make listener
   // readiness a hard precondition of opening the native picker.
+  const principalId = requireUploadPrincipal()
+  const principalVersion = getLocalUploadPrincipalVersion()
   if (!await ensureIosBackgroundUploadListeners()) throw new Error('NATIVE_BACKGROUND_UPLOAD_LISTENER_UNAVAILABLE')
-  return NativeBackgroundUpload.pickPhotos({ batchId })
+  if (principalVersion !== getLocalUploadPrincipalVersion()) throw new Error('UPLOAD_ACCOUNT_CHANGED')
+  return NativeBackgroundUpload.pickPhotos({ batchId, principalId })
 }
 
 export async function enqueueIosBackgroundUpload(options: {
   file: File
+  principalId?: string
   batchId: string
   mediaType: MediaType
   storageBackend: StorageBackend
@@ -142,9 +189,9 @@ export async function enqueueIosBackgroundUpload(options: {
   // Persist the complete original in the Web-side recovery store before starting the
   // JS -> Swift chunk bridge. If the process dies halfway through native staging, this
   // durable fallback is what lets startup rebuild the native .upload file automatically.
-  await registerNativeLocalUpload({ id, batchId: options.batchId, file: options.file, mediaType: options.mediaType, storageBackend: options.storageBackend })
+  const local = await registerNativeLocalUpload({ id, principalId: options.principalId, batchId: options.batchId, file: options.file, mediaType: options.mediaType, storageBackend: options.storageBackend })
   try {
-    await stageNativeOriginal({ id, batchId: options.batchId, file: options.file, mediaType: options.mediaType })
+    await stageNativeOriginal({ id, principalId: local.principalId!, batchId: options.batchId, file: options.file, mediaType: options.mediaType })
   } catch (error) {
     // Never translate an automatic staging/reservation error into cancelJob: cancelJob
     // intentionally destroys the native original. Preserve both recovery copies so a
@@ -155,8 +202,9 @@ export async function enqueueIosBackgroundUpload(options: {
 }
 
 async function restageFromDurableFallback(job: LocalUploadJob): Promise<boolean> {
+  const principalVersion = getLocalUploadPrincipalVersion()
   const file = await getLocalUploadFile(job)
-  if (!file || file.size !== job.sizeBytes) return false
+  if (!file || file.size !== job.sizeBytes || !job.principalId || job.principalId !== getLocalUploadPrincipal() || principalVersion !== getLocalUploadPrincipalVersion()) return false
   await updateLocalUpload(job.id, {
     status: 'retrying',
     prepareStatus: 'ready',
@@ -167,19 +215,37 @@ async function restageFromDurableFallback(job: LocalUploadJob): Promise<boolean>
   // removeJob is intentionally used instead of cancelJob: this is an automatic repair
   // of an incomplete native staging file, not a user cancellation. The Web-side copy
   // remains intact while the native cache is rebuilt under the same job id.
-  await NativeBackgroundUpload.removeJob({ id: job.id }).catch(() => undefined)
-  await stageNativeOriginal({ id: job.id, batchId: job.batchId, file, mediaType: job.mediaType })
+  await NativeBackgroundUpload.removeJob({ id: job.id, principalId: job.principalId })
+  await stageNativeOriginal({ id: job.id, principalId: job.principalId, batchId: job.batchId, file, mediaType: job.mediaType })
   return true
 }
 
 export async function syncIosBackgroundUploads(): Promise<void> {
   if (!isNativeApp() || nativePlatform() !== 'ios') return
+  const principalId = getLocalUploadPrincipal()
+  if (!principalId) return
+  const principalVersion = getLocalUploadPrincipalVersion()
+  const assertPrincipal = () => {
+    if (principalVersion !== getLocalUploadPrincipalVersion()) throw new Error('UPLOAD_ACCOUNT_CHANGED')
+  }
   try {
-    let result = await NativeBackgroundUpload.listJobs()
+    await setIosBackgroundUploadPrincipal(principalId)
+    assertPrincipal()
+    // Only a pre-existing persisted owner is migration evidence. Native jobs with no
+    // such mirror remain quarantined; an Owner login is not proof of their creator.
+    const ownedMirrors = (await listLocalUploads()).filter((job) => job.nativeBackground && job.principalId === principalId)
+    assertPrincipal()
+    await NativeBackgroundUpload.adoptLegacyJobs({ principalId, ids: ownedMirrors.map((job) => job.id) })
+    assertPrincipal()
+    let result = await NativeBackgroundUpload.listJobs({ principalId })
+    assertPrincipal()
+    quarantinedNativeUploadCount = result.quarantinedCount ?? 0
+    globalThis.dispatchEvent(new CustomEvent('private-archive:native-upload-quarantined', { detail: { count: quarantinedNativeUploadCount } }))
     await Promise.all(result.items.map(mirrorNativeJob))
 
     const localJobs = (await listLocalUploads()).filter((job) =>
       job.nativeBackground && job.status !== 'done' && job.controlState !== 'canceled')
+    assertPrincipal()
     const localById = new Map(localJobs.map((job) => [job.id, job]))
     let nativeById = new Map(result.items.map((job) => [job.id, job]))
 
@@ -193,7 +259,8 @@ export async function syncIosBackgroundUploads(): Promise<void> {
         ...missingNative.map((job) => resumeNativeBackgroundTransfer(job)),
         ...failedNative.map((native) => resumeNativeBackgroundTransfer(localById.get(native.id)!)),
       ])
-      result = await NativeBackgroundUpload.listJobs()
+      assertPrincipal()
+      result = await NativeBackgroundUpload.listJobs({ principalId })
       await Promise.all(result.items.map(mirrorNativeJob))
       nativeById = new Map(result.items.map((job) => [job.id, job]))
     }
@@ -209,12 +276,14 @@ export async function syncIosBackgroundUploads(): Promise<void> {
       await beginIosBackgroundUploadStaging()
       try {
         for (const job of needsRestage) {
+          assertPrincipal()
           try { await restageFromDurableFallback(job) } catch { /* preserve fallback and continue repairing siblings */ }
         }
       } finally {
         await endIosBackgroundUploadStaging()
       }
-      result = await NativeBackgroundUpload.listJobs()
+      assertPrincipal()
+      result = await NativeBackgroundUpload.listJobs({ principalId })
       await Promise.all(result.items.map(mirrorNativeJob))
     }
   } catch {
@@ -231,7 +300,8 @@ async function ensureIosBackgroundUploadListeners(): Promise<boolean> {
     let pickerHandle: PluginListenerHandle | null = null
     try {
       stateHandle = await NativeBackgroundUpload.addListener('stateChanged', ({ job }) => { void mirrorNativeJob(job) })
-      pickerHandle = await NativeBackgroundUpload.addListener('pickerError', ({ batchId, jobId, message }) => {
+      pickerHandle = await NativeBackgroundUpload.addListener('pickerError', ({ batchId, principalId, jobId, message }) => {
+        if (!principalId || principalId !== getLocalUploadPrincipal()) return
         globalThis.dispatchEvent(new CustomEvent('private-archive:native-picker-error', { detail: { batchId, jobId, message } }))
       })
       listenerReady = true
