@@ -167,6 +167,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         loadState()
         for record in records.values.sorted(by: { $0.createdAt > $1.createdAt }).prefix(3) {
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded job=%@ status=%@ progress=%.0f stage=%@ ownerKnown=%d taskOwned=%d originalPresent=%d", record.id, record.status, record.progress, record.stage, record.principalId != nil ? 1 : 0, record.contentTaskToken != nil ? 1 : 0, fileManager.fileExists(atPath: originalURL(record.id).path) ? 1 : 0)
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded-retry job=%@ attempts=%ld hasError=%d unconfirmed=%d expired=%d inProgress=%d", record.id, record.attempts, record.error != nil ? 1 : 0, record.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0, record.error == "UPLOAD_TOKEN_INVALID_OR_EXPIRED" ? 1 : 0, record.error == "UPLOAD_ALREADY_IN_PROGRESS" ? 1 : 0)
         }
         recoverInterruptedStaging()
         recoverRetryableFailures()
@@ -1672,7 +1673,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 
                 var validContentIds = Set<String>()
                 var needsContentRestartIds = Set<String>()
-                for task in contentTasks {
+                for (taskIndex, task) in contentTasks.enumerated() {
+                    if taskIndex < 3 {
+                        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG task task=%ld state=%ld sent=%lld expected=%lld received=%lld http=%ld earliestSeconds=%.0f", task.taskIdentifier, task.state.rawValue, task.countOfBytesSent, task.countOfBytesExpectedToSend, task.countOfBytesReceived, (task.response as? HTTPURLResponse)?.statusCode ?? 0, task.earliestBeginDate?.timeIntervalSinceNow ?? 0)
+                    }
                     guard let id = self.taskJobId(task) else {
                         task.cancel()
                         continue
@@ -1681,6 +1685,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     let ownership = self.stateQueue.sync { () -> (Bool, NativeUploadRecord?) in
                         guard var current = self.records[id], current.principalId != nil, current.ready,
                               current.status != "done", current.status != "failed", current.status != "paused" else { return (false, nil) }
+                        if taskIndex < 3 {
+                            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG task-owner job=%@ task=%ld generationMatch=%d requestMatch=%d attempts=%ld unconfirmed=%d", id, task.taskIdentifier, current.contentTaskToken == taskIdentity ? 1 : 0, self.contentRequestMatchesRecord(task, record: current) ? 1 : 0, current.attempts, current.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0)
+                        }
                         guard self.contentRequestMatchesRecord(task, record: current) else {
                             if current.contentTaskToken == taskIdentity {
                                 current.contentTaskToken = nil

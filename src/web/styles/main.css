@@ -5210,6 +5210,7 @@ body.upload-open .mobile-nav-dock {
 .archive-recent-link {
   min-height: 40px;
   padding-inline: 8px;
+  color: var(--ink);
 }
 
 .memory-aperture[data-render-mode="dom"] .memory-aperture-stage {
