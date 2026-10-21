@@ -51,8 +51,8 @@ test('shows quarantined old native jobs without exposing their filenames', async
     window.dispatchEvent(new CustomEvent('private-archive:native-upload-quarantined', { detail: { count: 3 } }))
   })
 
-  const notice = page.getByRole('status').filter({ hasText: '有 3 项旧版上传尚未确认所属账号' })
-  await expect(notice).toHaveText('有 3 项旧版上传尚未确认所属账号，原件已保留，暂未自动上传。')
+  const notice = page.getByRole('status').filter({ hasText: '有 3 项旧版未完成任务尚未确认所属账号' })
+  await expect(notice).toHaveText('有 3 项旧版未完成任务尚未确认所属账号，暂未自动上传。')
   await expect(page.getByText(/旧版.*\.jpg|旧版.*\.heic/)).toHaveCount(0)
 
   await page.evaluate(() => {

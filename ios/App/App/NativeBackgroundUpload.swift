@@ -168,6 +168,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         for record in records.values.sorted(by: { $0.createdAt > $1.createdAt }).prefix(3) {
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded job=%@ status=%@ progress=%.0f stage=%@ ownerKnown=%d taskOwned=%d originalPresent=%d", record.id, record.status, record.progress, record.stage, record.principalId != nil ? 1 : 0, record.contentTaskToken != nil ? 1 : 0, fileManager.fileExists(atPath: originalURL(record.id).path) ? 1 : 0)
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded-retry job=%@ attempts=%ld hasError=%d unconfirmed=%d expired=%d inProgress=%d", record.id, record.attempts, record.error != nil ? 1 : 0, record.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0, record.error == "UPLOAD_TOKEN_INVALID_OR_EXPIRED" ? 1 : 0, record.error == "UPLOAD_ALREADY_IN_PROGRESS" ? 1 : 0)
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded-cache job=%@ completeSize=%d", record.id, (try? fileSize(originalURL(record.id))) == record.sizeBytes ? 1 : 0)
         }
         recoverInterruptedStaging()
         recoverRetryableFailures()
