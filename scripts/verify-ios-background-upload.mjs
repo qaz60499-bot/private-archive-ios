@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 
 const source = readFileSync(new URL('../ios/App/App/NativeBackgroundUpload.swift', import.meta.url), 'utf8')
 const appDelegateSource = readFileSync(new URL('../ios/App/App/AppDelegate.swift', import.meta.url), 'utf8')
+const sceneDelegateSource = readFileSync(new URL('../ios/App/App/SceneDelegate.swift', import.meta.url), 'utf8')
 const bridgeSource = readFileSync(new URL('../src/web/lib/native-background-upload.ts', import.meta.url), 'utf8')
 const storeSource = readFileSync(new URL('../src/web/lib/offline/store.ts', import.meta.url), 'utf8')
 const processorSource = readFileSync(new URL('../src/web/lib/offline/processor.ts', import.meta.url), 'utf8')
@@ -26,7 +27,9 @@ assert(!source.includes('reserveSession.uploadTask'), 'new reservation handshake
 assert(source.includes('identifier == Self.sessionIdentifier || identifier == Self.legacyReserveSessionIdentifier'), 'native background-event bridge must drain both content and legacy reserve sessions')
 assert(appDelegateSource.includes('handleEventsForBackgroundURLSession identifier: String'), 'AppDelegate must receive iOS background URLSession wakeups')
 assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.handleBackgroundEvents'), 'AppDelegate must forward background URLSession wakeups to the upload manager')
-assert(appDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'AppDelegate must reconcile uploads on background transition')
+assert(sceneDelegateSource.includes('func sceneDidEnterBackground(') && sceneDelegateSource.includes('NativeBackgroundUploadManager.shared.resumePendingTransfers()'), 'the configured scene must reconcile uploads on background transition')
+assert(sceneDelegateSource.includes('func sceneDidBecomeActive(') && sceneDelegateSource.includes('NativeBackgroundUploadManager.shared.startForegroundRecoveryWatchdog()'), 'the configured scene must start existing foreground recovery')
+assert(sceneDelegateSource.includes('func sceneWillResignActive(') && sceneDelegateSource.includes('NativeBackgroundUploadManager.shared.stopForegroundRecoveryWatchdog()'), 'scene inactivity must stop foreground recovery')
 assert(source.includes('PRIVATE_ARCHIVE_API_BASE_OVERRIDE') && source.includes('PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED'), 'Debug build must include the simulator reserve-to-content protocol smoke')
 assert(source.includes('PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE') && source.includes('authenticatePrincipal("protocol-smoke", cookies: ["pa_account=stale-account", "pa_account=protocol-smoke-session"]'), 'Debug localhost protocol smoke must validate stale and current explicit cookies without depending on Simulator IP-cookie persistence')
 assert(source.includes('private lazy var protocolSmokeContentSession: URLSession'), 'Debug protocol smoke must have a localhost-capable delegated content transport')

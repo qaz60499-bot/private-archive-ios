@@ -68,16 +68,20 @@ async function localPayloads(page: Page): Promise<Array<{ key: string; byteLengt
   }))
 }
 
-async function mockSuccessfulBoundary(page: Page, contentDelayMs = 0): Promise<{ maxActive: () => number; contentCalls: () => number }> {
+async function mockSuccessfulBoundary(page: Page, contentDelayMs = 0, firstWaveSize = 0): Promise<{ maxActive: () => number; contentCalls: () => number }> {
   let active = 0
   let maximum = 0
   let calls = 0
+  let releaseFirstWave!: () => void
+  const firstWave = new Promise<void>((resolve) => { releaseFirstWave = resolve })
   await page.route('**/api/assets/reserve', async (route) => {
     const body = route.request().postDataJSON() as { originalName: string }
     await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ assetId: `asset-${body.originalName}`, uploadToken: 'token', duplicate: false, sizeTier: 'inline' }) })
   })
   await page.route('**/api/assets/*/content', async (route) => {
     active += 1; calls += 1; maximum = Math.max(maximum, active)
+    if (calls === firstWaveSize) releaseFirstWave()
+    if (firstWaveSize > 0 && calls <= firstWaveSize) await firstWave
     if (contentDelayMs) await new Promise((resolve) => setTimeout(resolve, contentDelayMs))
     active -= 1
     const assetId = new URL(route.request().url()).pathname.split('/').at(-2)!
@@ -88,7 +92,9 @@ async function mockSuccessfulBoundary(page: Page, contentDelayMs = 0): Promise<{
 
 test('20-item desktop batch respects upload concurrency and releases completed payloads', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'desktop concurrency contract')
-  const boundary = await mockSuccessfulBoundary(page, 120)
+  // Keep the first request open until a second starts: CPU-dependent file preparation
+  // must not turn the concurrency assertion into a race against a 120ms mock response.
+  const boundary = await mockSuccessfulBoundary(page, 120, 2)
   await openUpload(page)
   await chooseFiles(page, Array.from({ length: 20 }, (_, index) => `batch-20-${index}.pdf`))
 

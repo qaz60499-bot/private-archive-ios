@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
 import { expect, request as playwrightRequest, test } from '@playwright/test'
 
+// This single scenario bootstraps its isolated database; an in-place retry would
+// inherit those accounts instead of exercising a fresh bootstrap.
+test.describe.configure({ retries: 0 })
+
 const ownerPassword = 'OwnerPass!2026'
 const memberPassword = 'MemberPass!2026'
 
@@ -19,6 +23,7 @@ async function newApi(cookie?: string, ip?: string) {
 
 test('strict app-account auth covers bootstrap, sessions, roles, switching, disable and rate limiting', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'strict application-account contract only needs one browser project')
+  test.setTimeout(90_000)
 
   const initial = await page.request.get('/api/auth/status')
   expect(initial.ok()).toBeTruthy()

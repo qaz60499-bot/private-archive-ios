@@ -18,6 +18,20 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         SceneDelegateProxy.shared.scene(scene, openURLContexts: URLContexts)
     }
 
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        // This app enables scenes, so UIKit delivers UI lifecycle transitions here
+        // instead of the corresponding UIApplicationDelegate callbacks.
+        NativeBackgroundUploadManager.shared.startForegroundRecoveryWatchdog()
+    }
+
+    func sceneWillResignActive(_ scene: UIScene) {
+        NativeBackgroundUploadManager.shared.stopForegroundRecoveryWatchdog()
+    }
+
+    func sceneDidEnterBackground(_ scene: UIScene) {
+        NativeBackgroundUploadManager.shared.resumePendingTransfers()
+    }
+
     func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
         SceneDelegateProxy.shared.scene(scene, continue: userActivity)
     }

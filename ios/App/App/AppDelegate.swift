@@ -24,25 +24,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         }
     }
 
-    func applicationWillResignActive(_ application: UIApplication) {
-        NativeBackgroundUploadManager.shared.stopForegroundRecoveryWatchdog()
-    }
-
-    func applicationDidEnterBackground(_ application: UIApplication) {
-        // Make sure every already-staged original remains attached to the durable
-        // background URLSession before the WebView is suspended.
-        NativeBackgroundUploadManager.shared.resumePendingTransfers()
-    }
-
     func applicationWillEnterForeground(_ application: UIApplication) {
         // Called as part of the transition from the background to the active state; here you can undo many of the changes made on entering the background.
-    }
-
-    func applicationDidBecomeActive(_ application: UIApplication) {
-        // Reconcile immediately and keep rechecking while the app is foregrounded.
-        // This prevents a task that was not yet stale at launch from remaining frozen
-        // forever at values such as 34% after the app is reopened.
-        NativeBackgroundUploadManager.shared.startForegroundRecoveryWatchdog()
     }
 
     func applicationWillTerminate(_ application: UIApplication) {

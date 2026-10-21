@@ -20,8 +20,20 @@ let listenerInitialization: Promise<boolean> | null = null
 let quarantinedNativeUploadCount = 0
 let nativePrincipalActivation: { principalId: string | null; version: number; promise: Promise<void> } | null = null
 let nativeUploadAuthenticationPending = false
+const nativeUploadJobQueues = new Map<string, Promise<void>>()
 export function getQuarantinedNativeUploadCount(): number { return quarantinedNativeUploadCount }
 export function getNativeUploadAuthenticationPending(): boolean { return Boolean(getLocalUploadPrincipal()) && nativeUploadAuthenticationPending }
+
+export function serializeNativeBackgroundUploadJob<T>(id: string, operation: () => Promise<T>): Promise<T> {
+  const previous = nativeUploadJobQueues.get(id) ?? Promise.resolve()
+  const result = previous.catch(() => undefined).then(operation)
+  const tail = result.then(() => undefined, () => undefined)
+  nativeUploadJobQueues.set(id, tail)
+  void tail.then(() => {
+    if (nativeUploadJobQueues.get(id) === tail) nativeUploadJobQueues.delete(id)
+  })
+  return result
+}
 
 function notifyNativeAuthenticationPending(pending: boolean): void {
   nativeUploadAuthenticationPending = pending
@@ -63,6 +75,10 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
+  await serializeNativeBackgroundUploadJob(job.id, () => mirrorNativeJobInOrder(job))
+}
+
+async function mirrorNativeJobInOrder(job: NativeBackgroundUploadJob): Promise<void> {
   if (!job.principalId || job.principalId !== getLocalUploadPrincipal()) return
   const principalVersion = getLocalUploadPrincipalVersion()
   let local = await getLocalUpload(job.id)
@@ -92,6 +108,9 @@ async function mirrorNativeJob(job: NativeBackgroundUploadJob): Promise<void> {
     }
   }
   if (!local?.nativeBackground || local.principalId !== job.principalId || principalVersion !== getLocalUploadPrincipalVersion()) return
+  // A queued or delayed pre-completion snapshot must never resurrect a completed job
+  // after its recovery payload has been released.
+  if (local.status === 'done' && job.status !== 'done') return
   await updateLocalUpload(job.id, {
     status: job.status,
     stage: job.stage,

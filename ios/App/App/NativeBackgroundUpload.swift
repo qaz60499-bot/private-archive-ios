@@ -165,8 +165,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         super.init()
         _ = rootDirectory
         loadState()
+        for record in records.values.sorted(by: { $0.createdAt > $1.createdAt }).prefix(3) {
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded job=%@ status=%@ progress=%.0f stage=%@ ownerKnown=%d taskOwned=%d originalPresent=%d", record.id, record.status, record.progress, record.stage, record.principalId != nil ? 1 : 0, record.contentTaskToken != nil ? 1 : 0, fileManager.fileExists(atPath: originalURL(record.id).path) ? 1 : 0)
+        }
         recoverInterruptedStaging()
         recoverRetryableFailures()
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG init records=%ld unfinished=%ld", records.count, records.values.filter { $0.status != "done" }.count)
         _ = session
         _ = legacyReserveSession
         reconcileTasks()
@@ -288,7 +292,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func quarantinedJobCount() -> Int {
-        stateQueue.sync { records.values.filter { $0.principalId == nil }.count }
+        // Completed legacy records no longer have an upload to recover. Keep their
+        // history, but do not claim they still hold quarantined originals.
+        stateQueue.sync { records.values.filter { $0.principalId == nil && $0.status != "done" }.count }
     }
 
     private func mayScheduleLocked(_ record: NativeUploadRecord, cookieOverride: String?) -> Bool {
@@ -533,7 +539,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     func listJobs(principalId: String? = nil) -> [NativeUploadRecord] {
         stateQueue.sync {
             guard principalId == nil || principalId == activePrincipalId else { return [] }
-            return records.values.filter { $0.principalId != nil && $0.principalId == activePrincipalId }.sorted { $0.createdAt > $1.createdAt }
+            let jobs = records.values.filter { $0.principalId != nil && $0.principalId == activePrincipalId }.sorted { $0.createdAt > $1.createdAt }
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG list visible=%ld done=%ld unfinished=%ld", jobs.count, jobs.filter { $0.status == "done" }.count, jobs.filter { $0.status != "done" }.count)
+            for record in jobs.prefix(3) {
+                NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG snapshot job=%@ status=%@ progress=%.0f stage=%@ taskOwned=%d originalPresent=%d", record.id, record.status, record.progress, record.stage, record.contentTaskToken != nil ? 1 : 0, fileManager.fileExists(atPath: originalURL(record.id).path) ? 1 : 0)
+            }
+            return jobs
         }
     }
 
@@ -865,6 +876,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func startForegroundRecoveryWatchdog() {
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG foreground-start")
         let generation = stateQueue.sync { () -> Int in
             foregroundWatchdogGeneration += 1
             return foregroundWatchdogGeneration
@@ -875,6 +887,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func stopForegroundRecoveryWatchdog() {
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG foreground-stop")
         stateQueue.sync { foregroundWatchdogGeneration += 1 }
     }
 
@@ -1281,6 +1294,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
         task.earliestBeginDate = earliest
         task.priority = URLSessionTask.highPriority
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG scheduled job=%@ task=%ld pathMatch=%d delayed=%d", record.id, task.taskIdentifier, contentRequestMatchesRecord(task, record: updated) ? 1 : 0, delayed ? 1 : 0)
         notify(updated)
         task.resume()
     }
@@ -1522,7 +1536,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             saveStateLocked()
             return value
         }
-        guard let finished else { return }
+        guard let finished else {
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG complete-rejected job=%@", record.id)
+            return
+        }
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG completed job=%@ deduplicated=%d", record.id, deduplicated ? 1 : 0)
         notify(finished)
         cleanupFiles(record.id)
     }
@@ -1647,6 +1665,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             legacyReserveTasks.forEach { $0.cancel() }
 
             self.session.getAllTasks { allBackgroundTasks in
+                NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG reconcile backgroundTasks=%ld records=%ld", allBackgroundTasks.count, recordsById.count)
                 let legacyReserveOnContentSession = allBackgroundTasks.filter { self.taskStage($0) == "reserve" }
                 legacyReserveOnContentSession.forEach { $0.cancel() }
                 let contentTasks = allBackgroundTasks.filter { self.taskStage($0) == "content" }
@@ -1781,8 +1800,12 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let id = taskJobId(task), let stage = taskStage(task) else { return }
+        guard let id = taskJobId(task), let stage = taskStage(task) else {
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected task=%ld reason=description", task.taskIdentifier)
+            return
+        }
         let data = responseBuffers.removeValue(forKey: taskBufferKey(session, task: task)) ?? Data()
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback job=%@ task=%ld http=%ld bytes=%ld errorCode=%ld", id, task.taskIdentifier, (task.response as? HTTPURLResponse)?.statusCode ?? 0, data.count, (error as NSError?)?.code ?? 0)
         if stage == "reserve" {
             // Delegate-driven reserve tasks can only come from an older installed build.
             // New reservations complete through foregroundSession's closure. Never let a
@@ -1794,9 +1817,19 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if stage == "content" {
             let taskIdentity = contentTaskIdentity(task)
             record = stateQueue.sync { () -> NativeUploadRecord? in
-                guard var current = records[id], contentRequestMatchesRecord(task, record: current) else { return nil }
+                guard var current = records[id] else {
+                    NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=record-missing", id)
+                    return nil
+                }
+                guard contentRequestMatchesRecord(task, record: current) else {
+                    NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=request-match ready=%d stageOriginal=%d assetPresent=%d capabilityPresent=%d pathMatch=%d", id, current.ready ? 1 : 0, current.stage == "original" ? 1 : 0, current.remoteAssetId != nil ? 1 : 0, current.uploadToken != nil ? 1 : 0, task.originalRequest?.url?.path == current.remoteAssetId.map { "/api/assets/\($0)/content" } ? 1 : 0)
+                    return nil
+                }
                 if let owner = current.contentTaskToken {
-                    guard owner == taskIdentity else { return nil }
+                    guard owner == taskIdentity else {
+                        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=task-generation", id)
+                        return nil
+                    }
                 } else {
                     // In-place upgrades can inherit a legacy content task whose old
                     // taskDescription had no generation token. Claim that single task
@@ -1810,7 +1843,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 return current
             }
             guard let current = record,
-                  current.status != "done", current.status != "failed", current.status != "paused" else { return }
+                  current.status != "done", current.status != "failed", current.status != "paused" else {
+                NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=terminal-or-unmatched", id)
+                return
+            }
         } else {
             record = stateQueue.sync(execute: { records[id] })
             guard record != nil else { return }
@@ -1840,6 +1876,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let code = responseErrorCode(data)
 
         if (200...299).contains(status) {
+            let acknowledgement = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let acknowledgedAsset = acknowledgement?["asset"] as? [String: Any]
+            let storedStatuses = ["stored", "queued", "analyzing", "ready", "limited"]
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG acknowledgement job=%@ json=%d noError=%d idMatch=%d storedStatus=%d", id, acknowledgement != nil ? 1 : 0, acknowledgement?["error"] == nil ? 1 : 0, acknowledgedAsset?["id"] as? String == record.remoteAssetId ? 1 : 0, storedStatuses.contains(acknowledgedAsset?["status"] as? String ?? "") ? 1 : 0)
             guard hasStoredContentAcknowledgement(data, record: record) else {
 #if DEBUG
                 verifyProtocolSmokeOriginalRetention(record, response: response)

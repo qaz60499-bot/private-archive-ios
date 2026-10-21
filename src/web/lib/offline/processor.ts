@@ -8,6 +8,7 @@ import {
 import type { LocalUploadJob } from '../../types'
 import { calculateRetryDelay, friendlyUploadError, getUploadSchedulerLimits as policyLimits } from './scheduler-policy'
 import { cancelNativeBackgroundTransfer, pauseNativeBackgroundTransfer, removeNativeBackgroundTransfer, resumeNativeBackgroundTransfer } from '../native-background-upload-plugin'
+import { serializeNativeBackgroundUploadJob } from '../native-background-upload'
 
 export { calculateRetryDelay, friendlyUploadError } from './scheduler-policy'
 
@@ -18,6 +19,19 @@ const subscribers = new Set<() => void>()
 let schedulerPromise: Promise<void> | null = null
 let scheduledTimer: ReturnType<typeof globalThis.setTimeout> | undefined
 let throttledUntil = 0
+const latestUploadControlIntent = new Map<string, symbol>()
+
+function withUploadControlIntent<T>(id: string, operation: (intent: symbol) => Promise<T>): Promise<T> {
+  const intent = Symbol(id)
+  latestUploadControlIntent.set(id, intent)
+  return operation(intent).finally(() => {
+    if (latestUploadControlIntent.get(id) === intent) latestUploadControlIntent.delete(id)
+  })
+}
+
+function isLatestUploadControlIntent(id: string, intent: symbol): boolean {
+  return latestUploadControlIntent.get(id) === intent
+}
 
 subscribeLocalUploadPrincipal(() => {
   activePrepare.forEach((controller) => controller.abort())
@@ -351,41 +365,76 @@ export function resumePendingUploads(): Promise<void> {
   return wakeUploadScheduler('legacy-resume')
 }
 
-export async function pauseLocalUpload(id: string): Promise<void> {
-  const job = await getLocalUpload(id)
-  if (!job) return
-  if (job?.nativeBackground) await pauseNativeBackgroundTransfer(id)
-  await updateLocalUpload(id, {
-    controlState: 'paused', status: 'paused', error: '已暂停，原件仍安全保存在本机。',
-    prepareStatus: job?.prepareStatus === 'preparing' ? 'pending' : job?.prepareStatus,
-    stage: job?.prepareStatus === 'preparing' ? 'registered' : job?.stage,
+export function pauseLocalUpload(id: string): Promise<void> {
+  return withUploadControlIntent(id, async (intent) => {
+    const principalVersion = getLocalUploadPrincipalVersion()
+    const job = await getLocalUpload(id)
+    if (!job) return
+    const pause = (current: LocalUploadJob) => updateLocalUpload(id, {
+      controlState: 'paused', status: 'paused', error: '已暂停，原件仍安全保存在本机。',
+      prepareStatus: current.prepareStatus === 'preparing' ? 'pending' : current.prepareStatus,
+      stage: current.prepareStatus === 'preparing' ? 'registered' : current.stage,
+    })
+    if (job.nativeBackground) {
+      if (!isLatestUploadControlIntent(id, intent)) return
+      await pauseNativeBackgroundTransfer(id)
+      if (!isLatestUploadControlIntent(id, intent) || principalVersion !== getLocalUploadPrincipalVersion() || job.principalId !== getLocalUploadPrincipal()) return
+      const updated = await serializeNativeBackgroundUploadJob(id, async () => {
+        const current = await getLocalUpload(id)
+        if (!isLatestUploadControlIntent(id, intent) || principalVersion !== getLocalUploadPrincipalVersion() || !current || current.principalId !== job.principalId || current.status === 'done' || current.controlState === 'canceled') return undefined
+        return pause(current)
+      })
+      if (!updated) return
+    } else {
+      await pause(job)
+    }
+    activePrepare.get(id)?.abort()
+    activeUpload.get(id)?.abort()
+    notify()
   })
-  activePrepare.get(id)?.abort()
-  activeUpload.get(id)?.abort()
-  notify()
 }
 
-export async function resumeLocalUpload(id: string): Promise<void> {
-  const job = await getLocalUpload(id)
-  if (!job) return
-  if (job?.nativeBackground) {
-    try {
-      await resumeNativeBackgroundTransfer(job)
-    } catch (error) {
-      await updateLocalUpload(id, {
-        controlState: 'active', status: 'failed', nextAttemptAt: undefined,
-        error: error instanceof Error ? error.message : '后台上传无法恢复，请重新选择原文件。',
-      })
-      notify()
-      return
+export function resumeLocalUpload(id: string): Promise<void> {
+  return withUploadControlIntent(id, async (intent) => {
+    const principalVersion = getLocalUploadPrincipalVersion()
+    const job = await getLocalUpload(id)
+    if (!job) return
+    if (job?.nativeBackground) {
+      if (!isLatestUploadControlIntent(id, intent)) return
+      try {
+        await resumeNativeBackgroundTransfer(job)
+      } catch (error) {
+        if (!isLatestUploadControlIntent(id, intent) || principalVersion !== getLocalUploadPrincipalVersion() || job.principalId !== getLocalUploadPrincipal()) return
+        await serializeNativeBackgroundUploadJob(id, async () => {
+          const current = await getLocalUpload(id)
+          if (!isLatestUploadControlIntent(id, intent) || principalVersion !== getLocalUploadPrincipalVersion() || !current || current.principalId !== job.principalId || current.status === 'done' || current.controlState === 'canceled') return
+          await updateLocalUpload(id, {
+            controlState: 'active', status: 'failed', nextAttemptAt: undefined,
+            error: error instanceof Error ? error.message : '后台上传无法恢复，请重新选择原文件。',
+          })
+        })
+        notify()
+        return
+      }
     }
-  }
-  await updateLocalUpload(id, {
-    controlState: 'active', status: 'retrying', nextAttemptAt: undefined, error: undefined,
-    prepareStatus: job?.prepareStatus === 'failed' ? 'pending' : job?.prepareStatus,
+    const resume = (current: LocalUploadJob) => updateLocalUpload(id, {
+      controlState: 'active', status: 'retrying', nextAttemptAt: undefined, error: undefined,
+      prepareStatus: current.prepareStatus === 'failed' ? 'pending' : current.prepareStatus,
+    })
+    if (job.nativeBackground) {
+      if (!isLatestUploadControlIntent(id, intent) || principalVersion !== getLocalUploadPrincipalVersion() || job.principalId !== getLocalUploadPrincipal()) return
+      const updated = await serializeNativeBackgroundUploadJob(id, async () => {
+        const current = await getLocalUpload(id)
+        if (!isLatestUploadControlIntent(id, intent) || principalVersion !== getLocalUploadPrincipalVersion() || !current || current.principalId !== job.principalId || current.status === 'done' || current.controlState === 'canceled') return undefined
+        return resume(current)
+      })
+      if (!updated) return
+    } else {
+      await resume(job)
+    }
+    notify()
+    if (!job?.nativeBackground) await wakeUploadScheduler('resume-job')
   })
-  notify()
-  if (!job?.nativeBackground) await wakeUploadScheduler('resume-job')
 }
 
 export async function cancelLocalUpload(id: string): Promise<void> {

@@ -115,7 +115,7 @@ export function UploadQueue({ compact = false, suspended = false }: { compact?: 
   if (suspended) return null
   const batches = summarizeUploadBatches(jobs)
   const quarantineNotice = quarantineCount > 0
-    ? <p className="offline-notice upload-quarantine-notice" role="status">有 {quarantineCount} 项旧版上传尚未确认所属账号，原件已保留，暂未自动上传。</p>
+    ? <p className="offline-notice upload-quarantine-notice" role="status">有 {quarantineCount} 项旧版未完成任务尚未确认所属账号，暂未自动上传。</p>
     : null
   const authenticationNotice = authenticationPending
     ? <p className="offline-notice upload-auth-pending-notice" role="status">后台上传正在等待登录验证，原件与队列已保留；网络恢复后会重试。</p>
@@ -241,7 +241,7 @@ export function UploadSheet() {
         <div><strong>{importStatus.phase === 'complete' ? (importStatus.error ? '部分文件未能写入本机队列' : '全部文件已写入本机恢复队列') : '正在写入本机恢复队列…'}</strong><span>本次已选择 {importStatus.total} 项 · 本机已保存 {importStatus.queued} 项 · 已检查 {importStatus.processed}/{importStatus.total}</span></div>
         <div className="progress"><i style={{ width: `${importStatus.total ? Math.round(importStatus.processed / importStatus.total * 100) : 0}%` }} /></div>
       </div>}
-      {storageBackend === 'telegram_user_group' ? <div className="size-policy"><div><b>MTProto</b><span>原件不经过 Bot getFile</span></div><div><b>大文件</b><span>适用当前 Telegram 账户限制</span></div><div><b>恢复</b><span>由本机 Bridge 下载</span></div></div> : <div className="size-policy"><div><b>≤20 MB</b><span>Bot 存储可上传 / 恢复</span></div><div><b>&gt;20 MB</b><span>请切换私人群组</span></div><div><b>无 fallback</b><span>不会静默改存储后端</span></div></div>}
+      {storageBackend === 'telegram_user_group' ? <div className="size-policy"><div><b>MTProto</b><span>原件不经过 Bot getFile</span></div><div><b>大文件</b><span>适用当前 Telegram 账户限制</span></div><div><b>恢复</b><span>由本机 Bridge 下载</span></div></div> : <div className="size-policy"><div><b>≤20 MB</b><span>Bot 存储可上传 / 恢复</span></div><div><b>&gt;20 MB</b><span>{nativeIos ? '请在电脑使用私人群组上传' : '请切换私人群组'}</span></div><div><b>无 fallback</b><span>不会静默改存储后端</span></div></div>}
       {!online && <p className="offline-notice"><WifiOff />当前离线。文件已进入本机队列，恢复网络并打开 PWA 后会继续。</p>}
       {error && <p className="inline-error" role="alert">{error}</p>}
       <UploadQueue compact />
