@@ -1,5 +1,5 @@
 import { enqueueLocalUpload, getLocalUploadPrincipal } from './offline/store'
-import { wakeUploadScheduler } from './offline/processor'
+import { notifyUploadQueueChanged, wakeUploadScheduler } from './offline/processor'
 import {
   beginIosBackgroundUploadStaging,
   canUseIosBackgroundUpload,
@@ -84,7 +84,9 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
     processed += 1
     report('registering', windowNumber)
     if (storageBackend === 'telegram_bot' && file.size > MAX_UPLOAD_BYTES) {
-      errors.push(`${file.name} 超过 Bot 存储安全处理范围，请切换到“Telegram 私人群组”。不会自动回退到 Bot。`)
+      errors.push(iosBackgroundUpload
+        ? `${file.name} 超过 iPhone Bot 上传的 20 MB 范围，请在电脑上使用“Telegram 私人群组”上传。`
+        : `${file.name} 超过 Bot 存储安全处理范围，请切换到“Telegram 私人群组”。不会自动回退到 Bot。`)
       return
     }
     try {
@@ -94,6 +96,9 @@ export async function importFiles(files: FileList | File[], online: boolean, opt
       } else {
         await enqueueLocalUpload({ file, principalId: principalId!, batchId, mediaType, persistPayload, storageBackend })
       }
+      // Offline imports do not wake the network scheduler, but their durable jobs
+      // must still reach the shared queue snapshot immediately.
+      notifyUploadQueueChanged()
       queued += 1
       report('registering', windowNumber)
       if (online && navigator.onLine && !iosBackgroundUpload) void wakeUploadScheduler('import-window')

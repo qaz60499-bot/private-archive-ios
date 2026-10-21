@@ -1,6 +1,9 @@
 import { expect, test, type Page } from '@playwright/test'
 
 const tinyPdf = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF')
+function storedAssetConfirmation(assetId: string) {
+  return { asset: { id: assetId, status: 'stored' } }
+}
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
 const exifIphoneJpeg = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/4QEgRXhpZgAATU0AKgAAAAgABQEPAAIAAAAGAAAASgEQAAIAAAAOAAAAUIglAAQAAAABAAAAXpADAAIAAAAUAAAA8JAEAAIAAAAUAAABBAAAAABBcHBsZQBpUGhvbmUgMTUgUHJvAAAGAAEAAgAAAAJOAAAAAAIABQAAAAMAAACsAAMAAgAAAAJXAAAAAAQABQAAAAMAAADEAAYABQAAAAEAAADcAB0AAgAAAAsAAADkAAAAAAAAACUAAAABAAAALgAAAAEAAAAeAAAAAQAAAHoAAAABAAAAGQAAAAEAAAAKAAAAAQAAAA8AAAABMjAyNDowNTowNgAAMjAyNDowNTowNiAwNzowODowOQAyMDI0OjA1OjA2IDA3OjA4OjA5AP/bAEMACAYGBwYFCAcHBwkJCAoMFA0MCwsMGRITDxQdGh8eHRocHCAkLicgIiwjHBwoNyksMDE0NDQfJzk9ODI8LjM0Mv/bAEMBCQkJDAsMGA0NGDIhHCEyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMv/AABEIAAIAAgMBIgACEQEDEQH/xAAfAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgv/xAC1EAACAQMDAgQDBQUEBAAAAX0BAgMABBEFEiExQQYTUWEHInEUMoGRoQgjQrHBFVLR8CQzYnKCCQoWFxgZGiUmJygpKjQ1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4eLj5OXm5+jp6vHy8/T19vf4+fr/xAAfAQADAQEBAQEBAQEBAAAAAAAAAQIDBAUGBwgJCgv/xAC1EQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGhscEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/AOLooor5k/cT/9k=', 'base64')
 
@@ -77,7 +80,8 @@ async function mockSuccessfulBoundary(page: Page, contentDelayMs = 0): Promise<{
     active += 1; calls += 1; maximum = Math.max(maximum, active)
     if (contentDelayMs) await new Promise((resolve) => setTimeout(resolve, contentDelayMs))
     active -= 1
-    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null }) })
+    const assetId = new URL(route.request().url()).pathname.split('/').at(-2)!
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(storedAssetConfirmation(assetId)) })
   })
   return { maxActive: () => maximum, contentCalls: () => calls }
 }
@@ -119,7 +123,7 @@ test('same-content files are serialized so only one original reaches storage', a
     contentCalls += 1
     await new Promise((resolve) => setTimeout(resolve, 180))
     stored = true
-    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null }) })
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(storedAssetConfirmation('same-content-asset')) })
   })
 
   await openUpload(page)
@@ -222,7 +226,7 @@ test('iPhone BlobURL-in-IDB incompatibility is bypassed by binary payload storag
     await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ ok: true }) })
   })
   await page.route('**/api/assets/ios-photo/content', async (route) => {
-    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null, previewAvailable: true }) })
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...storedAssetConfirmation('ios-photo'), previewAvailable: true }) })
   })
 
   await openUpload(page)
@@ -311,7 +315,7 @@ test('429 Retry-After retries the same reservation and then completes', async ({
   await page.route('**/api/assets/rate-limited-asset/content', async (route) => {
     contentCalls += 1
     if (contentCalls === 1) await route.fulfill({ status: 429, contentType: 'application/json', headers: { 'Retry-After': '1' }, body: JSON.stringify({ error: 'TELEGRAM_RATE_LIMITED' }) })
-    else await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null }) })
+    else await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(storedAssetConfirmation('rate-limited-asset')) })
   })
   await openUpload(page)
   await chooseFiles(page, ['rate-limited.pdf'])
@@ -331,7 +335,8 @@ test('batch pause aborts active work and continue finishes the retained jobs', a
   })
   await page.route('**/api/assets/*/content', async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 900))
-    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ asset: null }) })
+    const assetId = new URL(route.request().url()).pathname.split('/').at(-2)!
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(storedAssetConfirmation(assetId)) })
   })
   await openUpload(page)
   await chooseFiles(page, Array.from({ length: 8 }, (_, index) => `pause-${index}.pdf`))

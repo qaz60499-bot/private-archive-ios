@@ -43,6 +43,8 @@ function notify(): void {
   subscribers.forEach((listener) => listener())
 }
 
+export { notify as notifyUploadQueueChanged }
+
 function notifyArchiveCommitted(): void {
   if (typeof globalThis.dispatchEvent !== 'function' || typeof Event !== 'function') return
   globalThis.dispatchEvent(new Event('private-archive:upload-committed'))

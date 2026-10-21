@@ -565,6 +565,15 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         try createJob(id: id, principalId: "isolation-a", fileName: "owner-test.bin", mimeType: "application/octet-stream", sizeBytes: 3, mediaType: "file", lastModifiedMs: nil)
         try appendChunk(id: id, data: Data([1, 2, 3]), principalId: "isolation-a")
         guard let record = stateQueue.sync(execute: { records[id] }) else { throw NSError(domain: "NativeBackgroundUpload", code: 50) }
+        var acknowledgementRecord = record
+        acknowledgementRecord.remoteAssetId = "acknowledgement-asset"
+        for status in ["stored", "queued", "analyzing", "ready", "limited"] {
+            let body = try JSONSerialization.data(withJSONObject: ["asset": ["id": "acknowledgement-asset", "status": status]])
+            try check(hasStoredContentAcknowledgement(body, record: acknowledgementRecord), "stored-acknowledgement-rejected-\(status)")
+        }
+        for body in [Data(), Data("{\"asset\":null}".utf8), Data("{\"error\":\"UNCONFIRMED\",\"asset\":{\"id\":\"acknowledgement-asset\",\"status\":\"ready\"}}".utf8)] {
+            try check(!hasStoredContentAcknowledgement(body, record: acknowledgementRecord), "invalid-acknowledgement-accepted")
+        }
         generation = beginPrincipalChange()
         _ = confirmPrincipal("isolation-b", cookie: "pa_account=isolation-b", generation: generation)
         try check(!listJobs().contains { $0.id == id }, "other-account-visible")
@@ -648,7 +657,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             finishJob(id: id) { result in
                 switch result {
                 case .success:
-                    self.pollNativeProtocolRuntimeSmoke(id: id, remaining: 80)
+                    self.pollNativeProtocolRuntimeSmoke(id: id, remaining: 160)
                 case .failure(let error):
                     NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED finish=%@", error.localizedDescription)
                 }
@@ -1379,6 +1388,31 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return json["error"] as? String
     }
 
+    private func hasStoredContentAcknowledgement(_ data: Data, record: NativeUploadRecord) -> Bool {
+        guard let expectedId = record.remoteAssetId,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["error"] == nil,
+              let asset = json["asset"] as? [String: Any], asset["id"] as? String == expectedId,
+              let status = asset["status"] as? String else { return false }
+        // markStored / enqueueIfReady / analysis can advance independently of this
+        // response. These states all follow durable original storage; pending/failed
+        // or a response for another asset must never authorize deleting our only copy.
+        return ["stored", "queued", "analyzing", "ready", "limited"].contains(status)
+    }
+
+#if DEBUG
+    private func verifyProtocolSmokeOriginalRetention(_ record: NativeUploadRecord, response: HTTPURLResponse?) {
+        guard ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1",
+              apiBase.host == "127.0.0.1" || apiBase.host == "localhost" else { return }
+        guard (try? fileSize(originalURL(record.id))) == record.sizeBytes,
+              record.contentHash != nil, (try? sha256(url: originalURL(record.id))) == record.contentHash else {
+            NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED unconfirmed-original-lost")
+            return
+        }
+        NSLog("PRIVATE_ARCHIVE_PROTOCOL_ORIGINAL_RETAINED case=%@", response?.value(forHTTPHeaderField: "X-Smoke-Case") ?? "unknown")
+    }
+#endif
+
     private func shouldRetry(status: Int, code: String?) -> Bool {
         if [408, 409, 425, 429, 500, 502, 503, 504].contains(status) { return true }
         return code == "DUPLICATE_UPLOAD_IN_PROGRESS" || code == "UPLOAD_ALREADY_IN_PROGRESS"
@@ -1806,6 +1840,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         let code = responseErrorCode(data)
 
         if (200...299).contains(status) {
+            guard hasStoredContentAcknowledgement(data, record: record) else {
+#if DEBUG
+                verifyProtocolSmokeOriginalRetention(record, response: response)
+#endif
+                retryContent(record, after: retryDelay(response), reason: "UPLOAD_COMMIT_UNCONFIRMED", cookieOverride: requestCookie)
+                return
+            }
             complete(record, deduplicated: false)
             return
         }
@@ -1814,6 +1855,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
         if status == 401 {
+#if DEBUG
+            verifyProtocolSmokeOriginalRetention(record, response: response)
+#endif
             // The server validates X-Upload-Token before app auth. A generic content 401
             // therefore means this reservation capability is no longer usable. Clear it
             // explicitly before asking for a fresh reservation; otherwise retryReserve's

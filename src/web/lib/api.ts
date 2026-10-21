@@ -11,6 +11,27 @@ export class ApiError extends Error {
 export const DEFAULT_REQUEST_TIMEOUT_MS = 45_000
 export const UPLOAD_REQUEST_TIMEOUT_MS = 180_000
 
+const STORED_UPLOAD_STATUSES = new Set(['stored', 'queued', 'analyzing', 'ready', 'limited'])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function uploadResponseError(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === 'string' ? body.error : undefined
+}
+
+function requireStoredUploadAsset(assetId: string, body: unknown): Asset {
+  if (!isRecord(body) || 'error' in body || !isRecord(body.asset)) {
+    throw new ApiError(502, 'UPLOAD_CONFIRMATION_INVALID')
+  }
+  const asset = body.asset
+  if (asset.id !== assetId || typeof asset.status !== 'string' || !STORED_UPLOAD_STATUSES.has(asset.status)) {
+    throw new ApiError(502, 'UPLOAD_CONFIRMATION_INVALID')
+  }
+  return asset as unknown as Asset
+}
+
 function emitAppAuthRequired(code: string): void {
   if (code !== 'APP_AUTH_REQUIRED') return
   globalThis.dispatchEvent(new Event('private-archive:auth-required'))
@@ -151,13 +172,14 @@ export const api = {
     const response = await authenticatedFetch(`/api/assets/${assetId}/content`, {
       method: 'PUT', body: file, signal, headers: { 'X-Upload-Token': token, 'Content-Type': file.type || 'application/octet-stream', 'Content-Length': String(file.size) },
     }, UPLOAD_REQUEST_TIMEOUT_MS)
-    const body = await response.json().catch(() => ({})) as { asset?: Asset; alreadyStored?: boolean; previewAvailable?: boolean; error?: string }
+    const body = await response.json().catch(() => null) as unknown
     if (!response.ok) {
-      const code = body.error ?? (response.status === 401 ? 'ACCESS_SIGN_IN_REQUIRED' : 'UPLOAD_FAILED')
+      const code = uploadResponseError(body) ?? (response.status === 401 ? 'ACCESS_SIGN_IN_REQUIRED' : 'UPLOAD_FAILED')
       emitAppAuthRequired(code)
       throw new ApiError(response.status, code, retryAfterMs(response))
     }
-    return body
+    const asset = requireStoredUploadAsset(assetId, body)
+    return { ...(body as Record<string, unknown>), asset } as { asset: Asset; alreadyStored?: boolean; previewAvailable?: boolean }
   },
   uploadPreview: async (assetId: string, token: string, preview: Blob, signal?: AbortSignal) => {
     const response = await authenticatedFetch(`/api/assets/${assetId}/preview`, {
@@ -196,8 +218,9 @@ export const api = {
   storagePreference: () => request<{ defaultStorageBackend: StorageBackend }>('/api/storage-preference'),
   setStoragePreference: (defaultStorageBackend: StorageBackend) => request<{ ok: true; defaultStorageBackend: StorageBackend }>('/api/storage-preference', { method: 'PUT', body: JSON.stringify({ defaultStorageBackend }) }),
   commitUserGroupUpload: async (assetId: string, token: string, receipt: { chatId: string; messageId: number; mediaId?: string | null; sizeBytes: number }, signal?: AbortSignal) => {
-    const result = await request<{ asset: Asset | null; alreadyStored: boolean }>(`/api/assets/${assetId}/user-group-commit`, { method: 'POST', headers: { 'X-Upload-Token': token }, body: JSON.stringify(receipt), signal })
-    return { ...result, asset: result.asset ? normalizeAssetForSurface(result.asset) : null }
+    const result = await request<unknown>(`/api/assets/${assetId}/user-group-commit`, { method: 'POST', headers: { 'X-Upload-Token': token }, body: JSON.stringify(receipt), signal })
+    const asset = requireStoredUploadAsset(assetId, result)
+    return { ...(result as Record<string, unknown>), asset: normalizeAssetForSurface(asset) } as { asset: Asset; alreadyStored: boolean }
   },
   updateUserGroupRuntime: (runtime: { connectionStatus: 'disconnected' | 'auth_required' | 'connected' | 'syncing' | 'error'; storageChatId?: string | null; storageChatTitle?: string | null; lastSyncAt?: string | null; lastError?: string | null; lastAckMessageId?: number | null }) => request<{ ok: true; runtime: NonNullable<IntegrationStatus['storage']>['userGroup'] }>('/api/telegram/user-group/runtime', { method: 'POST', body: JSON.stringify(runtime) }),
   importUserGroupItems: (items: Array<Record<string, unknown>>) => request<{ ok: boolean; created: number; duplicate: number; failed: number; results: Array<{ messageId: number; created: boolean; assetId?: string; error?: string }> }>('/api/telegram/user-group/import', { method: 'POST', body: JSON.stringify({ items }) }),

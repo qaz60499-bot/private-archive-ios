@@ -127,6 +127,9 @@ assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'fin
 assert(finishJob.includes('self.nativeUploadErrorCode(error) == 9'), 'finishJob must not turn a temporary auth gap into a failed staged original')
 
 const taskCompletion = section('func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)', 'func urlSessionDidFinishEvents')
+assert(taskCompletion.includes('guard hasStoredContentAcknowledgement(data, record: record) else') && taskCompletion.includes('reason: "UPLOAD_COMMIT_UNCONFIRMED"'), '2xx must validate the stored asset acknowledgement before completion and retain/retry unconfirmed originals')
+const acknowledgement = section('private func hasStoredContentAcknowledgement(', '#if DEBUG')
+assert(acknowledgement.includes('json["error"] == nil') && acknowledgement.includes('asset["id"] as? String == expectedId') && acknowledgement.includes('["stored", "queued", "analyzing", "ready", "limited"]'), 'content acknowledgement must reject errors, foreign assets and pre-storage states while accepting post-storage analysis states')
 assert(taskCompletion.includes('New reservations complete through foregroundSession') && taskCompletion.includes('if stage == "reserve"'), 'delegate callbacks from legacy reserve tasks must be ignored rather than rotating current tokens')
 assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'content callbacks should reuse an available persisted cookie for recovery')
 assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED", cookieOverride: requestCookie)'), 'expired content capability must explicitly clear and recreate reservation state using the persisted task cookie')

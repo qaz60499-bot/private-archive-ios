@@ -118,6 +118,9 @@ jobs:
             xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
           wait_for_log_marker 'PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED' 45
           wait_for_log_marker 'PRIVATE_ARCHIVE_ACCOUNT_ISOLATION_SMOKE_COMPLETED' 15
+          for fault in empty-body wrong-asset pending-asset expired-token; do
+            wait_for_log_marker "PRIVATE_ARCHIVE_PROTOCOL_ORIGINAL_RETAINED case=$fault" 1
+          done
 
           kill "$SERVER_PID" 2>/dev/null || true
           wait "$SERVER_PID" 2>/dev/null || true
@@ -130,6 +133,7 @@ jobs:
           cat "$UNIFIED_LOG"
           grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_RESERVE_OK' "$SERVER_LOG"
           grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_CONTENT_OK bytes=262144' "$SERVER_LOG"
+          grep -q 'PRIVATE_ARCHIVE_PROTOCOL_SERVER_RECOVERY_OK reserves=2 contents=5' "$SERVER_LOG"
           if grep -E 'PRIVATE_ARCHIVE_(PROTOCOL|BULK_IMPORT)_SMOKE_FAILED|Terminating app due to uncaught exception|Main Thread Checker|EXC_BAD_ACCESS|Fatal error' "$LOG_FILE" "$UNIFIED_LOG"; then
             echo 'iOS runtime smoke detected an upload/picker failure or native crash' >&2
             exit 1

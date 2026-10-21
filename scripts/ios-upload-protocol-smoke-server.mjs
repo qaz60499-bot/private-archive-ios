@@ -5,6 +5,8 @@ const port = Number(process.env.PRIVATE_ARCHIVE_PROTOCOL_SMOKE_PORT ?? 18765)
 const expectedSize = 256 * 1024
 const uploadToken = 'native-protocol-smoke-upload-token'
 const sessionCookie = 'pa_account=protocol-smoke-session'
+let reservationCount = 0
+let contentCount = 0
 
 function json(response, status, body) {
   response.writeHead(status, { 'Content-Type': 'application/json' })
@@ -62,9 +64,11 @@ const server = http.createServer(async (request, response) => {
         return json(response, 400, { error: 'PROTOCOL_SMOKE_RESERVE_BODY_INVALID' })
       }
       console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_RESERVE_OK')
+      reservationCount += 1
+      if (reservationCount > 2) return json(response, 400, { error: 'PROTOCOL_SMOKE_RESERVE_LIMIT' })
       return json(response, 201, {
         assetId: 'native-protocol-smoke-asset',
-        uploadToken,
+        uploadToken: `${uploadToken}-${reservationCount}`,
         duplicate: false,
         resumed: false,
         storageBackend: 'telegram_bot',
@@ -75,15 +79,28 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === 'PUT' && request.url === '/api/assets/native-protocol-smoke-asset/content') {
       if (!hasNativeHeaders(request)) return json(response, 403, { error: 'PROTOCOL_SMOKE_CONTENT_HEADERS_INVALID' })
-      if (request.headers['x-upload-token'] !== uploadToken) return json(response, 401, { error: 'PROTOCOL_SMOKE_UPLOAD_TOKEN_INVALID' })
+      if (request.headers['x-upload-token'] !== `${uploadToken}-${reservationCount}`) return json(response, 400, { error: 'PROTOCOL_SMOKE_UPLOAD_TOKEN_INVALID' })
       if (request.headers['content-type'] !== 'application/octet-stream') return json(response, 400, { error: 'PROTOCOL_SMOKE_CONTENT_TYPE_INVALID' })
       if (Number(request.headers['content-length']) !== expectedSize) return json(response, 411, { error: 'PROTOCOL_SMOKE_CONTENT_LENGTH_INVALID' })
       const body = await readBody(request, expectedSize + 1)
       if (body.length !== expectedSize || body.some((value) => value !== 0x5a)) {
         return json(response, 400, { error: 'PROTOCOL_SMOKE_CONTENT_BODY_INVALID' })
       }
+      contentCount += 1
+      response.setHeader('Retry-After', '1')
+      const fault = ['empty-body', 'wrong-asset', 'pending-asset', 'expired-token'][contentCount - 1]
+      if (fault) {
+        response.setHeader('X-Smoke-Case', fault)
+        console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_INJECTED case=' + fault)
+        if (fault === 'empty-body') { response.writeHead(204); response.end(); return }
+        if (fault === 'wrong-asset') return json(response, 201, { asset: { id: 'wrong-asset', status: 'ready' } })
+        if (fault === 'pending-asset') return json(response, 201, { asset: { id: 'native-protocol-smoke-asset', status: 'pending_upload' } })
+        return json(response, 401, { error: 'UPLOAD_TOKEN_INVALID_OR_EXPIRED' })
+      }
+      if (contentCount !== 5 || reservationCount !== 2) return json(response, 400, { error: 'PROTOCOL_SMOKE_RECOVERY_SEQUENCE_INVALID' })
       console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_CONTENT_OK bytes=' + body.length)
-      return json(response, 201, { asset: { id: 'native-protocol-smoke-asset' }, previewAvailable: false })
+      console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_RECOVERY_OK reserves=2 contents=5')
+      return json(response, 201, { asset: { id: 'native-protocol-smoke-asset', status: 'queued' }, previewAvailable: false })
     }
 
     return json(response, 404, { error: 'PROTOCOL_SMOKE_ROUTE_NOT_FOUND' })

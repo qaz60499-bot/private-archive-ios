@@ -20,6 +20,7 @@ export function friendlyUploadError(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === 'UPLOAD_ABORTED') return '任务已暂停。继续后会从安全阶段恢复。'
     if (error.code === 'REQUEST_TIMEOUT') return '请求超时，任务已保留并将在稍后重试。'
+    if (error.code === 'UPLOAD_CONFIRMATION_INVALID') return '云端尚未确认保存，原件已保留，将自动重试。'
     if (error.status === 429) return 'Telegram 当前请求过多，已按服务端提示降低并发并稍后重试。'
     if (error.code === 'DUPLICATE_UPLOAD_IN_PROGRESS') return '相同原件正在另一项任务中保存，当前任务会等待并在完成后自动去重。'
     if (error.code === 'UPLOAD_ALREADY_IN_PROGRESS') return '同一原件正在另一个页面中上传，当前任务会等待已有上传完成。'
