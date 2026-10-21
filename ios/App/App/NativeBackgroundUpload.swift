@@ -538,6 +538,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
 #if DEBUG
+    func inspectBulkImportRuntimeSmoke(batchId: String, principalId: String) -> (jobs: [NativeUploadRecord], recoverable: Int, activeOwnerMatches: Bool) {
+        // The WebView can finish its unauthenticated startup while this fixture is
+        // importing. listJobs deliberately hides another account's records, so it
+        // cannot measure whether this synthetic batch's originals survived.
+        let snapshot = stateQueue.sync {
+            (records.values.filter { $0.batchId == batchId }, activePrincipalId == principalId)
+        }
+        let recoverable = snapshot.0.filter { record in
+            record.principalId == principalId && record.ready && record.status != "failed"
+                && record.sizeBytes == 64 * 1024 + 6
+                && (try? fileSize(originalURL(record.id))) == record.sizeBytes
+                && record.contentHash != nil
+                && (try? sha256(url: originalURL(record.id))) == record.contentHash
+        }.count
+        return (snapshot.0, recoverable, snapshot.1)
+    }
+
     private func verifyAccountIsolationRuntimeSmoke() throws {
         func check(_ condition: Bool, _ message: String) throws {
             if !condition { throw NSError(domain: "NativeBackgroundUpload", code: 50, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -2081,10 +2098,10 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
             startPhotoImportLane(providers, index: lane, stride: lanes, batchId: batchId, principalId: principalId, group: group)
         }
         group.notify(queue: .main) {
-            let jobs = NativeBackgroundUploadManager.shared.listJobs().filter { $0.batchId == batchId }
-            let recoverable = jobs.filter { $0.ready && $0.status != "failed" }.count
-            NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=%d recoverable=%d", jobs.count, recoverable)
-            for job in jobs { NativeBackgroundUploadManager.shared.removeJob(id: job.id) }
+            let snapshot = NativeBackgroundUploadManager.shared.inspectBulkImportRuntimeSmoke(batchId: batchId, principalId: principalId)
+            NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_OWNER_MATCHES value=%d", snapshot.activeOwnerMatches ? 1 : 0)
+            NSLog("PRIVATE_ARCHIVE_BULK_IMPORT_SMOKE_COMPLETED count=%d recoverable=%d", snapshot.jobs.count, snapshot.recoverable)
+            for job in snapshot.jobs { NativeBackgroundUploadManager.shared.removeJob(id: job.id, principalId: principalId) }
             NativeBackgroundUploadManager.shared.endStagingProtection()
             try? FileManager.default.removeItem(at: directory)
         }
@@ -2092,6 +2109,16 @@ public class NativeBackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin, PHPicker
 #endif
 
     @objc func setPrincipal(_ call: CAPPluginCall) {
+#if DEBUG
+        // Simulator fixtures own synthetic principals. An unrelated Web auth-status
+        // response must not replace them midway through provider/protocol validation.
+        // The fixture's manager-level A -> B isolation checks still execute normally.
+        let environment = ProcessInfo.processInfo.environment
+        if environment["PRIVATE_ARCHIVE_PICKER_SMOKE"] == "1" || environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1" {
+            NSLog("PRIVATE_ARCHIVE_SMOKE_WEB_AUTH_ISOLATED")
+            return call.reject("RUNTIME_SMOKE_AUTH_CONTROLLED")
+        }
+#endif
         let manager = NativeBackgroundUploadManager.shared
         let generation = manager.beginPrincipalChange()
         guard let principalId = call.getString("principalId"), !principalId.isEmpty else { return call.resolve() }

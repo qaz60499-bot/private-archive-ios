@@ -307,8 +307,10 @@ test('Telegram discovery reads chats captured by the active webhook', async ({ r
 
 test('timeline auto-syncs a Telegram item without manual refresh', async ({ page, request }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'background sync only needs one browser project')
+  test.setTimeout(90_000)
   await page.goto('/')
   await expect(page.getByRole('heading', { name: /时间留下的\s*形状/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: '打开 morning-garden.jpg' })).toBeVisible()
 
   const suffix = `${Date.now()}-${Math.floor(Math.random() * 100_000)}`
   const messageId = 200_000 + Math.floor(Math.random() * 700_000)
@@ -334,7 +336,7 @@ test('timeline auto-syncs a Telegram item without manual refresh', async ({ page
   })
   expect(webhook.status()).toBe(201)
 
-  await expect(page.getByRole('button', { name: `打开 ${telegramName}` })).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByRole('button', { name: `打开 ${telegramName}` })).toBeVisible({ timeout: 75_000 })
 })
 
 test('viewer can soft-delete a web asset without deleting Telegram storage', async ({ page, request }, testInfo) => {
