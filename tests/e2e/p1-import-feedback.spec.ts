@@ -20,6 +20,25 @@ test('archive cover has no hero canvas and keeps actions interactive', async ({ 
   await expect(hero.getByRole('button', { name: '导入' })).toBeEnabled()
 })
 
+test('home statistics refresh once after a burst of committed uploads without reopening the page', async ({ page }) => {
+  let photoCount = 10
+  let summaryRequests = 0
+  await page.route('**/api/archive-summary', async (route) => {
+    summaryRequests += 1
+    await route.fulfill({ json: { assetCount: photoCount, photoCount, albumCount: 2, lastUpdate: '2026-10-21T00:00:00Z' } })
+  })
+  await page.goto('/')
+  const count = page.locator('.archive-hero-stats > div').first().locator('dd')
+  await expect(count).toHaveText('10')
+  const before = summaryRequests
+  photoCount = 11
+  await page.evaluate(() => {
+    for (let index = 0; index < 5; index += 1) window.dispatchEvent(new Event('private-archive:upload-committed'))
+  })
+  await expect(count).toHaveText('11')
+  expect(summaryRequests).toBe(before + 1)
+})
+
 test('opening an album page starts at its own heading after timeline scrolling', async ({ page }) => {
   await page.goto('/')
   await expect(page.locator('.memory-aperture')).toBeVisible()

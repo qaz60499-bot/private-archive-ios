@@ -83,6 +83,7 @@ async function mirrorNativeJobInOrder(job: NativeBackgroundUploadJob): Promise<v
   const principalVersion = getLocalUploadPrincipalVersion()
   let local = await getLocalUpload(job.id)
   if (principalVersion !== getLocalUploadPrincipalVersion()) return
+  const wasDone = local?.status === 'done'
   if (!local && job.batchId) {
     try {
       local = await registerNativeLocalUploadMirror({
@@ -129,7 +130,9 @@ async function mirrorNativeJobInOrder(job: NativeBackgroundUploadJob): Promise<v
   // File handle while avoiding permanent double storage.
   if (job.status === 'done') {
     await releaseLocalUploadPayload(job.id)
-    globalThis.dispatchEvent(new Event('private-archive:upload-committed'))
+    if (!wasDone && principalVersion === getLocalUploadPrincipalVersion()) {
+      globalThis.dispatchEvent(new Event('private-archive:upload-committed'))
+    }
   }
   globalThis.dispatchEvent(new CustomEvent('private-archive:native-upload-state', { detail: { batchId: job.batchId ?? local.batchId, jobId: job.id } }))
 }

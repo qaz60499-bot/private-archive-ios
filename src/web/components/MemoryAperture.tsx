@@ -11,6 +11,8 @@ interface MemoryApertureProps {
   onImport: () => void
 }
 
+const SUMMARY_REFRESH_DEBOUNCE_MS = 150
+
 function frameDate(asset: Asset | undefined): string {
   return asset ? formatArchiveDay(asset.takenAt) : 'ARCHIVE'
 }
@@ -103,12 +105,34 @@ export function MemoryAperture({ assets, onImport }: MemoryApertureProps) {
 
   useEffect(() => {
     let active = true
-    void api.archiveSummary().then((next) => {
-      if (active) setSummary(next)
-    }).catch(() => {
-      // Hero statistics are supplementary. A summary failure must never hide the archive.
-    })
-    return () => { active = false }
+    let requestVersion = 0
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    const refreshSummary = async () => {
+      const currentRequestVersion = ++requestVersion
+      try {
+        const next = await api.archiveSummary()
+        if (active && currentRequestVersion === requestVersion) setSummary(next)
+      } catch {
+        // Hero statistics are supplementary. A summary failure must never hide the archive.
+      }
+    }
+    const scheduleSummaryRefresh = () => {
+      // A committed upload makes any in-flight summary stale, even before the debounce fires.
+      requestVersion += 1
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer)
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined
+        void refreshSummary()
+      }, SUMMARY_REFRESH_DEBOUNCE_MS)
+    }
+
+    void refreshSummary()
+    globalThis.addEventListener('private-archive:upload-committed', scheduleSummaryRefresh)
+    return () => {
+      active = false
+      globalThis.removeEventListener('private-archive:upload-committed', scheduleSummaryRefresh)
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer)
+    }
   }, [])
 
   const displaySummary = summary ?? fallbackSummary

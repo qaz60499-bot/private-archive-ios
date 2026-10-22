@@ -82,6 +82,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private var foregroundWatchdogGeneration = 0
     private var foregroundRecoveryActive = false
     private var foregroundDiagnosticGeneration: Int?
+    private var contentCallbackDiagnosticCount = 0
     private var confirmationAttemptedJobs = Set<String>()
     private var storedConfirmation: StoredConfirmation?
     private let maximumConfirmationResponseBytes = 256 * 1024
@@ -1045,6 +1046,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             foregroundWatchdogGeneration += 1
             confirmationAttemptedJobs.removeAll()
             foregroundDiagnosticGeneration = foregroundWatchdogGeneration
+            contentCallbackDiagnosticCount = 0
             logForegroundRecoveryDiagnosticLocked("recovery-enter", generation: foregroundWatchdogGeneration)
             return foregroundWatchdogGeneration
         }
@@ -1925,7 +1927,21 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 (updated != nil, "updated-date"), (stale, "age"), (cacheSizeMatch, "cache-size")
             ]
             let reasons = checks.filter { !$0.0 }.map { $0.1 }.joined(separator: ",")
-            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG recovery-task job=%@ task=%ld state=%ld taskStage=%@ stage=%@ status=%@ progress=%.0f updatedAgeSeconds=%.0f progressAgeSeconds=%.0f ownerMatch=%d cookiePresent=%d tokenMatch=%d pathMatch=%d hashPresent=%d cacheSizeMatch=%d attempted=%d eligible=%d reasonFlags=%@", id, task.taskIdentifier, task.state.rawValue, taskStage(task) ?? "missing", current.stage, current.status, current.progress, updatedAge, progressAge, ownerMatch ? 1 : 0, cookiePresent ? 1 : 0, tokenMatch ? 1 : 0, pathMatch ? 1 : 0, hashPresent ? 1 : 0, cacheSizeMatch ? 1 : 0, attempted ? 1 : 0, reasons.isEmpty ? 1 : 0, reasons.isEmpty ? "none" : reasons)
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG recovery-task job=%@ task=%ld state=%ld taskStage=%@ stage=%@ status=%@ progress=%.0f updatedAgeSeconds=%.0f progressAgeSeconds=%.0f ownerMatch=%d cookiePresent=%d tokenMatch=%d pathMatch=%d hashPresent=%d cacheSizeMatch=%d attempted=%d eligible=%d reasonFlags=%@ attempts=%ld commitUnconfirmed=%d tokenInvalidOrExpired=%d alreadyInProgress=%d", id, task.taskIdentifier, task.state.rawValue, taskStage(task) ?? "missing", current.stage, current.status, current.progress, updatedAge, progressAge, ownerMatch ? 1 : 0, cookiePresent ? 1 : 0, tokenMatch ? 1 : 0, pathMatch ? 1 : 0, hashPresent ? 1 : 0, cacheSizeMatch ? 1 : 0, attempted ? 1 : 0, reasons.isEmpty ? 1 : 0, reasons.isEmpty ? "none" : reasons, current.attempts, current.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0, current.error == "UPLOAD_TOKEN_INVALID_OR_EXPIRED" ? 1 : 0, current.error == "UPLOAD_ALREADY_IN_PROGRESS" ? 1 : 0)
+        }
+    }
+
+    private func logContentCallbackDiagnostic(_ task: URLSessionTask, id: String, data: Data, error: Error?) {
+        stateQueue.sync {
+            guard foregroundRecoveryActive, contentCallbackDiagnosticCount < 3 else { return }
+            contentCallbackDiagnosticCount += 1
+            let current = records[id]
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let asset = json?["asset"] as? [String: Any]
+            let strictACK = current.map { hasStoredContentAcknowledgement(data, record: $0) } ?? false
+            let idMatch = current.flatMap { $0.remoteAssetId }.map { asset?["id"] as? String == $0 } ?? false
+            let statusStored = ["stored", "queued", "analyzing", "ready", "limited"].contains(asset?["status"] as? String ?? "")
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG content-terminal job=%@ task=%ld generation=%ld http=%ld bytes=%ld errorCode=%ld attempts=%ld strictACK=%d jsonError=%d assetPresent=%d idMatch=%d statusStored=%d", id, task.taskIdentifier, foregroundWatchdogGeneration, (task.response as? HTTPURLResponse)?.statusCode ?? 0, data.count, (error as NSError?)?.code ?? 0, current?.attempts ?? -1, strictACK ? 1 : 0, json?["error"] != nil ? 1 : 0, asset != nil ? 1 : 0, idMatch ? 1 : 0, statusStored ? 1 : 0)
         }
     }
 
@@ -2186,6 +2202,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
         let record: NativeUploadRecord?
         if stage == "content" {
+            logContentCallbackDiagnostic(task, id: id, data: data, error: error)
             let taskIdentity = contentTaskIdentity(task)
             record = stateQueue.sync { () -> NativeUploadRecord? in
                 guard var current = records[id] else {

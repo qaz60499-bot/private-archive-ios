@@ -98,6 +98,24 @@ beforeEach(async () => {
 })
 
 describe('native upload mirror ordering', () => {
+  it('emits the initial completion event once across repeated done snapshots', async () => {
+    await seedNativeJob()
+    mocks.payloads.set('native-ordering:original', { key: 'native-ordering:original', bytes: new Uint8Array([1]).buffer, mimeType: 'image/jpeg' })
+    const committedEvents = () => vi.mocked(globalThis.dispatchEvent).mock.calls.filter(([event]) => event.type === 'private-archive:upload-committed')
+    const mirroredSnapshots = () => vi.mocked(globalThis.dispatchEvent).mock.calls.filter(([event]) => event.type === 'private-archive:native-upload-state')
+
+    emitNativeJob({ ...nativeJob, status: 'done', stage: 'completed', progress: 100, remoteAssetId: 'asset-a' })
+    await vi.waitFor(() => expect(mirroredSnapshots()).toHaveLength(1))
+    expect(committedEvents()).toHaveLength(1)
+
+    emitNativeJob({ ...nativeJob, status: 'done', stage: 'completed', progress: 100, remoteAssetId: 'asset-a' })
+    emitNativeJob({ ...nativeJob, status: 'done', stage: 'completed', progress: 100, remoteAssetId: 'asset-a' })
+    await vi.waitFor(() => expect(mirroredSnapshots()).toHaveLength(3))
+
+    expect(committedEvents()).toHaveLength(1)
+    expect(mocks.payloads.has(`${nativeJob.id}:original`)).toBe(false)
+  })
+
   it('keeps a validated completion after a delayed 32% mirror read', async () => {
     await seedNativeJob()
     mocks.payloads.set('native-ordering:original', { key: 'native-ordering:original', bytes: new Uint8Array([1]).buffer, mimeType: 'image/jpeg' })
