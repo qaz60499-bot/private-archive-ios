@@ -135,27 +135,14 @@ export async function resetAllAppUserPasswords(db: D1Database, updates: Array<{ 
     SET password_hash = ?, updated_at = ?
     WHERE id = ? AND workspace_id = ?`).bind(passwordHash, now, id, PERSONAL_WORKSPACE_ID)
 
-  try {
-    const results = await db.batch([
-      ...updates.map(({ id, passwordHash }) => updateStatement(id, passwordHash)),
-      db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID),
-    ])
-    for (let index = 0; index < updates.length; index += 1) {
-      if (Number(results[index]?.meta.changes ?? 0) !== 1) throw new Error('APP_PASSWORD_RESET_TARGET_MISSING')
-    }
-  } catch (error) {
-    // D1 batch is the preferred all-or-nothing path. If the batch transport itself
-    // is temporarily unavailable, retry the small personal-account set one row at a
-    // time. Every row receives the same already-derived hash, so a partial retry is
-    // idempotent and the final verification below prevents a false success response.
-    console.warn('App password reset batch unavailable; retrying sequentially', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    for (const { id, passwordHash } of updates) {
-      const result = await updateStatement(id, passwordHash).run()
-      if (Number(result.meta.changes ?? 0) !== 1) throw new Error('APP_PASSWORD_RESET_TARGET_MISSING', { cause: error })
-    }
-    await db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID).run()
+  // Keep credentials and session invalidation in one D1 transaction. Replaying a
+  // failed batch as individual writes could leave only some accounts changed.
+  const results = await db.batch([
+    ...updates.map(({ id, passwordHash }) => updateStatement(id, passwordHash)),
+    db.prepare('DELETE FROM app_sessions WHERE workspace_id = ?').bind(PERSONAL_WORKSPACE_ID),
+  ])
+  for (let index = 0; index < updates.length; index += 1) {
+    if (Number(results[index]?.meta.changes ?? 0) !== 1) throw new Error('APP_PASSWORD_RESET_TARGET_MISSING')
   }
 
   const placeholders = updates.map(() => '?').join(',')
