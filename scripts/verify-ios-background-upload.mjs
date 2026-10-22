@@ -9,6 +9,7 @@ const processorSource = readFileSync(new URL('../src/web/lib/offline/processor.t
 const archiveContextSource = readFileSync(new URL('../src/web/context/ArchiveContext.tsx', import.meta.url), 'utf8')
 const authContextSource = readFileSync(new URL('../src/web/context/AuthContext.tsx', import.meta.url), 'utf8')
 const assetsRepositorySource = readFileSync(new URL('../src/worker/db/assets-repository.ts', import.meta.url), 'utf8')
+const protocolServerSource = readFileSync(new URL('./ios-upload-protocol-smoke-server.mjs', import.meta.url), 'utf8')
 
 function assert(condition, message) {
   if (!condition) throw new Error(`IOS_BACKGROUND_UPLOAD_VERIFY_FAILED: ${message}`)
@@ -140,9 +141,19 @@ assert(finishJob.includes('let shouldSchedule = value.status != "paused"'), 'fin
 assert(finishJob.includes('self.nativeUploadErrorCode(error) == 9'), 'finishJob must not turn a temporary auth gap into a failed staged original')
 
 const taskCompletion = section('func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)', 'func urlSessionDidFinishEvents')
-assert(taskCompletion.includes('guard hasStoredContentAcknowledgement(data, record: record) else') && taskCompletion.includes('reason: "UPLOAD_COMMIT_UNCONFIRMED"'), '2xx must validate the stored asset acknowledgement before completion and retain/retry unconfirmed originals')
+assert(taskCompletion.includes('guard hasStoredContentAcknowledgement(data, record: record, response: response, error: error) else') && taskCompletion.includes('reason: "UPLOAD_COMMIT_UNCONFIRMED"'), '2xx must validate the stored asset acknowledgement before completion and retain/retry unconfirmed originals')
 const acknowledgement = section('private func hasStoredContentAcknowledgement(', '#if DEBUG')
 assert(acknowledgement.includes('json["error"] == nil') && acknowledgement.includes('asset["id"] as? String == expectedId') && acknowledgement.includes('["stored", "queued", "analyzing", "ready", "limited"]'), 'content acknowledgement must reject errors, foreign assets and pre-storage states while accepting post-storage analysis states')
+assert(acknowledgement.includes('guard error == nil') && acknowledgement.includes('if data.isEmpty') && acknowledgement.includes('[200, 201].contains(response.statusCode)'), 'header commit proof must be restricted to empty successful 200/201 responses without transport errors')
+assert(acknowledgement.includes('url.host?.lowercased() == expected.host?.lowercased()') && acknowledgement.includes('url.scheme?.lowercased() == expected.scheme?.lowercased()') && acknowledgement.includes('url.port == expected.port') && acknowledgement.includes('url.path == expected.path') && acknowledgement.includes('url.query == nil') && acknowledgement.includes('url.user == nil'), 'header proof must bind the configured API content response origin and path')
+for (const header of ['X-PA-Upload-Commit', 'X-PA-Asset-Id', 'X-PA-Storage-Backend', 'X-PA-Size-Bytes', 'X-PA-Content-SHA256', 'X-PA-Asset-Status']) {
+  assert(acknowledgement.includes(`value(forHTTPHeaderField: "${header}")`), `header proof must validate ${header}`)
+  assert(protocolServerSource.includes(`'${header}':`), `protocol smoke must return ${header}`)
+}
+assert(acknowledgement.includes('hash.utf8.count == 64') && acknowledgement.includes('^[0-9a-f]{64}$') && acknowledgement.includes('String(record.sizeBytes)'), 'header proof must bind canonical decimal size and lowercase SHA-256 to the local record')
+assert(completion.includes('value.principalId == record.principalId') && completion.includes('value.sizeBytes == record.sizeBytes') && completion.includes('value.contentTaskToken == record.contentTaskToken') && completion.includes('authenticationSnapshot == authenticationGeneration') && completion.includes('!authenticationWasSet || value.principalId == activePrincipalId'), 'normal completion must preserve payload, owner, task, control and authentication snapshots while allowing a cold background task')
+assert(source.includes('try verifyContentHeaderAcknowledgementRuntimeSmoke()') && source.includes('PRIVATE_ARCHIVE_CONTENT_HEADER_ACK_SMOKE_COMPLETED') && source.includes('header-invalid-original-lost-') && source.includes('header-race-original-lost-') && source.includes('header-cold-background-completion'), 'native runtime smoke must execute header rejection, original retention, completion races and cold-background success')
+assert(protocolServerSource.includes("'Content-Length': '0'") && protocolServerSource.includes('reserves=2 contents=5') && protocolServerSource.includes("['empty-body', 'wrong-asset', 'pending-asset', 'expired-token']"), 'protocol smoke must preserve all prior fault cycles and finish with an empty body plus bound commit headers')
 assert(taskCompletion.includes('New reservations complete through foregroundSession') && taskCompletion.includes('if stage == "reserve"'), 'delegate callbacks from legacy reserve tasks must be ignored rather than rotating current tokens')
 assert(taskCompletion.includes('let requestCookie = task.originalRequest?.value(forHTTPHeaderField: "Cookie")'), 'content callbacks should reuse an available persisted cookie for recovery')
 assert(taskCompletion.includes('restartReservation(record, after: retryDelay(response), reason: code ?? "UPLOAD_TOKEN_INVALID_OR_EXPIRED", cookieOverride: requestCookie)'), 'expired content capability must explicitly clear and recreate reservation state using the persisted task cookie')

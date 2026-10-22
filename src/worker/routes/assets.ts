@@ -14,6 +14,7 @@ import { getDiscoverModule } from '../db/discover-modules-repository'
 import { getTelegramUserGroupRuntime } from '../db/user-group-storage-repository'
 import { MAX_UPLOAD_BYTES, USER_GROUP_CLIENT_SAFETY_MAX_BYTES, UPLOAD_TOKEN_TTL_MS, getSizeTier, hasUnsafeControlCharacters, selectTakenAt, validateReserveInput } from '../domain/policy'
 import { activeUploadRetryAfterSeconds, botUploadLeaseMs } from '../domain/upload-retry'
+import { storedUploadAcknowledgementHeaders } from '../domain/upload-acknowledgement'
 import { sanitizeLogicalPath } from '../domain/asset-metadata'
 import { toPublicAsset } from '../domain/types'
 import type { Env } from '../env'
@@ -273,6 +274,7 @@ assetsRoutes.put('/:id/content', async (context) => {
     return context.json({ error: 'APP_UPLOAD_NOT_ALLOWED' }, 403)
   }
   if (asset.storage_file_id) {
+    for (const [name, value] of Object.entries(storedUploadAcknowledgementHeaders(asset))) context.header(name, value)
     return context.json({ asset: toPublicAsset(asset, undefined, { allowDownload: await canAppUserAccessAsset(context.env.DB, user, assetId, 'download') }), alreadyStored: true, previewAvailable: Boolean(asset.preview_file_id) }, 200)
   }
   if (asset.storage_backend === 'telegram_user_group') {
@@ -289,6 +291,7 @@ assetsRoutes.put('/:id/content', async (context) => {
     await enqueueIfReady(context.env, assetId)
     scheduleUsageRefresh(context)
     const repaired = await getAsset(context.env.DB, assetId)
+    for (const [name, value] of Object.entries(storedUploadAcknowledgementHeaders(repaired))) context.header(name, value)
     return context.json({
       asset: repaired ? toPublicAsset(repaired, undefined, { allowDownload: await canAppUserAccessAsset(context.env.DB, user, assetId, 'download') }) : null,
       alreadyStored: true,
@@ -346,6 +349,7 @@ assetsRoutes.put('/:id/content', async (context) => {
     await logActivity(context.env.DB, { action: 'UPLOAD', assetId, detail: { reusedStorage: false } })
     scheduleUsageRefresh(context)
     const current = await getAsset(context.env.DB, assetId)
+    for (const [name, value] of Object.entries(storedUploadAcknowledgementHeaders(current))) context.header(name, value)
     return context.json({
       asset: current ? toPublicAsset(current, undefined, { allowDownload: await canAppUserAccessAsset(context.env.DB, user, assetId, 'download') }) : null,
       previewAvailable: Boolean(current?.preview_file_id),

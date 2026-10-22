@@ -1,8 +1,10 @@
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 
 const host = '127.0.0.1'
 const port = Number(process.env.PRIVATE_ARCHIVE_PROTOCOL_SMOKE_PORT ?? 18765)
 const expectedSize = 256 * 1024
+const expectedHash = createHash('sha256').update(Buffer.alloc(expectedSize, 0x5a)).digest('hex')
 const uploadToken = 'native-protocol-smoke-upload-token'
 const sessionCookie = 'pa_account=protocol-smoke-session'
 let reservationCount = 0
@@ -60,7 +62,7 @@ const server = http.createServer(async (request, response) => {
         || parsed.importOrigin !== 'ios-background'
         || parsed.sizeBytes !== expectedSize
         || typeof parsed.contentHash !== 'string'
-        || parsed.contentHash.length !== 64) {
+        || parsed.contentHash !== expectedHash) {
         return json(response, 400, { error: 'PROTOCOL_SMOKE_RESERVE_BODY_INVALID' })
       }
       console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_RESERVE_OK')
@@ -100,7 +102,18 @@ const server = http.createServer(async (request, response) => {
       if (contentCount !== 5 || reservationCount !== 2) return json(response, 400, { error: 'PROTOCOL_SMOKE_RECOVERY_SEQUENCE_INVALID' })
       console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_CONTENT_OK bytes=' + body.length)
       console.log('PRIVATE_ARCHIVE_PROTOCOL_SERVER_RECOVERY_OK reserves=2 contents=5')
-      return json(response, 201, { asset: { id: 'native-protocol-smoke-asset', status: 'queued' }, previewAvailable: false })
+      response.writeHead(201, {
+        'Content-Length': '0',
+        'Cache-Control': 'private, no-store',
+        'X-PA-Upload-Commit': 'v1',
+        'X-PA-Asset-Id': 'native-protocol-smoke-asset',
+        'X-PA-Storage-Backend': 'telegram_bot',
+        'X-PA-Size-Bytes': String(expectedSize),
+        'X-PA-Content-SHA256': expectedHash,
+        'X-PA-Asset-Status': 'queued',
+      })
+      response.end()
+      return
     }
 
     return json(response, 404, { error: 'PROTOCOL_SMOKE_ROUTE_NOT_FOUND' })

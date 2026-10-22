@@ -118,6 +118,7 @@ jobs:
             xcrun simctl launch --terminate-running-process "$UDID" cd.cc.joye.photo
           wait_for_log_marker 'PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED' 45
           wait_for_log_marker 'PRIVATE_ARCHIVE_ACCOUNT_ISOLATION_SMOKE_COMPLETED' 15
+          wait_for_log_marker 'PRIVATE_ARCHIVE_CONTENT_HEADER_ACK_SMOKE_COMPLETED' 1
           for fault in empty-body wrong-asset pending-asset expired-token; do
             wait_for_log_marker "PRIVATE_ARCHIVE_PROTOCOL_ORIGINAL_RETAINED case=$fault" 1
           done

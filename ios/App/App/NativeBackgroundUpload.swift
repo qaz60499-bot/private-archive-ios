@@ -774,6 +774,140 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         NSLog("PRIVATE_ARCHIVE_STORED_CONFIRMATION_SMOKE_COMPLETED cases=%ld", cases.count)
     }
 
+    private func verifyContentHeaderAcknowledgementRuntimeSmoke() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            if !condition { throw NSError(domain: "NativeBackgroundUpload", code: 52, userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        let id = UUID().uuidString
+        let principal = "header-acknowledgement-smoke"
+        let cookie = "pa_account=header-acknowledgement-smoke"
+        let generation = beginPrincipalChange()
+        _ = confirmPrincipal(principal, cookie: cookie, generation: generation)
+        let original = Data([1, 2, 3])
+        try createJob(id: id, principalId: principal, fileName: "header-fixture.bin", mimeType: "application/octet-stream", sizeBytes: 3, mediaType: "file", lastModifiedMs: nil)
+        try appendChunk(id: id, data: original, principalId: principal)
+        defer {
+            stateQueue.sync { records.removeValue(forKey: id); saveStateLocked() }
+            cleanupFiles(id)
+        }
+        let hash = try sha256(url: originalURL(id))
+        let record = stateQueue.sync { () -> NativeUploadRecord in
+            records[id]?.ready = true
+            records[id]?.contentHash = hash
+            records[id]?.remoteAssetId = "header-fixture"
+            records[id]?.uploadToken = "header-fixture-capability"
+            records[id]?.stage = "original"
+            records[id]?.status = "uploading"
+            return records[id]!
+        }
+        let contentURL = apiBase.appendingPathComponent("api/assets/header-fixture/content")
+        let headers = ["X-PA-Upload-Commit": "v1", "X-PA-Asset-Id": "header-fixture", "X-PA-Storage-Backend": "telegram_bot", "X-PA-Size-Bytes": "3", "X-PA-Content-SHA256": hash, "X-PA-Asset-Status": "ready"]
+        for statusCode in [200, 201] {
+            for storedStatus in ["stored", "queued", "analyzing", "ready", "limited"] {
+                var fields = headers
+                fields["X-PA-Asset-Status"] = storedStatus
+                let response = HTTPURLResponse(url: contentURL, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: fields)!
+                try check(hasStoredContentAcknowledgement(Data(), record: record, response: response), "header-valid-\(statusCode)-\(storedStatus)")
+            }
+        }
+        for header in headers.keys {
+            var fields = headers
+            fields.removeValue(forKey: header)
+            let response = HTTPURLResponse(url: contentURL, statusCode: 201, httpVersion: "HTTP/1.1", headerFields: fields)!
+            try check(!hasStoredContentAcknowledgement(Data(), record: record, response: response), "header-missing-field-accepted")
+            try check((try? Data(contentsOf: originalURL(id))) == original, "header-missing-field-original-lost")
+        }
+        let jsonBody = Data("{\"asset\":{\"id\":\"header-fixture\",\"status\":\"ready\"}}".utf8)
+        let bodyResponse = HTTPURLResponse(url: contentURL, statusCode: 201, httpVersion: "HTTP/1.1", headerFields: [:])!
+        try check(hasStoredContentAcknowledgement(jsonBody, record: record, response: bodyResponse), "header-json-backward-compatibility")
+        for status in [202, 204, 206, 301, 401, 500] {
+            let response = HTTPURLResponse(url: contentURL, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
+            try check(!hasStoredContentAcknowledgement(jsonBody, record: record, response: response), "json-invalid-http-accepted-\(status)")
+        }
+        let cases = ["missing-version", "version", "asset", "backend", "size", "size-format", "hash", "uppercase-hash", "missing-hash", "invalid-local-hash", "status", "202", "204", "401", "500", "origin", "scheme", "port", "path", "query", "fragment", "userinfo", "transport-error", "malformed-body", "error-body", "wrong-asset-body", "pending-body", "whitespace-body"]
+        for testCase in cases {
+            var fields = headers
+            var candidate = record
+            var status = 201
+            var url = contentURL
+            var data = Data()
+            var error: Error?
+            switch testCase {
+            case "missing-version": fields.removeValue(forKey: "X-PA-Upload-Commit")
+            case "version": fields["X-PA-Upload-Commit"] = "v2"
+            case "asset": fields["X-PA-Asset-Id"] = "another-asset"
+            case "backend": fields["X-PA-Storage-Backend"] = "telegram_user_group"
+            case "size": fields["X-PA-Size-Bytes"] = "4"
+            case "size-format": fields["X-PA-Size-Bytes"] = "03"
+            case "hash": fields["X-PA-Content-SHA256"] = String(repeating: "0", count: 64)
+            case "uppercase-hash": fields["X-PA-Content-SHA256"] = hash.uppercased()
+            case "missing-hash": candidate.contentHash = nil
+            case "invalid-local-hash": candidate.contentHash = "invalid"; fields["X-PA-Content-SHA256"] = "invalid"
+            case "status": fields["X-PA-Asset-Status"] = "pending_upload"
+            case "202", "204", "401", "500": status = Int(testCase)!
+            case "origin", "scheme", "port", "path", "query", "fragment", "userinfo":
+                var components = URLComponents(url: contentURL, resolvingAgainstBaseURL: false)!
+                switch testCase {
+                case "origin": components.host = "another.invalid"
+                case "scheme": components.scheme = contentURL.scheme == "https" ? "http" : "https"
+                case "port": components.port = (contentURL.port ?? 0) + 1
+                case "path": components.path += "/another"
+                case "query": components.query = "untrusted=1"
+                case "fragment": components.fragment = "untrusted"
+                default: components.user = "untrusted"
+                }
+                url = components.url!
+            case "transport-error": error = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotParseResponse)
+            case "malformed-body": data = Data("{".utf8)
+            case "error-body": data = Data("{\"error\":\"UNCONFIRMED\",\"asset\":{\"id\":\"header-fixture\",\"status\":\"ready\"}}".utf8)
+            case "wrong-asset-body": data = Data("{\"asset\":{\"id\":\"another-asset\",\"status\":\"ready\"}}".utf8)
+            case "pending-body": data = Data("{\"asset\":{\"id\":\"header-fixture\",\"status\":\"pending_upload\"}}".utf8)
+            default: data = Data(" ".utf8)
+            }
+            let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: fields)!
+            try check(!hasStoredContentAcknowledgement(data, record: candidate, response: response, error: error), "header-invalid-accepted-\(testCase)")
+            try check((try? Data(contentsOf: originalURL(id))) == original, "header-invalid-original-lost-\(testCase)")
+        }
+        let fixtureSession = URLSession(configuration: .ephemeral)
+        var request = baseRequest(url: contentURL, method: "PUT", cookie: cookie)
+        request.setValue(nil, forHTTPHeaderField: "Cookie")
+        let task = fixtureSession.uploadTask(with: request, fromFile: originalURL(id))
+        defer { task.cancel(); fixtureSession.invalidateAndCancel() }
+        let races = ["owner", "active-owner", "control", "hash", "size", "task", "capability", "pause", "auth"]
+        for race in races {
+            let authenticationSnapshot = stateQueue.sync { () -> Int in
+                records[id] = record
+                activePrincipalId = principal
+                activeAuthenticationCookie = cookie
+                authenticationWasSet = true
+                switch race {
+                case "owner": records[id]?.principalId = "another-owner"
+                case "active-owner": activePrincipalId = "another-owner"
+                case "control": records[id]?.controlGeneration = 1
+                case "hash": records[id]?.contentHash = "changed"
+                case "size": records[id]?.sizeBytes = 4
+                case "task": records[id]?.contentTaskToken = "new-task"
+                case "capability": records[id]?.uploadToken = "new-capability"
+                case "pause": records[id]?.status = "paused"
+                default: authenticationGeneration += 1
+                }
+                return race == "auth" ? authenticationGeneration - 1 : authenticationGeneration
+            }
+            try check(!complete(record, deduplicated: false, contentTask: task, authenticationSnapshot: authenticationSnapshot), "header-completion-race-\(race)")
+            try check((try? Data(contentsOf: originalURL(id))) == original, "header-race-original-lost-\(race)")
+        }
+        let coldAuthenticationSnapshot = stateQueue.sync { () -> Int in
+            records[id] = record
+            activePrincipalId = nil
+            activeAuthenticationCookie = nil
+            authenticationWasSet = false
+            return authenticationGeneration
+        }
+        try check(complete(record, deduplicated: false, contentTask: task, authenticationSnapshot: coldAuthenticationSnapshot), "header-cold-background-completion")
+        try check(!fileManager.fileExists(atPath: originalURL(id).path), "header-confirmed-original-not-released")
+        NSLog("PRIVATE_ARCHIVE_CONTENT_HEADER_ACK_SMOKE_COMPLETED cases=%ld", 10 + headers.count + 1 + 6 + cases.count + races.count + 1)
+    }
+
     func runNativeProtocolRuntimeSmoke() {
         guard ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1" else { return }
         guard let host = apiBase.host, host == "127.0.0.1" || host == "localhost" else {
@@ -783,6 +917,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         do {
             try verifyAccountIsolationRuntimeSmoke()
             try verifyStoredConfirmationRuntimeSmoke()
+            try verifyContentHeaderAcknowledgementRuntimeSmoke()
         }
         catch {
             NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED account-isolation=%@", error.localizedDescription)
@@ -844,6 +979,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             guard let self else { return }
             let record = self.stateQueue.sync { self.records[id] }
             if record?.status == "done" {
+                guard !self.fileManager.fileExists(atPath: self.originalURL(id).path) else {
+                    NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED confirmed-original-not-released")
+                    return
+                }
                 NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_COMPLETED id=%@", id)
                 self.removeJob(id: id)
                 return
@@ -1580,7 +1719,30 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return json["error"] as? String
     }
 
-    private func hasStoredContentAcknowledgement(_ data: Data, record: NativeUploadRecord) -> Bool {
+    private func hasStoredContentAcknowledgement(_ data: Data, record: NativeUploadRecord, response: HTTPURLResponse? = nil, error: Error? = nil) -> Bool {
+        guard error == nil else { return false }
+        if let response, ![200, 201].contains(response.statusCode) { return false }
+        if data.isEmpty {
+            // Background URLSession may retain the committed response headers while
+            // delivering no body. Only this fully bound server proof replaces JSON.
+            guard let response, [200, 201].contains(response.statusCode),
+                  let expectedId = record.remoteAssetId, let hash = record.contentHash,
+                  hash.utf8.count == 64, hash.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                  record.sizeBytes > 0,
+                  let url = response.url else { return false }
+            let expected = apiBase.appendingPathComponent("api/assets/\(expectedId)/content")
+            guard url.scheme?.lowercased() == expected.scheme?.lowercased(),
+                  url.host?.lowercased() == expected.host?.lowercased(), url.port == expected.port,
+                  url.path == expected.path, url.query == nil, url.fragment == nil,
+                  url.user == nil, url.password == nil,
+                  response.value(forHTTPHeaderField: "X-PA-Upload-Commit") == "v1",
+                  response.value(forHTTPHeaderField: "X-PA-Asset-Id") == expectedId,
+                  response.value(forHTTPHeaderField: "X-PA-Storage-Backend") == "telegram_bot",
+                  response.value(forHTTPHeaderField: "X-PA-Size-Bytes") == String(record.sizeBytes),
+                  response.value(forHTTPHeaderField: "X-PA-Content-SHA256") == hash,
+                  let status = response.value(forHTTPHeaderField: "X-PA-Asset-Status") else { return false }
+            return ["stored", "queued", "analyzing", "ready", "limited"].contains(status)
+        }
         guard let expectedId = record.remoteAssetId,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               json["error"] == nil,
@@ -1761,10 +1923,19 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     @discardableResult
-    private func complete(_ record: NativeUploadRecord, deduplicated: Bool, confirmation: StoredConfirmation? = nil) -> Bool {
+    private func complete(_ record: NativeUploadRecord, deduplicated: Bool, confirmation: StoredConfirmation? = nil, contentTask: URLSessionTask? = nil, authenticationSnapshot: Int? = nil) -> Bool {
         let finished = stateQueue.sync { () -> NativeUploadRecord? in
             guard var value = records[record.id], value.ready,
-                  value.status != "done", value.status != "failed", value.status != "paused" else { return nil }
+                  value.status != "done", value.status != "failed", value.status != "paused",
+                  value.principalId != nil, value.principalId == record.principalId,
+                  (value.controlGeneration ?? 0) == (record.controlGeneration ?? 0),
+                  value.contentHash == record.contentHash, value.sizeBytes == record.sizeBytes,
+                  value.contentTaskToken == record.contentTaskToken else { return nil }
+            if let contentTask {
+                guard authenticationSnapshot == authenticationGeneration,
+                      !authenticationWasSet || value.principalId == activePrincipalId,
+                      contentRequestMatchesRecord(contentTask, record: value) else { return nil }
+            }
             if let confirmation {
                 // Check proof provenance and commit in one queue turn. In particular,
                 // pause/account changes cannot slip between checking and completion.
@@ -1938,7 +2109,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let current = records[id]
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let asset = json?["asset"] as? [String: Any]
-            let strictACK = current.map { hasStoredContentAcknowledgement(data, record: $0) } ?? false
+            let strictACK = current.map { hasStoredContentAcknowledgement(data, record: $0, response: task.response as? HTTPURLResponse, error: error) } ?? false
             let idMatch = current.flatMap { $0.remoteAssetId }.map { asset?["id"] as? String == $0 } ?? false
             let statusStored = ["stored", "queued", "analyzing", "ready", "limited"].contains(asset?["status"] as? String ?? "")
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG content-terminal job=%@ task=%ld generation=%ld http=%ld bytes=%ld errorCode=%ld attempts=%ld strictACK=%d jsonError=%d assetPresent=%d idMatch=%d statusStored=%d", id, task.taskIdentifier, foregroundWatchdogGeneration, (task.response as? HTTPURLResponse)?.statusCode ?? 0, data.count, (error as NSError?)?.code ?? 0, current?.attempts ?? -1, strictACK ? 1 : 0, json?["error"] != nil ? 1 : 0, asset != nil ? 1 : 0, idMatch ? 1 : 0, statusStored ? 1 : 0)
@@ -2201,6 +2372,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return
         }
         let record: NativeUploadRecord?
+        var callbackAuthenticationSnapshot: Int?
         if stage == "content" {
             logContentCallbackDiagnostic(task, id: id, data: data, error: error)
             let taskIdentity = contentTaskIdentity(task)
@@ -2234,6 +2406,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 current.updatedAt = now()
                 records[id] = current
                 saveStateLocked()
+                callbackAuthenticationSnapshot = authenticationGeneration
                 return current
             }
             guard let current = record,
@@ -2278,14 +2451,14 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 #if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG acknowledgement job=%@ json=%d noError=%d idMatch=%d storedStatus=%d", id, acknowledgement != nil ? 1 : 0, acknowledgement?["error"] == nil ? 1 : 0, acknowledgedAsset?["id"] as? String == record.remoteAssetId ? 1 : 0, storedStatuses.contains(acknowledgedAsset?["status"] as? String ?? "") ? 1 : 0)
 #endif
-            guard hasStoredContentAcknowledgement(data, record: record) else {
+            guard hasStoredContentAcknowledgement(data, record: record, response: response, error: error) else {
 #if DEBUG
                 verifyProtocolSmokeOriginalRetention(record, response: response)
 #endif
                 retryContent(record, after: retryDelay(response), reason: "UPLOAD_COMMIT_UNCONFIRMED", cookieOverride: requestCookie)
                 return
             }
-            complete(record, deduplicated: false)
+            complete(record, deduplicated: false, contentTask: task, authenticationSnapshot: callbackAuthenticationSnapshot)
             return
         }
         if status == 401 && code == "APP_AUTH_REQUIRED" {
