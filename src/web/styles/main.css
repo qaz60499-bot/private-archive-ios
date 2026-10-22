@@ -2830,6 +2830,11 @@ body.upload-open .mobile-nav-dock {
 }
 
 .upload-sheet > header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-block: 10px;
+  background: var(--surface);
   margin-bottom: 24px;
   display: flex;
   align-items: flex-start;

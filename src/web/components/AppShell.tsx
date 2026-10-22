@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useState } from 'react'
 import { LogOut, Repeat2, UserRound } from 'lucide-react'
 import { createPortal } from 'react-dom'
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { NavLink, Outlet, useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { useArchive } from '../context/ArchiveContext'
 import { useAuth } from '../context/AuthContext'
 import { MediaViewer } from '../features/viewer/MediaViewer'
@@ -134,6 +134,13 @@ function AccountMenu() {
 }
 
 export function AppShell() {
+  const { pathname } = useLocation()
+  const navigationType = useNavigationType()
+  useLayoutEffect(() => {
+    // Opening another page must not inherit the timeline's scroll offset. Leave
+    // history navigation to the browser's existing restoration behavior.
+    if (navigationType !== 'POP') window.scrollTo(0, 0)
+  }, [pathname, navigationType])
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>

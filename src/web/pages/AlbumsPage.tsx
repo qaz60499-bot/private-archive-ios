@@ -84,7 +84,7 @@ export function AlbumsPage() {
             </article>
           ))}
         </div>
-      ) : <EmptyState title="还没有相册" description="创建相册后，可在暗色 Viewer 的信息面板中加入媒体。" />}
+      ) : <EmptyState title="还没有相册" description="创建相册后，打开照片或视频，在详情面板中加入相册。" />}
     </div>
   )
 }

@@ -37,7 +37,12 @@ function onAuthenticationPendingChange(event: Event): void {
 
 function subscribeNativeQuarantine(listener: () => void): () => void {
   quarantineSubscribers.add(listener)
-  if (quarantineSubscribers.size === 1) window.addEventListener(NATIVE_QUARANTINE_EVENT, onQuarantineChange)
+  if (quarantineSubscribers.size === 1) {
+    // Native sync can finish while the sheet has no subscribers. Recover the latest
+    // snapshot when mounting instead of waiting for another native event.
+    quarantineSnapshot = getQuarantinedNativeUploadCount()
+    window.addEventListener(NATIVE_QUARANTINE_EVENT, onQuarantineChange)
+  }
   return () => {
     quarantineSubscribers.delete(listener)
     if (quarantineSubscribers.size === 0) window.removeEventListener(NATIVE_QUARANTINE_EVENT, onQuarantineChange)
@@ -46,7 +51,10 @@ function subscribeNativeQuarantine(listener: () => void): () => void {
 
 function subscribeNativeAuthPending(listener: () => void): () => void {
   authenticationPendingSubscribers.add(listener)
-  if (authenticationPendingSubscribers.size === 1) window.addEventListener(NATIVE_AUTH_PENDING_EVENT, onAuthenticationPendingChange)
+  if (authenticationPendingSubscribers.size === 1) {
+    authenticationPendingSnapshot = getNativeUploadAuthenticationPending()
+    window.addEventListener(NATIVE_AUTH_PENDING_EVENT, onAuthenticationPendingChange)
+  }
   return () => {
     authenticationPendingSubscribers.delete(listener)
     if (authenticationPendingSubscribers.size === 0) window.removeEventListener(NATIVE_AUTH_PENDING_EVENT, onAuthenticationPendingChange)

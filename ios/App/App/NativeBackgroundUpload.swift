@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import UIKit
 import Capacitor
 import CryptoKit
@@ -79,6 +80,28 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private var responseBuffers: [String: Data] = [:]
     private var backgroundCompletionHandlers: [String: () -> Void] = [:]
     private var foregroundWatchdogGeneration = 0
+    private var foregroundRecoveryActive = false
+    private var confirmationAttemptedJobs = Set<String>()
+    private var storedConfirmation: StoredConfirmation?
+    private let maximumConfirmationResponseBytes = 256 * 1024
+    private final class StoredConfirmation {
+        let record: NativeUploadRecord
+        let contentTask: URLSessionTask
+        let authenticationGeneration: Int
+        let foregroundGeneration: Int
+        let cookie: String
+        var requestTask: URLSessionDataTask?
+        var data = Data()
+        var responseTooLarge = false
+
+        init(record: NativeUploadRecord, contentTask: URLSessionTask, authenticationGeneration: Int, foregroundGeneration: Int, cookie: String) {
+            self.record = record
+            self.contentTask = contentTask
+            self.authenticationGeneration = authenticationGeneration
+            self.foregroundGeneration = foregroundGeneration
+            self.cookie = cookie
+        }
+    }
     private var reconcileInFlight = false
     private var reconcilePending = false
     private var stagingProtectionDepth = 0
@@ -121,7 +144,21 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         return URLSession(configuration: configuration)
     }()
 
+    // Bounded metadata confirmation only; original bytes still use the background
+    // session. Never let a shared cookie jar change the captured account on this GET.
+    private lazy var storedConfirmationSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
+    }()
+
 #if DEBUG
+    private var storedConfirmationSmokeActive = false
     // iOS Simulator's background-transfer daemon rejects loopback HTTP uploads even
     // though a normal in-app URLSession can reach the same localhost server. The CI
     // protocol smoke therefore swaps only the transport for localhost while preserving
@@ -165,14 +202,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         super.init()
         _ = rootDirectory
         loadState()
+        _ = storedConfirmationSession
         for record in records.values.sorted(by: { $0.createdAt > $1.createdAt }).prefix(3) {
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded job=%@ status=%@ progress=%.0f stage=%@ ownerKnown=%d taskOwned=%d originalPresent=%d", record.id, record.status, record.progress, record.stage, record.principalId != nil ? 1 : 0, record.contentTaskToken != nil ? 1 : 0, fileManager.fileExists(atPath: originalURL(record.id).path) ? 1 : 0)
+#endif
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded-retry job=%@ attempts=%ld hasError=%d unconfirmed=%d expired=%d inProgress=%d", record.id, record.attempts, record.error != nil ? 1 : 0, record.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0, record.error == "UPLOAD_TOKEN_INVALID_OR_EXPIRED" ? 1 : 0, record.error == "UPLOAD_ALREADY_IN_PROGRESS" ? 1 : 0)
+#endif
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG loaded-cache job=%@ completeSize=%d", record.id, (try? fileSize(originalURL(record.id))) == record.sizeBytes ? 1 : 0)
+#endif
         }
         recoverInterruptedStaging()
         recoverRetryableFailures()
+#if DEBUG
         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG init records=%ld unfinished=%ld", records.count, records.values.filter { $0.status != "done" }.count)
+#endif
         _ = session
         _ = legacyReserveSession
         reconcileTasks()
@@ -225,6 +271,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             authenticationWasSet = true
             activePrincipalId = nil
             activeAuthenticationCookie = nil
+            // Keep the in-flight slot until its callback drains; an account change
+            // invalidates proof but never grants another foreground query budget.
+            storedConfirmation?.requestTask?.cancel()
             let tasks = Array(reserveTasks.values)
             reserveTasks.removeAll()
             tasks.forEach { $0.cancel() }
@@ -542,9 +591,13 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         stateQueue.sync {
             guard principalId == nil || principalId == activePrincipalId else { return [] }
             let jobs = records.values.filter { $0.principalId != nil && $0.principalId == activePrincipalId }.sorted { $0.createdAt > $1.createdAt }
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG list visible=%ld done=%ld unfinished=%ld", jobs.count, jobs.filter { $0.status == "done" }.count, jobs.filter { $0.status != "done" }.count)
+#endif
             for record in jobs.prefix(3) {
+#if DEBUG
                 NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG snapshot job=%@ status=%@ progress=%.0f stage=%@ taskOwned=%d originalPresent=%d", record.id, record.status, record.progress, record.stage, record.contentTaskToken != nil ? 1 : 0, fileManager.fileExists(atPath: originalURL(record.id).path) ? 1 : 0)
+#endif
             }
             return jobs
         }
@@ -618,13 +671,117 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         NSLog("PRIVATE_ARCHIVE_ACCOUNT_ISOLATION_SMOKE_COMPLETED")
     }
 
+    private func verifyStoredConfirmationRuntimeSmoke() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            if !condition { throw NSError(domain: "NativeBackgroundUpload", code: 51, userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        let fixtureSession = URLSession(configuration: .ephemeral)
+        let previousForeground = stateQueue.sync { () -> (Bool, Int, Set<String>) in
+            storedConfirmationSmokeActive = true
+            return (foregroundRecoveryActive, foregroundWatchdogGeneration, confirmationAttemptedJobs)
+        }
+        defer {
+            fixtureSession.invalidateAndCancel()
+            stateQueue.sync {
+                storedConfirmationSmokeActive = false
+                storedConfirmation = nil
+                foregroundRecoveryActive = previousForeground.0
+                foregroundWatchdogGeneration = previousForeground.1
+                confirmationAttemptedJobs = previousForeground.2
+            }
+        }
+        let cases = ["wrong-id", "pending", "401", "backend", "size", "boolean-size", "missing-deleted", "deleted", "not-available", "numeric-available", "oversized", "account-race", "pause-race", "foreground-race", "task-race", "capability-race", "hash-race", "control-race", "cookie-race", "valid"]
+        for testCase in cases {
+            let id = UUID().uuidString
+            let principalId = "stored-confirmation-smoke"
+            let generation = beginPrincipalChange()
+            _ = confirmPrincipal(principalId, cookie: "pa_account=stored-confirmation-smoke", generation: generation)
+            let original = testCase == "boolean-size" ? Data([1]) : Data([1, 2, 3])
+            try createJob(id: id, principalId: principalId, fileName: "confirmation-fixture.bin", mimeType: "application/octet-stream", sizeBytes: Int64(original.count), mediaType: "file", lastModifiedMs: nil)
+            try appendChunk(id: id, data: original, principalId: principalId)
+            let task = fixtureSession.uploadTask(with: baseRequest(url: apiBase.appendingPathComponent("api/assets/confirmation-fixture/content"), method: "PUT", cookie: "pa_account=stored-confirmation-smoke"), fromFile: originalURL(id))
+            let taskIdentity = UUID().uuidString
+            task.taskDescription = "content|\(id)|\(taskIdentity)"
+            defer {
+                task.cancel()
+                stateQueue.sync { records.removeValue(forKey: id); saveStateLocked() }
+                cleanupFiles(id)
+            }
+            let hash = try sha256(url: originalURL(id))
+            stateQueue.sync {
+                foregroundRecoveryActive = true
+                foregroundWatchdogGeneration += 1
+                confirmationAttemptedJobs.removeAll()
+                records[id]?.ready = true
+                records[id]?.contentHash = hash
+                records[id]?.remoteAssetId = "confirmation-fixture"
+                records[id]?.uploadToken = "confirmation-fixture-capability"
+                records[id]?.contentTaskToken = taskIdentity
+                records[id]?.stage = "original"
+                records[id]?.status = "uploading"
+                records[id]?.updatedAt = now()
+            }
+            try check(claimStoredConfirmation(task) == nil, "fresh-task-probed")
+            stateQueue.sync {
+                records[id]?.updatedAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-181))
+                confirmationAttemptedJobs = ["budget-1", "budget-2", "budget-3"]
+            }
+            try check(claimStoredConfirmation(task) == nil, "foreground-budget-exceeded")
+            stateQueue.sync { confirmationAttemptedJobs.removeAll(); foregroundRecoveryActive = false }
+            try check(claimStoredConfirmation(task) == nil, "background-task-probed")
+            stateQueue.sync { foregroundRecoveryActive = true }
+            guard let confirmation = claimStoredConfirmation(task) else { throw NSError(domain: "NativeBackgroundUpload", code: 51, userInfo: [NSLocalizedDescriptionKey: "fixture-probe-not-claimed"]) }
+            try check(claimStoredConfirmation(task) == nil, "multiple-inflight-probes")
+            var asset: [String: Any] = ["id": "confirmation-fixture", "status": "ready", "storageBackend": "telegram_bot", "sizeBytes": original.count, "originalAvailableInApp": true, "deletedAt": NSNull()]
+            switch testCase {
+            case "wrong-id": asset["id"] = "other-asset"
+            case "pending": asset["status"] = "pending_upload"
+            case "backend": asset["storageBackend"] = "telegram_user_group"
+            case "size": asset["sizeBytes"] = 4
+            case "boolean-size": asset["sizeBytes"] = true
+            case "missing-deleted": asset.removeValue(forKey: "deletedAt")
+            case "deleted": asset["deletedAt"] = "2026-10-21T00:00:00Z"
+            case "not-available": asset["originalAvailableInApp"] = false
+            case "numeric-available": asset["originalAvailableInApp"] = 1
+            case "account-race": _ = beginPrincipalChange()
+            case "pause-race": pauseJob(id: id, principalId: principalId)
+            case "foreground-race": stopForegroundRecoveryWatchdog()
+            case "task-race": stateQueue.sync { records[id]?.contentTaskToken = UUID().uuidString }
+            case "capability-race": stateQueue.sync { records[id]?.uploadToken = "rotated-capability" }
+            case "hash-race": stateQueue.sync { records[id]?.contentHash = "changed-hash" }
+            case "control-race": stateQueue.sync { records[id]?.controlGeneration = 1 }
+            case "cookie-race": stateQueue.sync { activeAuthenticationCookie = "changed-cookie" }
+            default: break
+            }
+            let data: Data
+            if testCase == "oversized" { data = Data(repeating: 0x20, count: maximumConfirmationResponseBytes + 1) }
+            else { data = try JSONSerialization.data(withJSONObject: ["asset": asset]) }
+            let completed = finishStoredConfirmation(confirmation, status: testCase == "401" ? 401 : 200, data: data, error: nil)
+            try check(completed == (testCase == "valid"), "confirmation-case-\(testCase)")
+            try check(stateQueue.sync { confirmationAttemptedJobs == Set([id]) && records[id]?.attempts == 0 }, "confirmation-changed-budget-or-attempts")
+            if completed {
+                try check(stateQueue.sync { records[id]?.status == "done" && records[id]?.contentTaskToken == nil }, "confirmed-state-not-terminal")
+                try check(!fileManager.fileExists(atPath: originalURL(id).path), "confirmed-cache-not-released")
+                try check(task.state == .canceling || task.state == .completed, "confirmed-task-not-retired")
+            } else {
+                try check((try? Data(contentsOf: originalURL(id))) == original, "uncertain-original-not-retained-\(testCase)")
+                try check(task.state == .suspended, "uncertain-task-canceled-\(testCase)")
+            }
+            try check(claimStoredConfirmation(task) == nil, "same-job-reprobed-in-cycle")
+        }
+        NSLog("PRIVATE_ARCHIVE_STORED_CONFIRMATION_SMOKE_COMPLETED cases=%ld", cases.count)
+    }
+
     func runNativeProtocolRuntimeSmoke() {
         guard ProcessInfo.processInfo.environment["PRIVATE_ARCHIVE_NATIVE_PROTOCOL_SMOKE"] == "1" else { return }
         guard let host = apiBase.host, host == "127.0.0.1" || host == "localhost" else {
             NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED invalid-api-base=%@", apiBase.absoluteString)
             return
         }
-        do { try verifyAccountIsolationRuntimeSmoke() }
+        do {
+            try verifyAccountIsolationRuntimeSmoke()
+            try verifyStoredConfirmationRuntimeSmoke()
+        }
         catch {
             NSLog("PRIVATE_ARCHIVE_PROTOCOL_SMOKE_FAILED account-isolation=%@", error.localizedDescription)
             return
@@ -878,25 +1035,37 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func startForegroundRecoveryWatchdog() {
+#if DEBUG
         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG foreground-start")
-        let generation = stateQueue.sync { () -> Int in
+#endif
+        let generation = stateQueue.sync { () -> Int? in
+            guard !foregroundRecoveryActive else { return nil }
+            foregroundRecoveryActive = true
             foregroundWatchdogGeneration += 1
+            confirmationAttemptedJobs.removeAll()
             return foregroundWatchdogGeneration
         }
+        guard let generation else { return }
         recoverRetryableFailures()
         reconcileTasks()
         scheduleForegroundRecoveryWatchdog(generation: generation)
     }
 
     func stopForegroundRecoveryWatchdog() {
+#if DEBUG
         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG foreground-stop")
-        stateQueue.sync { foregroundWatchdogGeneration += 1 }
+#endif
+        stateQueue.sync {
+            foregroundRecoveryActive = false
+            foregroundWatchdogGeneration += 1
+            storedConfirmation?.requestTask?.cancel()
+        }
     }
 
     private func scheduleForegroundRecoveryWatchdog(generation: Int) {
         workerQueue.asyncAfter(deadline: .now() + 30) { [weak self] in
             guard let self else { return }
-            let stillCurrent = self.stateQueue.sync { self.foregroundWatchdogGeneration == generation }
+            let stillCurrent = self.stateQueue.sync { self.foregroundRecoveryActive && self.foregroundWatchdogGeneration == generation }
             guard stillCurrent else { return }
             self.reconcileTasks()
             self.scheduleForegroundRecoveryWatchdog(generation: generation)
@@ -1296,7 +1465,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         task.taskDescription = "content|\(record.id)|\(contentTaskToken)"
         task.earliestBeginDate = earliest
         task.priority = URLSessionTask.highPriority
+#if DEBUG
         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG scheduled job=%@ task=%ld pathMatch=%d delayed=%d", record.id, task.taskIdentifier, contentRequestMatchesRecord(task, record: updated) ? 1 : 0, delayed ? 1 : 0)
+#endif
         notify(updated)
         task.resume()
     }
@@ -1517,10 +1688,89 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    private func complete(_ record: NativeUploadRecord, deduplicated: Bool) {
+    private func claimStoredConfirmation(_ task: URLSessionTask, at timestamp: Date = Date()) -> StoredConfirmation? {
+        stateQueue.sync {
+            guard foregroundRecoveryActive, storedConfirmation == nil, confirmationAttemptedJobs.count < 3,
+                  taskStage(task) == "content", let id = taskJobId(task), !confirmationAttemptedJobs.contains(id),
+                  let current = records[id], current.principalId != nil, current.principalId == activePrincipalId,
+                  let cookie = activeAuthenticationCookie, !cookie.isEmpty,
+                  current.status != "done", current.status != "failed", current.status != "paused",
+                  task.state != .completed, task.state != .canceling,
+                  current.contentTaskToken == contentTaskIdentity(task), contentRequestMatchesRecord(task, record: current),
+                  let hash = current.contentHash, !hash.isEmpty,
+                  let updated = ISO8601DateFormatter().date(from: current.updatedAt),
+                  timestamp.timeIntervalSince(max(updated, lastProgressAt[id] ?? updated)) >= 180,
+                  (try? fileSize(originalURL(id))) == current.sizeBytes else { return nil }
+            let confirmation = StoredConfirmation(record: current, contentTask: task, authenticationGeneration: authenticationGeneration, foregroundGeneration: foregroundWatchdogGeneration, cookie: cookie)
+            confirmationAttemptedJobs.insert(id)
+            storedConfirmation = confirmation
+            return confirmation
+        }
+    }
+
+    private func startStoredConfirmationIfEligible(_ task: URLSessionTask) {
+        guard let confirmation = claimStoredConfirmation(task), let assetId = confirmation.record.remoteAssetId else { return }
+        // This existing route updates last_viewed_at. Limit that side effect to three
+        // single-asset GETs per foreground cycle; never poll every native list call.
+        var request = baseRequest(url: apiBase.appendingPathComponent("api/assets/\(assetId)"), method: "GET", cookie: confirmation.cookie)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let requestTask = storedConfirmationSession.dataTask(with: request)
+        let shouldStart = stateQueue.sync { () -> Bool in
+            guard storedConfirmation === confirmation,
+                  foregroundRecoveryActive, foregroundWatchdogGeneration == confirmation.foregroundGeneration,
+                  authenticationGeneration == confirmation.authenticationGeneration else {
+                if storedConfirmation === confirmation { storedConfirmation = nil }
+                return false
+            }
+            confirmation.requestTask = requestTask
+            return true
+        }
+        if shouldStart { requestTask.resume() }
+        else { requestTask.cancel() }
+    }
+
+    private func hasStoredConfirmation(_ data: Data, status: Int, record: NativeUploadRecord) -> Bool {
+        guard status == 200, data.count <= maximumConfirmationResponseBytes,
+              hasStoredContentAcknowledgement(data, record: record),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let asset = json["asset"] as? [String: Any],
+              asset["storageBackend"] as? String == "telegram_bot", asset["deletedAt"] is NSNull,
+              let size = asset["sizeBytes"] as? NSNumber, CFGetTypeID(size) != CFBooleanGetTypeID(),
+              size.decimalValue == Decimal(record.sizeBytes),
+              let available = asset["originalAvailableInApp"] as? NSNumber,
+              CFGetTypeID(available) == CFBooleanGetTypeID(), available.boolValue else { return false }
+        return true
+    }
+
+    @discardableResult
+    private func finishStoredConfirmation(_ confirmation: StoredConfirmation, status: Int, data: Data, error: Error?) -> Bool {
+        let proof = error == nil && !confirmation.responseTooLarge && hasStoredConfirmation(data, status: status, record: confirmation.record)
+        let completed = proof && complete(confirmation.record, deduplicated: false, confirmation: confirmation)
+        stateQueue.sync { if storedConfirmation === confirmation { storedConfirmation = nil } }
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG stored-confirmation job=%@ http=%ld bytes=%ld proof=%d completed=%d", confirmation.record.id, status, data.count, proof ? 1 : 0, completed ? 1 : 0)
+        return completed
+    }
+
+    @discardableResult
+    private func complete(_ record: NativeUploadRecord, deduplicated: Bool, confirmation: StoredConfirmation? = nil) -> Bool {
         let finished = stateQueue.sync { () -> NativeUploadRecord? in
             guard var value = records[record.id], value.ready,
                   value.status != "done", value.status != "failed", value.status != "paused" else { return nil }
+            if let confirmation {
+                // Check proof provenance and commit in one queue turn. In particular,
+                // pause/account changes cannot slip between checking and completion.
+                guard storedConfirmation === confirmation, foregroundRecoveryActive,
+                      foregroundWatchdogGeneration == confirmation.foregroundGeneration,
+                      authenticationGeneration == confirmation.authenticationGeneration,
+                      activePrincipalId == record.principalId, value.principalId == record.principalId,
+                      activeAuthenticationCookie == confirmation.cookie,
+                      (value.controlGeneration ?? 0) == (record.controlGeneration ?? 0),
+                      value.contentTaskToken == record.contentTaskToken,
+                      value.contentTaskToken == contentTaskIdentity(confirmation.contentTask),
+                      value.contentHash == record.contentHash, value.sizeBytes == record.sizeBytes,
+                      contentRequestMatchesRecord(confirmation.contentTask, record: value) else { return nil }
+            }
             if !deduplicated {
                 guard value.stage == "original",
                       value.remoteAssetId == record.remoteAssetId,
@@ -1539,12 +1789,20 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             return value
         }
         guard let finished else {
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG complete-rejected job=%@", record.id)
-            return
+#endif
+            return false
         }
+        // Only the exact task whose stored proof was committed can be retired. A late
+        // cancellation/completion callback sees the persisted terminal record.
+        confirmation?.contentTask.cancel()
+#if DEBUG
         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG completed job=%@ deduplicated=%d", record.id, deduplicated ? 1 : 0)
+#endif
         notify(finished)
         cleanupFiles(record.id)
+        return true
     }
 
     private func cleanupFiles(_ id: String) {
@@ -1667,7 +1925,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             legacyReserveTasks.forEach { $0.cancel() }
 
             self.session.getAllTasks { allBackgroundTasks in
+#if DEBUG
                 NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG reconcile backgroundTasks=%ld records=%ld", allBackgroundTasks.count, recordsById.count)
+#endif
                 let legacyReserveOnContentSession = allBackgroundTasks.filter { self.taskStage($0) == "reserve" }
                 legacyReserveOnContentSession.forEach { $0.cancel() }
                 let contentTasks = allBackgroundTasks.filter { self.taskStage($0) == "content" }
@@ -1676,7 +1936,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 var needsContentRestartIds = Set<String>()
                 for (taskIndex, task) in contentTasks.enumerated() {
                     if taskIndex < 3 {
+#if DEBUG
                         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG task task=%ld state=%ld sent=%lld expected=%lld received=%lld http=%ld earliestSeconds=%.0f", task.taskIdentifier, task.state.rawValue, task.countOfBytesSent, task.countOfBytesExpectedToSend, task.countOfBytesReceived, (task.response as? HTTPURLResponse)?.statusCode ?? 0, task.earliestBeginDate?.timeIntervalSinceNow ?? 0)
+#endif
                     }
                     guard let id = self.taskJobId(task) else {
                         task.cancel()
@@ -1687,7 +1949,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                         guard var current = self.records[id], current.principalId != nil, current.ready,
                               current.status != "done", current.status != "failed", current.status != "paused" else { return (false, nil) }
                         if taskIndex < 3 {
+#if DEBUG
                             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG task-owner job=%@ task=%ld generationMatch=%d requestMatch=%d attempts=%ld unconfirmed=%d", id, task.taskIdentifier, current.contentTaskToken == taskIdentity ? 1 : 0, self.contentRequestMatchesRecord(task, record: current) ? 1 : 0, current.attempts, current.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0)
+#endif
                         }
                         guard self.contentRequestMatchesRecord(task, record: current) else {
                             if current.contentTaskToken == taskIdentity {
@@ -1717,6 +1981,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                     }
                     if task.state == .suspended { task.resume() }
                     validContentIds.insert(id)
+                    self.startStoredConfirmationIfEligible(task)
                 }
 
                 // contentTaskToken is persisted so an in-place relaunch can reject
@@ -1743,7 +2008,11 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 let activeReserveIds = self.stateQueue.sync { Set(self.reserveTasks.keys) }
                 let activeIds = activeReserveIds.union(validContentIds)
                 let resumable = self.stateQueue.sync {
-                    self.records.values.filter {
+#if DEBUG
+                    // Pure response/control fixtures never submit their synthetic PUTs.
+                    if self.storedConfirmationSmokeActive { return [NativeUploadRecord]() }
+#endif
+                    return self.records.values.filter {
                         $0.ready && $0.principalId != nil && $0.principalId == self.activePrincipalId && $0.status != "done" && $0.status != "failed" && $0.status != "paused" && !activeIds.contains($0.id)
                     }.sorted { $0.createdAt < $1.createdAt }
                 }
@@ -1782,7 +2051,38 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        // A metadata check may not forward the bound account cookie to another URL.
+        completionHandler(session === storedConfirmationSession ? nil : request)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard session === storedConfirmationSession else { completionHandler(.allow); return }
+        let allowed = stateQueue.sync { () -> Bool in
+            guard let confirmation = storedConfirmation, confirmation.requestTask?.taskIdentifier == dataTask.taskIdentifier else { return false }
+            if response.expectedContentLength > Int64(maximumConfirmationResponseBytes) {
+                confirmation.responseTooLarge = true
+                return false
+            }
+            return true
+        }
+        completionHandler(allowed ? .allow : .cancel)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if session === storedConfirmationSession {
+            let accepted = stateQueue.sync { () -> Bool in
+                guard let confirmation = storedConfirmation, confirmation.requestTask?.taskIdentifier == dataTask.taskIdentifier else { return false }
+                guard !confirmation.responseTooLarge, data.count <= maximumConfirmationResponseBytes - confirmation.data.count else {
+                    confirmation.responseTooLarge = true
+                    return false
+                }
+                confirmation.data.append(data)
+                return true
+            }
+            if !accepted { dataTask.cancel() }
+            return
+        }
         responseBuffers[taskBufferKey(session, task: dataTask), default: Data()].append(data)
     }
 
@@ -1808,12 +2108,21 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if session === storedConfirmationSession {
+            guard let confirmation = stateQueue.sync(execute: { storedConfirmation }), confirmation.requestTask?.taskIdentifier == task.taskIdentifier else { return }
+            if finishStoredConfirmation(confirmation, status: (task.response as? HTTPURLResponse)?.statusCode ?? 0, data: confirmation.data, error: error) { reconcileTasks() }
+            return
+        }
         guard let id = taskJobId(task), let stage = taskStage(task) else {
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected task=%ld reason=description", task.taskIdentifier)
+#endif
             return
         }
         let data = responseBuffers.removeValue(forKey: taskBufferKey(session, task: task)) ?? Data()
+#if DEBUG
         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback job=%@ task=%ld http=%ld bytes=%ld errorCode=%ld", id, task.taskIdentifier, (task.response as? HTTPURLResponse)?.statusCode ?? 0, data.count, (error as NSError?)?.code ?? 0)
+#endif
         if stage == "reserve" {
             // Delegate-driven reserve tasks can only come from an older installed build.
             // New reservations complete through foregroundSession's closure. Never let a
@@ -1826,16 +2135,22 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let taskIdentity = contentTaskIdentity(task)
             record = stateQueue.sync { () -> NativeUploadRecord? in
                 guard var current = records[id] else {
+#if DEBUG
                     NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=record-missing", id)
+#endif
                     return nil
                 }
                 guard contentRequestMatchesRecord(task, record: current) else {
+#if DEBUG
                     NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=request-match ready=%d stageOriginal=%d assetPresent=%d capabilityPresent=%d pathMatch=%d", id, current.ready ? 1 : 0, current.stage == "original" ? 1 : 0, current.remoteAssetId != nil ? 1 : 0, current.uploadToken != nil ? 1 : 0, task.originalRequest?.url?.path == current.remoteAssetId.map { "/api/assets/\($0)/content" } ? 1 : 0)
+#endif
                     return nil
                 }
                 if let owner = current.contentTaskToken {
                     guard owner == taskIdentity else {
+#if DEBUG
                         NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=task-generation", id)
+#endif
                         return nil
                     }
                 } else {
@@ -1852,7 +2167,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             }
             guard let current = record,
                   current.status != "done", current.status != "failed", current.status != "paused" else {
+#if DEBUG
                 NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected job=%@ reason=terminal-or-unmatched", id)
+#endif
                 return
             }
         } else {
@@ -1887,7 +2204,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let acknowledgement = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let acknowledgedAsset = acknowledgement?["asset"] as? [String: Any]
             let storedStatuses = ["stored", "queued", "analyzing", "ready", "limited"]
+#if DEBUG
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG acknowledgement job=%@ json=%d noError=%d idMatch=%d storedStatus=%d", id, acknowledgement != nil ? 1 : 0, acknowledgement?["error"] == nil ? 1 : 0, acknowledgedAsset?["id"] as? String == record.remoteAssetId ? 1 : 0, storedStatuses.contains(acknowledgedAsset?["status"] as? String ?? "") ? 1 : 0)
+#endif
             guard hasStoredContentAcknowledgement(data, record: record) else {
 #if DEBUG
                 verifyProtocolSmokeOriginalRetention(record, response: response)
