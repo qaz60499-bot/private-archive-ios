@@ -23,6 +23,14 @@ describe('structured archive classifier', () => {
     expect(classifyVisionFacts({ ...base, mainSubject: 'social', people: 'social', groupSize: '3+', socialActivity: true, food: 'strong' })).toBe('gathering')
   })
 
+  it('does not classify a large posed group as gathering without social activity', () => {
+    expect(classifyVisionFacts({ ...base, mainSubject: 'other', people: 'social', groupSize: '3+' })).toBe('other')
+  })
+
+  it('keeps a camera photo of a screen out of the screenshot category', () => {
+    expect(classifyVisionFacts({ ...base, capture: 'camera' })).toBe('other')
+  })
+
   it('classifies a road or in-transit scene as travel when a person is only incidental', () => {
     expect(classifyVisionFacts({ ...base, mainSubject: 'journey', people: 'incidental', groupSize: '1-2', journey: 'strong', nature: 'strong' })).toBe('travel')
   })
