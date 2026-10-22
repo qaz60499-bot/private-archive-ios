@@ -92,6 +92,12 @@ async function mockSuccessfulBoundary(page: Page, contentDelayMs = 0, firstWaveS
 
 test('20-item desktop batch respects upload concurrency and releases completed payloads', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop', 'desktop concurrency contract')
+  // This checks the unconstrained three-lane policy. Chrome's live downlink estimate
+  // can otherwise select the intentional one-lane slow-network policy and deadlock
+  // the two-request barrier below.
+  await page.addInitScript(() => Object.defineProperty(navigator, 'connection', {
+    configurable: true, value: { effectiveType: '4g', saveData: false, downlink: 10 },
+  }))
   // Keep the first request open until a second starts: CPU-dependent file preparation
   // must not turn the concurrency assertion into a race against a 120ms mock response.
   const boundary = await mockSuccessfulBoundary(page, 120, 2)

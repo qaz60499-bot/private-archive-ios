@@ -22,6 +22,7 @@ test('archive cover has no hero canvas and keeps actions interactive', async ({ 
 
 test('opening an album page starts at its own heading after timeline scrolling', async ({ page }) => {
   await page.goto('/')
+  await expect(page.locator('.memory-aperture')).toBeVisible()
   await page.evaluate(() => window.scrollTo({ top: 600, behavior: 'instant' }))
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(100)
   await page.getByRole('link', { name: '相册', exact: true }).click()

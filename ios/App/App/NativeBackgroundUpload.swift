@@ -81,6 +81,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private var backgroundCompletionHandlers: [String: () -> Void] = [:]
     private var foregroundWatchdogGeneration = 0
     private var foregroundRecoveryActive = false
+    private var foregroundDiagnosticGeneration: Int?
     private var confirmationAttemptedJobs = Set<String>()
     private var storedConfirmation: StoredConfirmation?
     private let maximumConfirmationResponseBytes = 256 * 1024
@@ -1043,6 +1044,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             foregroundRecoveryActive = true
             foregroundWatchdogGeneration += 1
             confirmationAttemptedJobs.removeAll()
+            foregroundDiagnosticGeneration = foregroundWatchdogGeneration
+            logForegroundRecoveryDiagnosticLocked("recovery-enter", generation: foregroundWatchdogGeneration)
             return foregroundWatchdogGeneration
         }
         guard let generation else { return }
@@ -1726,7 +1729,10 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             confirmation.requestTask = requestTask
             return true
         }
-        if shouldStart { requestTask.resume() }
+        if shouldStart {
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG stored-confirmation-start job=%@ generation=%ld", confirmation.record.id, confirmation.foregroundGeneration)
+            requestTask.resume()
+        }
         else { requestTask.cancel() }
     }
 
@@ -1887,6 +1893,42 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         }
     }
 
+    // Temporary, bounded Release diagnostics: one snapshot per real foreground cycle.
+    // Call only under stateQueue; never print account, capability, hash or URL values.
+    private func logForegroundRecoveryDiagnosticLocked(_ phase: String, generation: Int, taskCount: Int = 0, contentTasks: [URLSessionTask] = []) {
+        guard foregroundRecoveryActive, foregroundWatchdogGeneration == generation else { return }
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG recovery phase=%@ generation=%ld active=%d budgetUsed=%ld confirmationInFlight=%d reconcileInFlight=%d principalPresent=%d tasks=%ld", phase, generation, foregroundRecoveryActive ? 1 : 0, confirmationAttemptedJobs.count, storedConfirmation != nil ? 1 : 0, reconcileInFlight ? 1 : 0, activePrincipalId != nil ? 1 : 0, taskCount)
+        let timestamp = Date()
+        for task in contentTasks.prefix(3) {
+            let id = taskJobId(task) ?? "missing"
+            guard let current = records[id] else {
+                NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG recovery-task job=%@ task=%ld state=%ld reasonFlags=record-missing", id, task.taskIdentifier, task.state.rawValue)
+                continue
+            }
+            let updated = ISO8601DateFormatter().date(from: current.updatedAt)
+            let updatedAge = updated.map { timestamp.timeIntervalSince($0) } ?? -1
+            let progressAge = lastProgressAt[id].map { timestamp.timeIntervalSince($0) } ?? -1
+            let ownerMatch = current.principalId != nil && current.principalId == activePrincipalId
+            let cookiePresent = !(activeAuthenticationCookie ?? "").isEmpty
+            let tokenMatch = current.contentTaskToken == contentTaskIdentity(task)
+            let pathMatch = contentRequestMatchesRecord(task, record: current)
+            let hashPresent = !(current.contentHash ?? "").isEmpty
+            let cacheSizeMatch = (try? fileSize(originalURL(id))) == current.sizeBytes
+            let attempted = confirmationAttemptedJobs.contains(id)
+            let stale = updated.map { timestamp.timeIntervalSince(max($0, lastProgressAt[id] ?? $0)) >= 180 } ?? false
+            let checks: [(Bool, String)] = [
+                (storedConfirmation == nil, "inflight"), (confirmationAttemptedJobs.count < 3, "budget"),
+                (!attempted, "attempted"), (ownerMatch, "owner"), (cookiePresent, "cookie"),
+                (!["done", "failed", "paused"].contains(current.status), "status"),
+                (task.state != .completed && task.state != .canceling, "task-state"),
+                (tokenMatch, "token"), (pathMatch, "path"), (hashPresent, "hash"),
+                (updated != nil, "updated-date"), (stale, "age"), (cacheSizeMatch, "cache-size")
+            ]
+            let reasons = checks.filter { !$0.0 }.map { $0.1 }.joined(separator: ",")
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG recovery-task job=%@ task=%ld state=%ld taskStage=%@ stage=%@ status=%@ progress=%.0f updatedAgeSeconds=%.0f progressAgeSeconds=%.0f ownerMatch=%d cookiePresent=%d tokenMatch=%d pathMatch=%d hashPresent=%d cacheSizeMatch=%d attempted=%d eligible=%d reasonFlags=%@", id, task.taskIdentifier, task.state.rawValue, taskStage(task) ?? "missing", current.stage, current.status, current.progress, updatedAge, progressAge, ownerMatch ? 1 : 0, cookiePresent ? 1 : 0, tokenMatch ? 1 : 0, pathMatch ? 1 : 0, hashPresent ? 1 : 0, cacheSizeMatch ? 1 : 0, attempted ? 1 : 0, reasons.isEmpty ? 1 : 0, reasons.isEmpty ? "none" : reasons)
+        }
+    }
+
     private func reconcileTasks() {
         let shouldStart = stateQueue.sync { () -> Bool in
             if reconcileInFlight {
@@ -1917,7 +1959,16 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         // a task created during getAllTasks from being mistaken for an orphan whose
         // persisted owner token should be reclaimed.
         let recordsById = stateQueue.sync { records }
+        let diagnosticGeneration = stateQueue.sync { () -> Int? in
+            guard foregroundRecoveryActive, foregroundDiagnosticGeneration == foregroundWatchdogGeneration else { return nil }
+            let generation = foregroundDiagnosticGeneration
+            foregroundDiagnosticGeneration = nil
+            return generation
+        }
         legacyReserveSession.getAllTasks { legacyReserveTasks in
+            if let diagnosticGeneration {
+                self.stateQueue.sync { self.logForegroundRecoveryDiagnosticLocked("legacy-return", generation: diagnosticGeneration, taskCount: legacyReserveTasks.count) }
+            }
             // Retire every /reserve task created by the broken dual-background-session
             // generation. A fresh foreground handshake will reclaim its pending asset
             // after the server's stale-reservation window; never let the old callback
@@ -1931,6 +1982,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 let legacyReserveOnContentSession = allBackgroundTasks.filter { self.taskStage($0) == "reserve" }
                 legacyReserveOnContentSession.forEach { $0.cancel() }
                 let contentTasks = allBackgroundTasks.filter { self.taskStage($0) == "content" }
+                if let diagnosticGeneration {
+                    self.stateQueue.sync { self.logForegroundRecoveryDiagnosticLocked("content-return", generation: diagnosticGeneration, taskCount: allBackgroundTasks.count, contentTasks: contentTasks) }
+                }
 
                 var validContentIds = Set<String>()
                 var needsContentRestartIds = Set<String>()

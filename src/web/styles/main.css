@@ -2835,6 +2835,7 @@ body.upload-open .mobile-nav-dock {
   z-index: 2;
   padding-block: 10px;
   background: var(--surface);
+  box-shadow: 0 -26px 0 var(--surface);
   margin-bottom: 24px;
   display: flex;
   align-items: flex-start;
