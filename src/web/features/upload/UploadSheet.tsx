@@ -73,6 +73,10 @@ function jobDescription(job: LocalUploadJob): string {
   if (job.controlState === 'paused') return job.error ?? '已暂停'
   if (job.status === 'failed') return job.error ?? '上传失败'
   if (job.status === 'done') return job.deduplicated ? '已存在相同文件，已跳过重复原件' : '已保存，正在整理'
+  if (job.status === 'retrying') {
+    const attempts = job.attempts > 0 ? ` · 已尝试 ${job.attempts} 次` : ''
+    return `正在重新连接并重试${attempts}${job.error ? ` · ${job.error}` : ''}`
+  }
   if (job.nextAttemptAt) return `${job.error ?? '稍后重试'} · ${new Date(job.nextAttemptAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
   return `${stageLabels[job.stage]} · ${job.progress}%`
 }
@@ -81,7 +85,7 @@ function JobRow({ job, reload }: { job: LocalUploadJob; reload: () => Promise<vo
   const working = job.prepareStatus === 'preparing' || ['uploading', 'retrying'].includes(job.status) && job.controlState === 'active'
   return <article className={`upload-job ${job.status}`}>
     <div className="job-icon">{job.status === 'done' ? <CheckCircle2 /> : job.controlState === 'paused' ? <WifiOff /> : working ? <LoaderCircle className="spin" /> : <FileUp />}</div>
-    <div><strong>{job.fileName}</strong><span>{jobDescription(job)}</span><div className="progress"><i style={{ width: `${job.progress}%` }} /></div></div>
+    <div><strong>{job.fileName}</strong><span>{jobDescription(job)}</span>{job.status !== 'retrying' && <div className="progress"><i style={{ width: `${job.progress}%` }} /></div>}</div>
     <div className="job-actions">
       {job.controlState === 'paused' || job.status === 'failed' && job.controlState !== 'canceled'
         ? <button type="button" aria-label={`继续 ${job.fileName}`} onClick={async () => { await resumeLocalUpload(job.id); await reload() }}><Play /></button>

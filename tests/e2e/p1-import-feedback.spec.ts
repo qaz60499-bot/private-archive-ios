@@ -2,6 +2,44 @@ import { expect, test, type Page } from '@playwright/test'
 
 const tinyPdf = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF')
 
+test('a retained native retry shows reconnect feedback instead of stalled transfer progress', async ({ page }, testInfo) => {
+  await openUpload(page)
+  const sheet = page.getByRole('dialog', { name: '加入私人档案' })
+  await sheet.getByRole('radio', { name: /Telegram Bot/ }).check()
+  await page.context().setOffline(true)
+  const chooser = page.waitForEvent('filechooser')
+  await sheet.getByRole('button', { name: testInfo.project.name === 'mobile' ? '选择文件' : '选择照片、视频或文件', exact: true }).click()
+  await (await chooser).setFiles({ name: 'retained-native-retry.pdf', mimeType: 'application/pdf', buffer: tinyPdf })
+  if (testInfo.project.name === 'mobile') await page.getByRole('button', { name: '上传媒体' }).click()
+  await expect(sheet.getByText('retained-native-retry.pdf', { exact: true })).toBeVisible()
+  await sheet.getByRole('button', { name: '关闭', exact: true }).click()
+  await page.evaluate(() => new Promise<void>((resolve, reject) => {
+    const opening = indexedDB.open('private-archive-offline', 3)
+    opening.onerror = () => reject(opening.error)
+    opening.onsuccess = () => {
+      const db = opening.result
+      const transaction = db.transaction('uploads', 'readwrite')
+      const store = transaction.objectStore('uploads')
+      const reading = store.getAll()
+      reading.onsuccess = () => {
+        const job = reading.result.find((item: { fileName: string }) => item.fileName === 'retained-native-retry.pdf')
+        if (!job) { transaction.abort(); return }
+        store.put({ ...job, nativeBackground: true, prepareStatus: 'ready', status: 'retrying', stage: 'original', progress: 32, attempts: 14, error: '正在重新连接后台上传。' })
+      }
+      transaction.oncomplete = () => { db.close(); resolve() }
+      transaction.onerror = () => { db.close(); reject(transaction.error) }
+      transaction.onabort = () => { db.close(); reject(new Error('RETRY_FIXTURE_NOT_SAVED')) }
+    }
+  }))
+  await page.evaluate(() => window.dispatchEvent(new Event('private-archive:native-upload-state')))
+  await (testInfo.project.name === 'mobile' ? page.getByRole('button', { name: '上传媒体' }) : page.getByRole('button', { name: '加入档案' })).click()
+  const row = sheet.locator('.upload-job').filter({ hasText: 'retained-native-retry.pdf' })
+  await expect(row).toContainText('正在重新连接并重试 · 已尝试 14 次')
+  await expect(row).not.toContainText('32%')
+  await expect(row.locator('.progress')).toHaveCount(0)
+  await expect(row.getByRole('button', { name: '暂停 retained-native-retry.pdf' })).toBeEnabled()
+})
+
 test.beforeEach(async ({ request }) => {
   await request.post('/api/dev/seed')
 })
