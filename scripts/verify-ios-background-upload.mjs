@@ -10,9 +10,14 @@ const archiveContextSource = readFileSync(new URL('../src/web/context/ArchiveCon
 const authContextSource = readFileSync(new URL('../src/web/context/AuthContext.tsx', import.meta.url), 'utf8')
 const assetsRepositorySource = readFileSync(new URL('../src/worker/db/assets-repository.ts', import.meta.url), 'utf8')
 const protocolServerSource = readFileSync(new URL('./ios-upload-protocol-smoke-server.mjs', import.meta.url), 'utf8')
+const infoPlistSource = readFileSync(new URL('../ios/App/App/Info.plist', import.meta.url), 'utf8')
 
 function assert(condition, message) {
   if (!condition) throw new Error(`IOS_BACKGROUND_UPLOAD_VERIFY_FAILED: ${message}`)
+}
+
+for (const permission of ['NSCameraUsageDescription', 'NSMicrophoneUsageDescription']) {
+  assert(new RegExp(`<key>${permission}</key>\\s*<string>[^<]+</string>`).test(infoPlistSource), 'iOS photo and video capture require a nonempty ' + permission)
 }
 
 function section(start, end) {

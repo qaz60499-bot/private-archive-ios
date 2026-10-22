@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>用于直接拍摄照片和视频并保存到你的 Private Adventure。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>用于录制上传视频中的声音；你可以拒绝麦克风访问。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于从系统照片图库选择照片和视频上传到你的 Private Adventure。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

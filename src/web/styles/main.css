@@ -256,6 +256,19 @@ p {
 
 .archive-atmosphere canvas[data-unavailable="true"] { display: none; }
 
+@media (max-width: 1023px) {
+  html[data-app-surface="personal-desktop"] .archive-atmosphere-fallback i {
+    animation: none;
+    transform: translate3d(2%, -2%, 0) scale(1.035);
+  }
+
+  html[data-app-surface="personal-desktop"] .archive-exposure-track span {
+    animation: none;
+    opacity: .525;
+    transform: scale(1.05);
+  }
+}
+
 @keyframes chemistry-drift {
   from { transform: translate3d(-3%, 2%, 0) scale(.94); }
   to { transform: translate3d(7%, -6%, 0) scale(1.13); }

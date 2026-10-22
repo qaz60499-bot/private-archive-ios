@@ -1981,6 +1981,14 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
 #endif
         notify(finished)
         cleanupFiles(record.id)
+        // One sanitized terminal metric per committed job, including Release builds.
+        // Use the record's device-clock timestamps (one-second resolution), never
+        // subtract a server timestamp from a host/device observation.
+        let formatter = ISO8601DateFormatter()
+        let created = formatter.date(from: finished.createdAt)
+        let committed = formatter.date(from: finished.updatedAt)
+        let elapsed = created.flatMap { start in committed.map { $0.timeIntervalSince(start) } } ?? -1
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG committed job=%@ bytes=%lld attempts=%ld deduplicated=%d elapsedSeconds=%.0f originalPresent=%d", finished.id, finished.sizeBytes, finished.attempts, deduplicated ? 1 : 0, elapsed, fileManager.fileExists(atPath: originalURL(finished.id).path) ? 1 : 0)
         return true
     }
 
