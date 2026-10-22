@@ -31,6 +31,9 @@ struct NativeUploadRecord: Codable {
     var contentHash: String?
     var deduplicated: Bool?
     var contentTaskToken: String?
+    // Reservation-scoped age for the bounded remote-proof check. Retry bookkeeping
+    // and repeated body sends must not postpone confirmation indefinitely.
+    var contentStartedAt: String? = nil
     // Monotonic desired-control generation. Async URLSession task enumeration must
     // verify this before applying pause/resume so an older callback cannot override
     // a newer user action.
@@ -417,6 +420,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             record.attempts = 0
             record.remoteAssetId = nil
             record.uploadToken = nil
+            record.contentStartedAt = nil
             record.contentTaskToken = nil
             record.error = "检测到完整本机缓存，正在重新建立后台上传。"
             record.updatedAt = timestamp
@@ -722,10 +726,34 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 records[id]?.stage = "original"
                 records[id]?.status = "uploading"
                 records[id]?.updatedAt = now()
+                records[id]?.contentStartedAt = now()
             }
             try check(claimStoredConfirmation(task) == nil, "fresh-task-probed")
+            let started = Date().addingTimeInterval(-181)
             stateQueue.sync {
-                records[id]?.updatedAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-181))
+                records[id]?.contentStartedAt = ISO8601DateFormatter().string(from: started)
+            }
+            // Replay retry/progress bookkeeping at intervals shorter than the probe
+            // threshold. It must neither probe early nor keep moving the deadline.
+            for seconds in [0.0, 60.0, 120.0, 178.0] {
+                let timestamp = started.addingTimeInterval(seconds)
+                stateQueue.sync {
+                    records[id]?.updatedAt = ISO8601DateFormatter().string(from: timestamp)
+                    lastProgressAt[id] = timestamp
+                }
+                try check(claimStoredConfirmation(task, at: timestamp) == nil, "retry-age-probed-early")
+            }
+            let persisted = try stateQueue.sync { try JSONEncoder().encode(records[id]!) }
+            let restored = try JSONDecoder().decode(NativeUploadRecord.self, from: persisted)
+            try check(restored.contentStartedAt == stateQueue.sync { records[id]?.contentStartedAt }, "retry-age-not-persisted")
+            var legacy = try JSONSerialization.jsonObject(with: persisted) as! [String: Any]
+            legacy.removeValue(forKey: "contentStartedAt")
+            let decodedLegacy = try JSONDecoder().decode(NativeUploadRecord.self, from: JSONSerialization.data(withJSONObject: legacy))
+            try check(decodedLegacy.contentStartedAt == nil, "legacy-content-age-decode")
+            stateQueue.sync {
+                records[id] = restored
+                records[id]?.updatedAt = now()
+                lastProgressAt[id] = Date()
                 confirmationAttemptedJobs = ["budget-1", "budget-2", "budget-3"]
             }
             try check(claimStoredConfirmation(task) == nil, "foreground-budget-exceeded")
@@ -771,6 +799,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             }
             try check(claimStoredConfirmation(task) == nil, "same-job-reprobed-in-cycle")
         }
+        NSLog("PRIVATE_ARCHIVE_CONFIRMATION_RETRY_AGE_SMOKE_COMPLETED cases=%ld", cases.count)
         NSLog("PRIVATE_ARCHIVE_STORED_CONFIRMATION_SMOKE_COMPLETED cases=%ld", cases.count)
     }
 
@@ -1081,6 +1110,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 value.attempts = 0
                 value.remoteAssetId = nil
                 value.uploadToken = nil
+                value.contentStartedAt = nil
                 value.contentTaskToken = nil
                 value.error = "正在从本机缓存重新建立上传。"
             }) else { return }
@@ -1307,6 +1337,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             value.progress = min(value.progress, 18)
             value.remoteAssetId = nil
             value.uploadToken = nil
+            value.contentStartedAt = nil
             value.contentTaskToken = nil
             value.error = reason ?? "正在重新建立上传预约。"
             value.updatedAt = now()
@@ -1590,6 +1621,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                 return nil
             }
             value.contentTaskToken = contentTaskToken
+            if value.contentStartedAt == nil { value.contentStartedAt = now() }
             value.status = delayed ? "retrying" : "uploading"
             value.stage = "original"
             value.progress = 32
@@ -1865,8 +1897,8 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                   task.state != .completed, task.state != .canceling,
                   current.contentTaskToken == contentTaskIdentity(task), contentRequestMatchesRecord(task, record: current),
                   let hash = current.contentHash, !hash.isEmpty,
-                  let updated = ISO8601DateFormatter().date(from: current.updatedAt),
-                  timestamp.timeIntervalSince(max(updated, lastProgressAt[id] ?? updated)) >= 180,
+                  let started = ISO8601DateFormatter().date(from: current.contentStartedAt ?? current.updatedAt),
+                  timestamp.timeIntervalSince(started) >= 180,
                   (try? fileSize(originalURL(id))) == current.sizeBytes else { return nil }
             let confirmation = StoredConfirmation(record: current, contentTask: task, authenticationGeneration: authenticationGeneration, foregroundGeneration: foregroundWatchdogGeneration, cookie: cookie)
             confirmationAttemptedJobs.insert(id)
@@ -2089,6 +2121,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let updated = ISO8601DateFormatter().date(from: current.updatedAt)
             let updatedAge = updated.map { timestamp.timeIntervalSince($0) } ?? -1
             let progressAge = lastProgressAt[id].map { timestamp.timeIntervalSince($0) } ?? -1
+            let contentStarted = ISO8601DateFormatter().date(from: current.contentStartedAt ?? current.updatedAt)
             let ownerMatch = current.principalId != nil && current.principalId == activePrincipalId
             let cookiePresent = !(activeAuthenticationCookie ?? "").isEmpty
             let tokenMatch = current.contentTaskToken == contentTaskIdentity(task)
@@ -2096,14 +2129,14 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             let hashPresent = !(current.contentHash ?? "").isEmpty
             let cacheSizeMatch = (try? fileSize(originalURL(id))) == current.sizeBytes
             let attempted = confirmationAttemptedJobs.contains(id)
-            let stale = updated.map { timestamp.timeIntervalSince(max($0, lastProgressAt[id] ?? $0)) >= 180 } ?? false
+            let stale = contentStarted.map { timestamp.timeIntervalSince($0) >= 180 } ?? false
             let checks: [(Bool, String)] = [
                 (storedConfirmation == nil, "inflight"), (confirmationAttemptedJobs.count < 3, "budget"),
                 (!attempted, "attempted"), (ownerMatch, "owner"), (cookiePresent, "cookie"),
                 (!["done", "failed", "paused"].contains(current.status), "status"),
                 (task.state != .completed && task.state != .canceling, "task-state"),
                 (tokenMatch, "token"), (pathMatch, "path"), (hashPresent, "hash"),
-                (updated != nil, "updated-date"), (stale, "age"), (cacheSizeMatch, "cache-size")
+                (contentStarted != nil, "content-date"), (stale, "age"), (cacheSizeMatch, "cache-size")
             ]
             let reasons = checks.filter { !$0.0 }.map { $0.1 }.joined(separator: ",")
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG recovery-task job=%@ task=%ld state=%ld taskStage=%@ stage=%@ status=%@ progress=%.0f updatedAgeSeconds=%.0f progressAgeSeconds=%.0f ownerMatch=%d cookiePresent=%d tokenMatch=%d pathMatch=%d hashPresent=%d cacheSizeMatch=%d attempted=%d eligible=%d reasonFlags=%@ attempts=%ld commitUnconfirmed=%d tokenInvalidOrExpired=%d alreadyInProgress=%d", id, task.taskIdentifier, task.state.rawValue, taskStage(task) ?? "missing", current.stage, current.status, current.progress, updatedAge, progressAge, ownerMatch ? 1 : 0, cookiePresent ? 1 : 0, tokenMatch ? 1 : 0, pathMatch ? 1 : 0, hashPresent ? 1 : 0, cacheSizeMatch ? 1 : 0, attempted ? 1 : 0, reasons.isEmpty ? 1 : 0, reasons.isEmpty ? "none" : reasons, current.attempts, current.error == "UPLOAD_COMMIT_UNCONFIRMED" ? 1 : 0, current.error == "UPLOAD_TOKEN_INVALID_OR_EXPIRED" ? 1 : 0, current.error == "UPLOAD_ALREADY_IN_PROGRESS" ? 1 : 0)
@@ -2212,9 +2245,17 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
                             return (false, current)
                         }
                         if let owner = current.contentTaskToken {
+                            if owner == taskIdentity, current.contentStartedAt == nil {
+                                // Upgrade a legacy owned task once, without resetting
+                                // this age on subsequent reconciliation or retries.
+                                current.contentStartedAt = self.now()
+                                self.records[id] = current
+                                self.saveStateLocked()
+                            }
                             return (owner == taskIdentity, current)
                         }
                         current.contentTaskToken = taskIdentity
+                        if current.contentStartedAt == nil { current.contentStartedAt = self.now() }
                         current.updatedAt = self.now()
                         self.records[id] = current
                         self.saveStateLocked()
