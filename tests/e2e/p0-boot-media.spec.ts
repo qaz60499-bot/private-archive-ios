@@ -87,6 +87,26 @@ test('desktop personal surface is compact and does not boot Three.js', async ({ 
   expect(threeResources).toEqual([])
 })
 
+test('an idle archive keeps unloaded previews and selected navigation static', async ({ page, request }) => {
+  expect((await request.post('/api/dev/seed')).ok()).toBeTruthy()
+  // Hold preview requests so the archive exercises real pending image states.
+  await page.route('**/api/assets/*/preview**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    await route.abort()
+  })
+  await page.goto('/')
+  await expect(page.locator('.media-open').first()).toBeVisible()
+  const state = await page.evaluate(() => ({
+    pending: [...document.querySelectorAll('.media-open')].map((node) => getComputedStyle(node).animationName),
+    navigation: [...document.querySelectorAll('.rail-link.active .glyph-dot, .mobile-bottom-nav a.active .glyph-dot')]
+      .map((node) => getComputedStyle(node).animationName),
+  }))
+  expect(state.pending.length).toBeGreaterThan(0)
+  expect(state.navigation.length).toBeGreaterThan(0)
+  expect(state.pending.every((name) => name === 'none')).toBe(true)
+  expect(state.navigation.every((name) => name === 'none')).toBe(true)
+})
+
 test('access-check rejects protocol-relative external return targets', async ({ page }) => {
   await page.goto('/access-check?return=%2F%2Fevil.example%2Fsteal')
   await expect(page).toHaveURL('http://127.0.0.1:8799/')

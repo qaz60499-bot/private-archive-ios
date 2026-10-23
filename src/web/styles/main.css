@@ -368,9 +368,7 @@ p {
 .rail-link .archive-glyph { width: 27px; height: 27px; transition: transform 360ms cubic-bezier(.2,.8,.2,1); }
 .rail-link:hover .archive-glyph { transform: rotate(4deg) scale(1.06); }
 .rail-link.active .glyph-orbit { opacity: .75; stroke-dasharray: 82; }
-.rail-link.active .glyph-dot { animation: glyph-orbit 5s linear infinite; }
-
-@keyframes glyph-orbit { to { transform: rotate(360deg); } }
+/* Keep the selected navigation marker static: an idle archive needs no frame loop. */
 
 .rail-link:hover {
   color: var(--ink);
@@ -1656,7 +1654,8 @@ p {
   border: 0;
   background: linear-gradient(110deg, rgba(229, 226, 216, .86) 8%, rgba(241, 238, 229, .94) 22%, rgba(229, 226, 216, .86) 38%);
   background-size: 220% 100%;
-  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  /* Lazy thumbnails can remain offscreen indefinitely. A static placeholder
+     avoids animating every unloaded tile while the reader is on the cover. */
   cursor: zoom-in;
 }
 
@@ -4467,7 +4466,6 @@ body.upload-open .mobile-nav-dock {
   }
 
   .mobile-bottom-nav a.active .glyph-orbit { opacity: .78; stroke-dasharray: 82; }
-  .mobile-bottom-nav a.active .glyph-dot { animation: glyph-orbit 5s linear infinite; }
 
   .mobile-bottom-nav > .mobile-upload {
     width: 52px;

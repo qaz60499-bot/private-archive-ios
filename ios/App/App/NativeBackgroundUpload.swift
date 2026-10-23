@@ -86,6 +86,7 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
     private var foregroundRecoveryActive = false
     private var foregroundDiagnosticGeneration: Int?
     private var contentCallbackDiagnosticCount = 0
+    private let uploadProfilingEnabled = ProcessInfo.processInfo.arguments.contains("--private-archive-profile")
     private var confirmationAttemptedJobs = Set<String>()
     private var storedConfirmation: StoredConfirmation?
     private let maximumConfirmationResponseBytes = 256 * 1024
@@ -2397,6 +2398,23 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
         if let updated { notify(updated) }
     }
 
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        guard uploadProfilingEnabled, taskStage(task) == "content", let id = taskJobId(task) else { return }
+        let createdAt = stateQueue.sync { records[id]?.createdAt }
+        let created = createdAt.flatMap { ISO8601DateFormatter().date(from: $0) }
+        let beforeTask = created.map { metrics.taskInterval.start.timeIntervalSince($0) } ?? -1
+        func seconds(_ start: Date?, _ end: Date?) -> Double {
+            guard let start, let end else { return -1 }
+            return end.timeIntervalSince(start)
+        }
+        // Per-task diagnostic timing only. No URLs, headers, filenames, hashes or
+        // capabilities are exported. A missing phase is -1, never a guessed zero.
+        NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG task-metrics job=%@ task=%ld startEpoch=%.3f duration=%.3f sinceCreated=%.3f transactions=%ld bytesSent=%lld bytesExpected=%lld", id, task.taskIdentifier, metrics.taskInterval.start.timeIntervalSince1970, metrics.taskInterval.duration, beforeTask, metrics.transactionMetrics.count, task.countOfBytesSent, task.countOfBytesExpectedToSend)
+        for (index, transaction) in metrics.transactionMetrics.prefix(4).enumerated() {
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG transaction-metrics job=%@ task=%ld index=%ld protocol=%@ reused=%d fetchOffset=%.3f requestOffset=%.3f sendSeconds=%.3f responseWaitSeconds=%.3f receiveSeconds=%.3f bodyBytes=%lld http=%ld", id, task.taskIdentifier, index, transaction.networkProtocolName ?? "unknown", transaction.isReusedConnection ? 1 : 0, seconds(metrics.taskInterval.start, transaction.fetchStartDate), seconds(metrics.taskInterval.start, transaction.requestStartDate), seconds(transaction.requestStartDate, transaction.requestEndDate), seconds(transaction.requestEndDate, transaction.responseStartDate), seconds(transaction.responseStartDate, transaction.responseEndDate), transaction.countOfRequestBodyBytesSent, (transaction.response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if session === storedConfirmationSession {
             guard let confirmation = stateQueue.sync(execute: { storedConfirmation }), confirmation.requestTask?.taskIdentifier == task.taskIdentifier else { return }
@@ -2408,6 +2426,9 @@ final class NativeBackgroundUploadManager: NSObject, URLSessionDelegate, URLSess
             NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG callback-rejected task=%ld reason=description", task.taskIdentifier)
 #endif
             return
+        }
+        if uploadProfilingEnabled, stage == "content" {
+            NSLog("PRIVATE_ARCHIVE_UPLOAD_DIAG profile-terminal job=%@ task=%ld http=%ld errorCode=%ld bytesSent=%lld bytesExpected=%lld", id, task.taskIdentifier, (task.response as? HTTPURLResponse)?.statusCode ?? 0, (error as NSError?)?.code ?? 0, task.countOfBytesSent, task.countOfBytesExpectedToSend)
         }
         let data = responseBuffers.removeValue(forKey: taskBufferKey(session, task: task)) ?? Data()
 #if DEBUG
