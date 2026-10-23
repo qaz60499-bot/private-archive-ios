@@ -1452,6 +1452,7 @@ p {
 
 .mobile-import-status .text-button {
   flex: 0 0 auto;
+  color: var(--ink);
   white-space: nowrap;
 }
 
