@@ -176,7 +176,7 @@ export function TimelinePage() {
         : <PageIntro eyebrow="私人影像库 · 01" title={query ? `“${query}”` : category ? `分类 · ${categoryLabel ?? categoryLabels[category] ?? category}` : month ? `月度 · ${month.replace('-', ' · ')}` : '私人影像库'} description="按真实拍摄时间归档。原件沉静地留在 Telegram，眼前只呈现值得重看的部分。" count={assets.length} />}
       <div className="timeline-control-row" id="archive-timeline">
         <FilterChips options={filters} value={filter} onChange={setFilter} />
-        <div className="timeline-actions">
+        <div className={`timeline-actions${selectionMode ? ' selection-mode' : ''}`}>
           <TimelineMonthJump value={month} onChange={(nextMonth) => {
             const next = new URLSearchParams(searchParams)
             if (nextMonth) next.set('month', nextMonth)
@@ -206,7 +206,11 @@ export function TimelinePage() {
           )}
         </div>
       </div>
-      {importStatus ? <p className="mobile-import-status" role="status">{importStatus.phase === 'complete' ? (importStatus.error ? `部分照片未能写入本机队列：${importStatus.error}` : `已加入 ${importStatus.queued} 项；本机已保存，Telegram 正在后台确认，你可以继续浏览图库。`) : `正在接收：${importStatus.processed}/${importStatus.total}，并写入本机恢复队列。`}</p> : null}
+      {importStatus ? <div className="mobile-import-status" role="status">{importStatus.phase === 'complete'
+        ? importStatus.error
+          ? <span>部分照片未能写入本机队列：{importStatus.error}</span>
+          : <><span>本机上传队列已登记 {importStatus.queued} 项。</span><button className="text-button" type="button" onClick={() => setUploadOpen(true)}>查看上传队列</button></>
+        : <span>正在接收：{importStatus.processed}/{importStatus.total}，并写入本机恢复队列。</span>}</div> : null}
       {actionError ? <p className="inline-error timeline-action-error" role="alert">{actionError}</p> : null}
       {loading ? <SkeletonGrid /> : error ? <ErrorState message={error} onRetry={() => void load(loadOptions)} /> : sections.length ? <>
         <div className="timeline-month-chapters">

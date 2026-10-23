@@ -1338,6 +1338,7 @@ p {
 
 .timeline-control-row {
   margin: -24px 0 36px;
+  scroll-margin-top: 88px;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -1439,11 +1440,21 @@ p {
 .mobile-import-status {
   margin: -18px 0 26px;
   padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
   border: 1px solid rgba(90, 110, 86, .18);
   border-radius: var(--radius-sm);
   background: rgba(231, 236, 226, .62);
   color: var(--ink-muted);
   font-size: .76rem;
+}
+
+.mobile-import-status .text-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .selection-count {
@@ -4052,6 +4063,7 @@ body.upload-open .mobile-nav-dock {
   .timeline-control-row {
     margin-top: -14px;
     margin-bottom: 28px;
+    scroll-margin-top: calc(74px + env(safe-area-inset-top));
     flex-direction: column;
     align-items: stretch;
     gap: 10px;
@@ -4068,6 +4080,13 @@ body.upload-open .mobile-nav-dock {
     overflow-x: auto;
     padding-bottom: 2px;
     scrollbar-width: none;
+  }
+
+  .timeline-actions.selection-mode {
+    align-items: center;
+    flex-wrap: wrap;
+    overflow: visible;
+    padding-bottom: 0;
   }
 
   .timeline-actions::-webkit-scrollbar {

@@ -2969,6 +2969,11 @@ class PrivateArchiveBridgeViewController: CAPBridgeViewController, WKHTTPCookieS
         let nativeUploadPlugin = NativeBackgroundUploadPlugin()
         bridge?.registerPluginInstance(nativeUploadPlugin)
         if let webView {
+            // Explicit, device-local profiling opt-in. Ordinary launches keep
+            // inspection disabled; never expose the private archive by default.
+            if #available(iOS 16.4, *) {
+                webView.isInspectable = ProcessInfo.processInfo.arguments.contains("--private-archive-profile")
+            }
             let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
             observedCookieStore = cookieStore
             cookieStore.add(self)

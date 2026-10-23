@@ -144,4 +144,61 @@ test('choosing files shows immediate app-level import feedback that survives she
   await expect(toast).toBeVisible()
   await expect(toast).toContainText('项')
   await expect.poll(() => toast.textContent(), { timeout: 15_000 }).toContain('云端已确认')
+
+  const sheet = page.getByRole('dialog', { name: '加入私人档案' })
+  if (await sheet.isVisible()) await sheet.getByRole('button', { name: '关闭', exact: true }).click()
+  const localFeedback = page.locator('.mobile-import-status')
+  await expect(localFeedback).toContainText('本机上传队列已登记 6 项')
+  await expect(localFeedback).not.toContainText(/Telegram|云端|后台确认/)
+  await localFeedback.getByRole('button', { name: '查看上传队列' }).click()
+  await expect(page.getByRole('dialog', { name: '加入私人档案' })).toBeVisible()
+})
+
+test('home timeline anchor keeps its controls clear of the sticky topbar', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('link', { name: '查看时间线' }).click()
+
+  const controls = page.locator('#archive-timeline')
+  await expect(page.getByRole('button', { name: '全部', exact: true })).toBeInViewport()
+  await expect(controls.getByRole('button', { name: '选择', exact: true })).toBeInViewport()
+  const verticalGap = await page.evaluate(() => {
+    const target = document.querySelector('#archive-timeline')
+    const topbar = document.querySelector('.topbar')
+    if (!target || !topbar) return Number.NEGATIVE_INFINITY
+    return target.getBoundingClientRect().top - topbar.getBoundingClientRect().bottom
+  })
+  expect(verticalGap).toBeGreaterThanOrEqual(8)
+})
+
+test('mobile bulk selection wraps the delete action into the visible control layout', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'mobile viewport only')
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: '打开 morning-garden.jpg' })).toBeVisible()
+  await page.getByRole('button', { name: '选择', exact: true }).click()
+  await page.getByRole('button', { name: /^选择 / }).first().click()
+
+  const controls = page.locator('#archive-timeline')
+  const actions = controls.locator('.timeline-actions')
+  const deleteButton = actions.getByRole('button', { name: '删除选中' })
+  await expect(deleteButton).toBeEnabled()
+  await controls.evaluate((element) => element.scrollIntoView({ block: 'start', behavior: 'instant' }))
+  await expect(deleteButton).toBeInViewport({ ratio: 1 })
+  const layout = await actions.evaluate((element) => {
+    const button = element.querySelector('.selection-delete-button')
+    if (!button) return null
+    const row = element.getBoundingClientRect()
+    const action = button.getBoundingClientRect()
+    return {
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+      rowLeft: row.left,
+      rowRight: row.right,
+      actionLeft: action.left,
+      actionRight: action.right,
+    }
+  })
+  expect(layout).not.toBeNull()
+  expect(layout!.scrollWidth).toBeLessThanOrEqual(layout!.clientWidth + 1)
+  expect(layout!.actionLeft).toBeGreaterThanOrEqual(layout!.rowLeft - 1)
+  expect(layout!.actionRight).toBeLessThanOrEqual(layout!.rowRight + 1)
 })
