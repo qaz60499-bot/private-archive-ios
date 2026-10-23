@@ -50,7 +50,16 @@ from the patched Node runtime; audit JSON is preserved in `work/node24-audit*.js
 No broad dependency updates, forced audit fixes, or downgrades were applied.
 The existing Three.js optional chunk size warning also remains.
 
-The macOS/iOS CI run for this exact change is pending. This report does not
-claim a new IPA installation or improvements to CPU, heat, upload throughput,
+The macOS/iOS CI run for exact commit `e453789146db3e4e6e67fccdcc6d178c3de64c30`
+passed: <https://github.com/qaz60499-bot/private-archive-ios/actions/runs/39902657632>.
+The actual simulator logs were downloaded and checked for the 80 recoverable
+imports, account isolation, 20 retry-age/confirmation cases, 61 header ACK cases,
+four fault-original-retention cases and successful protocol recovery. Swift
+analysis and iPhone Release packaging also passed. The resulting IPA is saved
+under `release/node24-e453789/`; metadata and ZIP CRC passed (manifest in
+`work/node24-ipa-manifest.json`). It remains Build 12 because application code
+did not change, and was not reinstalled over the existing Build 12.
+
+This report does not claim a new IPA installation or improvements to CPU, heat, upload throughput,
 or the unresolved Build 12 network long tail. Those belong to the next measured
 performance phase. Setup and desktop preview limitations: `docs/node-runtime.md`.
